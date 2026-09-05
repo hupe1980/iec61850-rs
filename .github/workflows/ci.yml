@@ -23,7 +23,9 @@ jobs:
           sudo add-apt-repository -y ppa:wireshark-dev/stable
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
-          tshark -v | head -1
+          # Both streams, several lines: which one carries the banner has moved between
+          # releases, and this is the log the version gate points at when it cannot read one.
+          tshark -v 2>&1 | sed -n '1,5p'
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features
       - run: cargo clippy --no-default-features --features goose,sv,mms

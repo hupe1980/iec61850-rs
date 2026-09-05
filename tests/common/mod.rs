@@ -85,8 +85,9 @@ pub fn tshark() -> Option<PathBuf> {
         return None;
     }
     let path = PathBuf::from(path);
-    let Some(version) = tshark_version(&path) else {
-        assert!(!required, "IEC61850_REQUIRE_TSHARK is set, but `tshark -v` did not report a version");
+    let banner = tshark_banner(&path);
+    let Some(version) = banner.as_deref().and_then(first_version) else {
+        assert!(!required, "IEC61850_REQUIRE_TSHARK is set, but `tshark -v` did not report a version. It said: {banner:?}");
         return None;
     };
     if version < TSHARK_MIN {
@@ -102,16 +103,48 @@ fn dotted(version: (u32, u32, u32)) -> String {
     format!("{}.{}.{}", version.0, version.1, version.2)
 }
 
-/// The `major.minor.patch` out of `TShark (Wireshark) 4.2.3 (v4.2.3-0-g...)`.
-fn tshark_version(path: &Path) -> Option<(u32, u32, u32)> {
+/// The line of `tshark -v` that names the product.
+///
+/// Both streams are read: which one carries the banner has moved between releases, and a
+/// distribution build may put a warning in front of it. Returning the raw text on failure is
+/// deliberate — the version gate above prints it, so a banner this does not understand says
+/// so instead of looking like a missing `tshark`.
+fn tshark_banner(path: &Path) -> Option<String> {
     let out = std::process::Command::new(path).arg("-v").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let first = text.lines().next()?;
-    first.split_whitespace().find_map(|word| {
-        let mut parts = word.trim_start_matches('v').split('.');
-        let v = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
-        parts.next().is_none().then_some(v)
+    let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    let named = text.lines().find(|l| l.contains("Wireshark") || l.contains("TShark"));
+    Some(named.or_else(|| text.lines().next()).unwrap_or_default().trim().to_string())
+}
+
+/// The first `major.minor.patch` on a line.
+///
+/// `TShark (Wireshark) 4.2.3 (v4.2.3-0-g0e5b6b0)` upstream, but a packager rewrites the
+/// parenthesised half freely — Ubuntu's reads `(Git v4.4.9 packaged as 4.4.9-1~ubuntu24.04)`
+/// — so the whole line is scanned for the first three dotted numbers rather than a fixed
+/// word position. Runs of digits and dots are the only candidates, so `64-bit` and a
+/// `2.80.0` further down the banner cannot be mistaken for it.
+fn first_version(line: &str) -> Option<(u32, u32, u32)> {
+    line.split(|c: char| !c.is_ascii_digit() && c != '.').find_map(|chunk| {
+        let mut parts = chunk.split('.');
+        Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
     })
+}
+
+#[test]
+fn a_version_is_read_out_of_every_banner_a_packager_writes() {
+    for (banner, want) in [
+        ("TShark (Wireshark) 4.2.3 (v4.2.3-0-g0e5b6b0)", (4, 2, 3)),
+        ("TShark (Wireshark) 4.6.7 (v4.6.7-0-gb439fb7b47a9).", (4, 6, 7)),
+        ("TShark (Wireshark) 4.4.9 (Git v4.4.9 packaged as 4.4.9-1~ubuntu24.04.0+wiresharkdevstable1)", (4, 4, 9)),
+        ("TShark (Wireshark) 4.2.2 (Git v4.2.2 packaged as 4.2.2-1.1build3)", (4, 2, 2)),
+        ("TShark 3.6.2 (Git v3.6.2 packaged as 3.6.2-2)", (3, 6, 2)),
+    ] {
+        assert_eq!(first_version(banner), Some(want), "{banner}");
+    }
+    // No three dotted numbers means no version, rather than a number read out of something
+    // else on the line — which is why only the line naming the product is ever scanned.
+    assert_eq!(first_version("Compiled (64-bit) using GCC"), None);
+    assert_eq!(first_version(""), None);
 }
 
 // ---------------------------------------------------------------------------------------
