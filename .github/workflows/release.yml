@@ -86,8 +86,9 @@ jobs:
           - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, packages: musl-tools }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, packages: musl-tools }
+          # Apple Silicon only: macOS has not shipped on x86_64 for years, and the runner
+          # that could build for it is gone.
           - { target: aarch64-apple-darwin, os: macos-14 }
-          - { target: x86_64-apple-darwin, os: macos-13 }
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
     steps:
       - uses: actions/checkout@v4
