@@ -108,6 +108,15 @@ That includes checks we did not write: Wireshark flags a frame whose header simu
 disagrees with the PDU's own field, and it knows the GOOSE and Sampled Values ASN.1 modules
 independently of us.
 
+An oracle needs its own version floor. Wireshark up to 4.2.2 — which is what Ubuntu 24.04
+ships — asserts `recursion_depth <= 100` on a *legitimate* GOOSE message and marks it
+malformed ([wireshark#19580], fixed in 4.2.3), so an older dissector fails correct frames.
+The tests skip on a `tshark` older than that rather than believe it, and CI sets
+`IEC61850_REQUIRE_TSHARK=1`, which turns "missing or too old" into a failure — an oracle that
+can quietly stop running is not one.
+
+[wireshark#19580]: https://gitlab.com/wireshark/wireshark/-/issues/19580
+
 ## Adversarial simulation
 
 A publisher and a subscriber are driven against each other under virtual time, with a network

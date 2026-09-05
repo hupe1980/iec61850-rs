@@ -62,15 +62,56 @@ pub fn write_pcap(path: &Path, frames: &[Vec<u8>]) {
     std::fs::write(path, out).expect("write pcap");
 }
 
-/// `tshark` if it is installed.
+/// The oldest Wireshark whose verdict about a GOOSE frame can be believed.
+///
+/// Up to 4.2.2 the GOOSE dissector asserts `recursion_depth <= 100` on a **legitimate**
+/// message and marks it `_ws.malformed` (wireshark#19580, fixed in 4.2.3). An oracle that
+/// reports correct frames as malformed is testing itself, not us — and Ubuntu 24.04 ships
+/// exactly 4.2.2, so this is not a hypothetical.
+const TSHARK_MIN: (u32, u32, u32) = (4, 2, 3);
+
+/// `tshark`, if it is installed and new enough to be trusted. `None` means the tests that
+/// use it skip.
+///
+/// Set `IEC61850_REQUIRE_TSHARK=1` to make both of those a failure instead. CI does, because
+/// a silent skip would let the Wireshark oracle stop running without anyone noticing — which
+/// is the one thing an oracle must not be able to do.
 pub fn tshark() -> Option<PathBuf> {
+    let required = std::env::var("IEC61850_REQUIRE_TSHARK").is_ok_and(|v| v != "0");
     let out = std::process::Command::new("sh").arg("-c").arg("command -v tshark").output().ok()?;
-    if out.status.success() {
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (!s.is_empty()).then(|| PathBuf::from(s))
-    } else {
-        None
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || path.is_empty() {
+        assert!(!required, "IEC61850_REQUIRE_TSHARK is set, but tshark is not installed");
+        return None;
     }
+    let path = PathBuf::from(path);
+    let Some(version) = tshark_version(&path) else {
+        assert!(!required, "IEC61850_REQUIRE_TSHARK is set, but `tshark -v` did not report a version");
+        return None;
+    };
+    if version < TSHARK_MIN {
+        let (found, want) = (dotted(version), dotted(TSHARK_MIN));
+        assert!(!required, "IEC61850_REQUIRE_TSHARK is set, but tshark {found} is older than {want} (wireshark#19580)");
+        eprintln!("skipping: tshark {found} is older than {want}, which reports valid GOOSE frames as malformed (wireshark#19580)");
+        return None;
+    }
+    Some(path)
+}
+
+fn dotted(version: (u32, u32, u32)) -> String {
+    format!("{}.{}.{}", version.0, version.1, version.2)
+}
+
+/// The `major.minor.patch` out of `TShark (Wireshark) 4.2.3 (v4.2.3-0-g...)`.
+fn tshark_version(path: &Path) -> Option<(u32, u32, u32)> {
+    let out = std::process::Command::new(path).arg("-v").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let first = text.lines().next()?;
+    first.split_whitespace().find_map(|word| {
+        let mut parts = word.trim_start_matches('v').split('.');
+        let v = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+        parts.next().is_none().then_some(v)
+    })
 }
 
 // ---------------------------------------------------------------------------------------

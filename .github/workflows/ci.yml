@@ -16,7 +16,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - run: sudo apt-get update && sudo apt-get install -y tshark
+      # Not the distribution's tshark: Ubuntu 24.04 ships Wireshark 4.2.2, whose GOOSE
+      # dissector asserts on a legitimate message (wireshark#19580, fixed in 4.2.3) and would
+      # report this crate's own correct frames as malformed.
+      - run: |
+          sudo add-apt-repository -y ppa:wireshark-dev/stable
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+          tshark -v | head -1
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features
       - run: cargo clippy --no-default-features --features goose,sv,mms
@@ -32,7 +39,11 @@ jobs:
             cargo check --all-targets --no-default-features --features "$f" || exit 1
             cargo test --doc --no-default-features --features "$f" || exit 1
           done
+      # `IEC61850_REQUIRE_TSHARK` turns "tshark missing or too old" from a skip into a
+      # failure, so the Wireshark oracle cannot quietly stop running here.
       - run: cargo test --all-features
+        env:
+          IEC61850_REQUIRE_TSHARK: "1"
       # 512 seeds instead of the 64 a normal run does.
       - run: for s in $(seq 1 512); do SIM_SEED=$s cargo test --release --test simulation -- --exact publisher_and_subscriber_hold_their_invariants_under_an_adversarial_network || exit 1; done
       - run: cargo run --all-features --bin ied -- --help
