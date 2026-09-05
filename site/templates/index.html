@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+
+{#- One `@graph`: what the software is, what the site is (so a search engine can offer the
+    sitelinks search box), and the questions the page actually answers below. The FAQ entries
+    come from the page's own front matter, so the markup and the visible text cannot drift. -#}
+{% block structured_data %}
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareSourceCode",
+      "@id": "{{ config.base_url | safe }}/#software",
+      "name": "iec61850-rs",
+      "description": {{ config.description | json_encode | safe }},
+      "url": "{{ config.base_url | safe }}/",
+      "codeRepository": "{{ config.extra.repository }}",
+      "programmingLanguage": "Rust",
+      "runtimePlatform": "Rust 1.85+",
+      "license": "{{ config.extra.license_url }}",
+      "author": { "@type": "Person", "name": {{ config.author | json_encode | safe }} },
+      "keywords": {{ config.extra.keywords | json_encode | safe }},
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "Linux, macOS, Windows, no_std targets"
+    },
+    {
+      "@type": "WebSite",
+      "@id": "{{ config.base_url | safe }}/#website",
+      "name": "iec61850-rs",
+      "url": "{{ config.base_url | safe }}/",
+      "description": {{ config.description | json_encode | safe }},
+      "inLanguage": "en",
+      "potentialAction": {
+        "@type": "SearchAction",
+        "target": {
+          "@type": "EntryPoint",
+          "urlTemplate": "{{ get_url(path='@/docs/_index.md') | safe }}?q={search_term_string}"
+        },
+        "query-input": "required name=search_term_string"
+      }
+    }{% if section.extra.faq %},
+    {
+      "@type": "FAQPage",
+      "@id": "{{ config.base_url | safe }}/#faq",
+      "mainEntity": [
+        {%- for item in section.extra.faq %}
+        {
+          "@type": "Question",
+          "name": {{ item.q | json_encode | safe }},
+          "acceptedAnswer": { "@type": "Answer", "text": {{ item.a | json_encode | safe }} }
+        }{% if not loop.last %},{% endif %}
+        {%- endfor %}
+      ]
+    }{% endif %}
+  ]
+}
+{% endblock %}
+
+{% block content %}
+<section class="hero">
+  <div class="wrap">
+    <div>
+      <span class="eyebrow">GOOSE · Sampled Values · MMS client &amp; server · Edition 2.1</span>
+      {#- The heading carries the words a reader searches for. The tagline that used to be
+          here is the lede's job: a page whose only <h1> says nothing about IEC 61850 is a
+          page nobody arrives at. -#}
+      <h1>IEC 61850, in Rust.</h1>
+      <p class="lede">
+        Publish and subscribe to <strong>GOOSE</strong> and <strong>Sampled Values</strong> on
+        the process bus; browse, report and control over <strong>MMS</strong> on the station
+        bus, as a client <em>or</em> as a server. Decoders that <strong>cannot panic</strong>,
+        state machines that own no socket, and encoders checked against
+        <strong>real substation captures, frame for frame</strong>.
+      </p>
+      <div class="cta">
+        <a class="btn btn-primary" href="{{ get_url(path='@/docs/getting-started.md') | safe }}">Get started</a>
+        <a class="btn btn-ghost" href="{{ config.extra.repository }}" rel="noopener">View source</a>
+      </div>
+      <div class="stats">
+        <div><b>10,161</b><span>captured frames re-encoded exactly</span></div>
+        <div><b>0</b><span>allocations once running</span></div>
+        <div><b>2400/s</b><span>frames patched, not encoded</span></div>
+        <div><b>0</b><span>lines of generated model</span></div>
+      </div>
+    </div>
+    {%- if section.extra.hero_code %}
+    <div class="hero-code">
+      <div class="install"><code>cargo add iec61850-rs</code></div>
+      {{ section.extra.hero_code | markdown | safe }}
+    </div>
+    {%- endif %}
+  </div>
+</section>
+
+<div class="landing">
+{{ section.content | safe }}
+
+{%- if section.extra.faq %}
+<section class="band" id="faq">
+  <div class="wrap">
+    <h2>Questions people ask first</h2>
+    <div class="faq">
+      {%- for item in section.extra.faq %}
+      <details{% if loop.first %} open{% endif %}>
+        <summary>{{ item.q }}</summary>
+        <p>{{ item.a | markdown(inline=true) | safe }}</p>
+      </details>
+      {%- endfor %}
+    </div>
+  </div>
+</section>
+{%- endif %}
+</div>
+{% endblock %}

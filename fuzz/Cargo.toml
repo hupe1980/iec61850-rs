@@ -1,0 +1,72 @@
+[package]
+name = "iec61850-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+iec61850-rs = { path = "..", default-features = false, features = ["std", "goose", "sv", "mms", "scl", "pcap", "client", "server"] }
+
+[[bin]]
+name = "goose_frame"
+path = "fuzz_targets/goose_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sv_frame"
+path = "fuzz_targets/sv_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ber_data"
+path = "fuzz_targets/ber_data.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sv_publisher"
+path = "fuzz_targets/sv_publisher.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "pcap_read"
+path = "fuzz_targets/pcap_read.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "scl_load"
+path = "fuzz_targets/scl_load.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "scl_subscriptions"
+path = "fuzz_targets/scl_subscriptions.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "mms_stack"
+path = "fuzz_targets/mms_stack.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "mms_association"
+path = "fuzz_targets/mms_association.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "mms_server"
+path = "fuzz_targets/mms_server.rs"
+test = false
+doc = false

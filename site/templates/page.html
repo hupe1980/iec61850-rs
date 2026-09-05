@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+
+{#- `lower`/`higher` follow the section's `weight` order, which is the reading order. -#}
+{% block link_rels %}
+{%- if page.lower %}<link rel="prev" href="{{ page.lower.permalink | safe }}">{% endif %}
+{%- if page.higher %}<link rel="next" href="{{ page.higher.permalink | safe }}">{% endif %}
+{% endblock %}
+
+{% block structured_data %}
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "TechArticle",
+      "@id": "{{ page_url | safe }}#article",
+      "headline": {{ page_title | json_encode | safe }},
+      "description": {{ page_desc | json_encode | safe }},
+      "url": "{{ page_url | safe }}",
+      "inLanguage": "en",
+      "author": { "@type": "Person", "name": {{ config.author | json_encode | safe }} },
+      "isPartOf": {
+        "@type": "WebSite",
+        "name": "iec61850-rs",
+        "url": "{{ config.base_url | safe }}/"
+      },
+      "about": {
+        "@type": "SoftwareSourceCode",
+        "name": "iec61850-rs",
+        "codeRepository": "{{ config.extra.repository }}",
+        "programmingLanguage": "Rust"
+      },
+      "proficiencyLevel": "Expert"
+    },
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        { "@type": "ListItem", "position": 1, "name": "Home", "item": "{{ config.base_url | safe }}/" },
+        { "@type": "ListItem", "position": 2, "name": "Documentation", "item": "{{ get_url(path='@/docs/_index.md') | safe }}" },
+        { "@type": "ListItem", "position": 3, "name": {{ page.extra.nav_title | default(value=page.title) | json_encode | safe }} }
+      ]
+    }
+  ]
+}
+{% endblock %}
+
+{% block content %}
+<div class="wrap docs">
+  {% include "sidebar.html" %}
+  <article>
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="{{ get_url(path='@/_index.md') | safe }}">Home</a>
+      <span aria-hidden="true">/</span>
+      <a href="{{ get_url(path='@/docs/_index.md') | safe }}">Documentation</a>
+      <span aria-hidden="true">/</span>
+      <span aria-current="page">{{ page.extra.nav_title | default(value=page.title) }}</span>
+    </nav>
+    <h1>{{ page.title }}</h1>
+    {%- if page.description %}<p class="page-lede">{{ page.description }}</p>{% endif %}
+    {{ page.content | safe }}
+
+    <nav class="next" aria-label="Pagination">
+      <span>{% if page.lower %}<a rel="prev" href="{{ page.lower.permalink | safe }}">&larr; {{ page.lower.extra.nav_title | default(value=page.lower.title) }}</a>{% endif %}</span>
+      <span>{% if page.higher %}<a rel="next" href="{{ page.higher.permalink | safe }}">{{ page.higher.extra.nav_title | default(value=page.higher.title) }} &rarr;</a>{% endif %}</span>
+    </nav>
+  </article>
+
+  {#- On-page navigation. Rendered only where there is enough of it to be worth the column;
+      a two-heading page is a list of two links next to a page you can already see. -#}
+  {%- if page.toc | length > 2 %}
+  <nav class="toc" aria-label="On this page">
+    <h2>On this page</h2>
+    <ol>
+      {%- for h in page.toc %}
+      <li><a href="#{{ h.id }}">{{ h.title }}</a></li>
+      {%- endfor %}
+    </ol>
+  </nav>
+  {%- endif %}
+</div>
+{% endblock %}

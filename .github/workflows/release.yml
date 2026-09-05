@@ -1,0 +1,180 @@
+name: Release
+
+# Push an annotated tag to cut a release:
+#
+#   git tag -a v0.1.0 -m 'v0.1.0' && git push origin v0.1.0
+#
+# `workflow_dispatch` runs everything except the two irreversible steps, so the whole
+# pipeline can be rehearsed on a branch before a tag exists.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One release at a time, and never cancelled: a half-finished publish is worse than a slow one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Everything that can say "no" cheaply, before six machines start building.
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # A crates.io version is immutable and a tag is not, so the tag is checked against the
+      # manifest rather than the other way round. Publishing 0.1.0 as v0.2.0 cannot be undone.
+      - name: The tag and Cargo.toml must agree
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+            if [ "$tag" != "v$version" ]; then
+              echo "::error::tag $tag does not match Cargo.toml version $version (expected v$version)"
+              exit 1
+            fi
+          else
+            tag="v$version"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "releasing $tag"
+
+      # The packaged crate is not the working tree: `exclude` drops the site, the internal
+      # notes, the fuzz harness and the downloaded standards material, and a crate that only
+      # builds because of a file it does not ship fails here rather than on crates.io.
+      - name: The published package builds from what it ships
+        run: cargo publish --dry-run --locked
+
+      - name: Show what would be published
+        run: cargo package --list
+
+  # The release gate is CI itself — the feature matrix, the 512-seed simulation, the examples
+  # and the docs — invoked rather than copied.
+  ci:
+    name: ci
+    needs: guard
+    uses: ./.github/workflows/ci.yml
+
+  # `ied` is the reason to want a binary at all: a laptop on a substation LAN, or a gateway
+  # with no Rust toolchain on it. Every target builds natively, which the crate can afford
+  # because it has no C dependencies and one optional Rust one.
+  binaries:
+    name: ied ${{ matrix.target }}
+    needs: [guard, ci]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          # Statically linked: one file to copy onto a device whose glibc is older than the
+          # runner's, which is most of them.
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, packages: musl-tools }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, packages: musl-tools }
+          - { target: aarch64-apple-darwin, os: macos-14 }
+          - { target: x86_64-apple-darwin, os: macos-13 }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.packages
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
+
+      # `cli` is not a default feature — it is the only thing that builds this binary.
+      - run: cargo build --release --locked --features cli --bin ied --target ${{ matrix.target }}
+
+      # Every target is built on its own architecture, so the binary in the archive is also
+      # the binary that answers `--help` here: an archive nobody ran is a guess.
+      - name: Package
+        shell: bash
+        run: |
+          name="ied-${{ needs.guard.outputs.tag }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          if [ "${{ runner.os }}" = "Windows" ]; then bin=ied.exe; else bin=ied; fi
+          cp "target/${{ matrix.target }}/release/$bin" "dist/$name/$bin"
+          [ "$bin" = ied ] && strip "dist/$name/$bin" || true
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          "./dist/$name/$bin" --help > /dev/null
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$name.zip" "$name" > /dev/null
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ied-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  # The only step that cannot be taken back — a crates.io version is immutable — so nothing
+  # runs it on a guess: the gate has passed, `cargo publish --dry-run` has succeeded, and
+  # every binary has been built and has answered `--help`.
+  crates-io:
+    name: crates.io
+    needs: [guard, ci, binaries]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # Holds CARGO_REGISTRY_TOKEN, and is where a required reviewer goes if a publish should
+    # need a human to approve it.
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Last: the release page is the announcement, so it goes up once the thing it announces is
+  # actually installable.
+  github-release:
+    name: github release
+    needs: [guard, binaries, crates-io]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # Whoever downloads a binary off a release page should be able to check it without
+      # trusting the page it came from.
+      - name: Checksums
+        working-directory: artifacts
+        run: sha256sum *.tar.gz *.zip > SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ needs.guard.outputs.tag }}" \
+            --title "${{ needs.guard.outputs.tag }}" \
+            --generate-notes \
+            --verify-tag \
+            artifacts/*

@@ -1,0 +1,22 @@
+{# Documentation navigation. Pages are ordered by their `weight`, which is also the order
+   the `next`/`previous` links at the foot of each page follow. #}
+{%- set docs = get_section(path="docs/_index.md") -%}
+<aside class="sidebar">
+  <h2>Documentation</h2>
+  <ol>
+    <li>
+      <a href="{{ docs.permalink | safe }}"{% if current_path == docs.path %} aria-current="page"{% endif %}>Overview</a>
+    </li>
+    {%- for p in docs.pages %}
+    <li>
+      <a href="{{ p.permalink | safe }}"{% if current_path == p.path %} aria-current="page"{% endif %}>{{ p.extra.nav_title | default(value=p.title) }}</a>
+    </li>
+    {%- endfor %}
+  </ol>
+  <h2>Reference</h2>
+  <ol>
+    <li><a href="{{ config.extra.api_docs }}" rel="noopener">API (docs.rs)</a></li>
+    <li><a href="{{ config.extra.crate }}" rel="noopener">crates.io</a></li>
+    <li><a href="{{ config.extra.repository }}" rel="noopener">GitHub</a></li>
+  </ol>
+</aside>

@@ -1,0 +1,68 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # A release runs this same gate rather than a copy of it, so the two cannot drift.
+  workflow_call:
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: sudo apt-get update && sudo apt-get install -y tshark
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features
+      - run: cargo clippy --no-default-features --features goose,sv,mms
+      # Every feature has to stand on its own: a type that lives in the wrong module only
+      # shows up when the module it borrows from is switched off. `--all-targets` and the
+      # doctests are part of it — a unit test, an example or a doc example that reaches into
+      # a module the feature does not compile is the same defect, and those were the halves
+      # that used to slip through.
+      - run: |
+          cargo check --all-targets --no-default-features || exit 1
+          cargo test --doc --no-default-features || exit 1
+          for f in std goose sv mms scl pcap client server cli; do
+            cargo check --all-targets --no-default-features --features "$f" || exit 1
+            cargo test --doc --no-default-features --features "$f" || exit 1
+          done
+      - run: cargo test --all-features
+      # 512 seeds instead of the 64 a normal run does.
+      - run: for s in $(seq 1 512); do SIM_SEED=$s cargo test --release --test simulation -- --exact publisher_and_subscriber_hold_their_invariants_under_an_adversarial_network || exit 1; done
+      - run: cargo run --all-features --bin ied -- --help
+      # The examples are documentation that has to keep working: each one runs to completion
+      # with no network, no device and no arguments.
+      - run: |
+          for e in goose_roundtrip sv_merging_unit mms_loopback scl_model server_from_scl; do
+            cargo run --all-features --example "$e" > /dev/null || exit 1
+          done
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+  no_std:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - run: cargo build --no-default-features --features goose,sv,mms --target thumbv7em-none-eabihf
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: cargo check --all-features
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: for t in goose_frame sv_frame sv_publisher mms_stack mms_association ber_data scl_load scl_subscriptions pcap_read; do cargo fuzz run $t -- -max_total_time=60 -max_len=2048; done

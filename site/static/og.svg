@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img"
+     aria-label="iec61850-rs — IEC 61850 GOOSE and Sampled Values in Rust">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#111c33"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <!-- A busbar with two feeders: the substation single-line diagram, reduced. -->
+  <g fill="none" stroke="#5ac8fa" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" opacity="0.9">
+    <path d="M120 190h360"/>
+    <path d="M300 120v70"/>
+    <path d="M200 190v56l-26 40h52l-26-40"/>
+    <path d="M400 190v56l-26 40h52l-26-40"/>
+  </g>
+  <!-- Sampled-value waveform: the other half of the process bus. -->
+  <path d="M120 420q30-70 60 0t60 0q30-70 60 0t60 0q30-70 60 0t60 0"
+        fill="none" stroke="#7ee787" stroke-width="5" stroke-linecap="round" opacity="0.75"/>
+  <text x="120" y="520" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+        font-size="62" fill="#e8eef9" font-weight="700">iec61850-rs</text>
+  <text x="120" y="572" font-family="system-ui, -apple-system, Segoe UI, sans-serif"
+        font-size="30" fill="#9fb3d1">GOOSE &amp; Sampled Values for Rust</text>
+  <text x="640" y="150" font-family="system-ui, -apple-system, Segoe UI, sans-serif"
+        font-size="26" fill="#5ac8fa" letter-spacing="2">IEC 61850 · EDITION 2.1</text>
+  <g font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="30" fill="#c8d6ea">
+    <text x="640" y="230">Panic-free decoders</text>
+    <text x="640" y="290">Sans-IO state machines</text>
+    <text x="640" y="350">IEC 62351-6 replay protection</text>
+    <text x="640" y="410">9-2LE and IEC 61869-9 profiles</text>
+    <text x="640" y="470">no_std capable</text>
+  </g>
+</svg>

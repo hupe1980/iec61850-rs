@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block structured_data %}
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "CollectionPage",
+      "@id": "{{ page_url | safe }}#page",
+      "name": {{ page_title | json_encode | safe }},
+      "description": {{ page_desc | json_encode | safe }},
+      "url": "{{ page_url | safe }}",
+      "inLanguage": "en",
+      "isPartOf": { "@type": "WebSite", "name": "iec61850-rs", "url": "{{ config.base_url | safe }}/" },
+      "hasPart": [
+        {%- for p in section.pages %}
+        {
+          "@type": "TechArticle",
+          "headline": {{ p.title | json_encode | safe }},
+          "description": {{ p.description | default(value="") | json_encode | safe }},
+          "url": "{{ p.permalink | safe }}"
+        }{% if not loop.last %},{% endif %}
+        {%- endfor %}
+      ]
+    },
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        { "@type": "ListItem", "position": 1, "name": "Home", "item": "{{ config.base_url | safe }}/" },
+        { "@type": "ListItem", "position": 2, "name": {{ section.title | json_encode | safe }} }
+      ]
+    }
+  ]
+}
+{% endblock %}
+
+{% block content %}
+<div class="wrap docs">
+  {% include "sidebar.html" %}
+  <article>
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="{{ get_url(path='@/_index.md') | safe }}">Home</a>
+      <span aria-hidden="true">/</span>
+      <span aria-current="page">{{ section.title }}</span>
+    </nav>
+    <h1>{{ section.title }}</h1>
+    {%- if section.description %}<p class="page-lede">{{ section.description }}</p>{% endif %}
+    {{ section.content | safe }}
+  </article>
+</div>
+{% endblock %}

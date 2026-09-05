@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Redirecting…</title>
+{#- A moved URL must not compete with the page it moved to: tell a crawler not to index the
+    stub and where the content actually lives. -#}
+<meta name="robots" content="noindex, follow">
+<link rel="canonical" href="{{ url | safe }}">
+<meta http-equiv="refresh" content="0; url={{ url | safe }}">
+</head>
+<body>
+<p>This page moved to <a href="{{ url | safe }}">{{ url }}</a>.</p>
+<script>window.location.replace("{{ url | safe }}" + (window.location.hash || ""));</script>
+</body>
+</html>

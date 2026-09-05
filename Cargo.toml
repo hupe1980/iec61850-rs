@@ -1,0 +1,167 @@
+[package]
+name = "iec61850-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "IEC 61850 in Rust: GOOSE, Sampled Values, an MMS client over the whole OSI station-bus stack, and SCL — memory-safe, sans-IO cores, no async runtime, process-bus grade."
+repository = "https://github.com/hupe1980/iec61850-rs"
+keywords = ["iec61850", "goose", "sampled-values", "mms", "substation"]
+categories = ["network-programming", "embedded", "no-std"]
+readme = "README.md"
+# Only the library, its tests and the two licences are published. The site, the internal
+# notes, the downloaded standards material and the fuzz harness are not part of the crate.
+exclude = ["specs/", "concepts/", "fuzz/", "site/", ".github/", "scripts/"]
+
+[lib]
+name = "iec61850_rs"
+
+[features]
+default = ["std", "goose", "sv", "mms", "scl", "pcap", "client", "server"]
+# The crate is `no_std` + `alloc` everywhere: the codecs, the state machines and the model
+# all need an allocator, and there is no configuration in which they do not, so `alloc` is
+# not a feature that can be switched off. `std` adds file and socket-facing surface.
+std = []
+# Process-bus codecs, publisher scheduler and subscriber state machines (no_std + alloc).
+goose = []
+sv = []
+# The OSI stack of IEC 61850-8-1 (TPKT, COTP, session, presentation, ACSE) and the MMS PDUs
+# that ride on it. Codecs and framing only — the client and server state machines are next.
+mms = []
+# SCL loading into an IED model descriptor (needs std).
+scl = ["std", "dep:roxmltree"]
+# Reading and writing classic pcap files (needs std).
+pcap = ["std"]
+# A blocking MMS client over TCP: the association state machine plus a socket, no runtime
+# and no dependency. The sans-IO core is what an async wrapper would be written against.
+client = ["std", "mms"]
+# A blocking MMS server over TCP: the same association state machine in the server role, the
+# IED model from SCL as the served namespace, and the ACSI services above it. Sans-IO core,
+# blocking socket, no runtime and no dependency — the mirror of `client`.
+server = ["std", "mms", "scl"]
+# The `ied` command-line tool.
+cli = ["std", "pcap", "scl", "goose", "sv", "mms", "client", "server"]
+
+[dependencies]
+roxmltree = { version = "0.21", optional = true }
+
+[dev-dependencies]
+proptest = "1.11"
+
+[lints.rust]
+# The library itself carries `#![forbid(unsafe_code)]` in `src/lib.rs`, which is the actual
+# guarantee and cannot be opted out of. This is `deny` rather than `forbid` so that a test
+# target can opt in deliberately and visibly: `tests/allocation.rs` installs a counting
+# global allocator, which is the only way to turn "the steady state allocates nothing" into
+# something a test can assert.
+unsafe_code = "deny"
+missing_docs = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+struct_excessive_bools = "allow"
+similar_names = "allow"
+
+[[bin]]
+name = "ied"
+path = "src/bin/ied.rs"
+required-features = ["cli"]
+
+# Every test target states the features it needs, so `cargo test --features <subset>` builds
+# the ones that can build instead of failing on the ones that cannot — the same rule the
+# examples already follow.
+[[test]]
+name = "concepts"
+path = "tests/concepts.rs"
+
+[[test]]
+name = "allocation"
+path = "tests/allocation.rs"
+required-features = ["goose", "sv"]
+
+[[test]]
+name = "simulation"
+path = "tests/simulation.rs"
+required-features = ["goose"]
+
+[[test]]
+name = "pcap_goose"
+path = "tests/pcap_goose.rs"
+required-features = ["goose", "pcap", "scl"]
+
+[[test]]
+name = "pcap_sv"
+path = "tests/pcap_sv.rs"
+required-features = ["sv", "pcap", "scl"]
+
+[[test]]
+name = "pcap_mms"
+path = "tests/pcap_mms.rs"
+required-features = ["client"]
+
+[[test]]
+name = "scl_fixtures"
+path = "tests/scl_fixtures.rs"
+required-features = ["scl", "goose", "sv"]
+
+[[test]]
+name = "tshark_oracle"
+path = "tests/tshark_oracle.rs"
+required-features = ["goose", "sv", "pcap"]
+
+[[test]]
+name = "regressions"
+path = "tests/regressions.rs"
+required-features = ["mms"]
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "mms_client"
+path = "tests/mms_client.rs"
+required-features = ["client", "scl"]
+
+[[test]]
+name = "mms_server"
+path = "tests/mms_server.rs"
+required-features = ["client", "server"]
+
+# Examples state the features they use, so `cargo test --no-default-features` does not try to
+# build a GOOSE example without the GOOSE codec.
+[[example]]
+name = "goose_roundtrip"
+# Every example is a `std` binary — `Error` only implements `std::error::Error` there.
+required-features = ["std", "goose"]
+
+[[example]]
+name = "sv_merging_unit"
+required-features = ["sv", "pcap"]
+
+[[example]]
+name = "mms_loopback"
+required-features = ["client"]
+
+[[example]]
+name = "scl_model"
+# It prints an engineered control model (`mms`) and the sampled-value channel layout (`sv`),
+# both of which are gated fields on the SCL types themselves.
+required-features = ["scl", "sv", "mms"]
+
+[[example]]
+name = "server_from_scl"
+required-features = ["client", "server"]

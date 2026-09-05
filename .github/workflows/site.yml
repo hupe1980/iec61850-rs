@@ -1,0 +1,59 @@
+name: Site
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Only the deploy needs write access, and only one deploy may be in flight.
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  ZOLA_VERSION: "0.23.4"
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zola
+        run: |
+          curl -sSfL "https://github.com/getzola/zola/releases/download/v${ZOLA_VERSION}/zola-v${ZOLA_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C /usr/local/bin zola
+          zola --version
+      # `build` fails on a broken internal link, which is what keeps the guide's
+      # cross-references honest as pages move.
+      - name: Build
+        working-directory: site
+        run: zola build
+      # `check` additionally resolves every external link. It runs on pull requests too,
+      # but a dead third-party URL must not block a release, so it is advisory.
+      - name: Check links
+        working-directory: site
+        continue-on-error: true
+        run: zola check
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/public
+
+  deploy:
+    name: deploy to GitHub Pages
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
