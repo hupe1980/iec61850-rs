@@ -102,6 +102,10 @@ implementation rather than by running anything.
 - `tests/allocation.rs` counts **octets** as well as allocations, and its counters are
   thread-local so tests in that file may run in parallel.
 - Two fuzz crashes are committed as named regression inputs under `fuzz/regressions/`.
+- The fuzz smoke job discovers targets with `cargo fuzz list` instead of naming them, so a
+  target added to `fuzz/fuzz_targets/` cannot be one nothing runs — `mms_server` was.
+- The `sv_publisher` target drives `smpSynch` from the fuzzer's bytes, covering both sides of
+  the width boundary and the template re-encode that crossing it triggers.
 - `concepts/QUALITY.md` section numbering repaired (it had two `§5.2`s).
 
 ## [0.1.0] — 2026-09-06

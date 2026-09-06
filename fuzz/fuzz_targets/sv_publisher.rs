@@ -32,7 +32,13 @@ fuzz_target!(|data: &[u8]| {
     let Ok(mut publisher) = Publisher::new(PublisherConfig::new(header, "FUZZ", profile).with_time_fields(with_clock, with_clock)) else {
         return;
     };
-    publisher.set_smp_synch(SmpSynch::Global);
+    // `smpSynch` is `0..254` and its field widens past 127, which re-encodes the template.
+    // Driving it from the fuzzer's own bytes puts both sides of that boundary — and the
+    // re-encode itself — on the path every assertion below checks.
+    let synch = SmpSynch::from_u8(data.get(2).copied().unwrap_or(2));
+    if publisher.set_smp_synch(synch).is_err() {
+        return;
+    }
     if with_clock {
         publisher.set_refr_tm(UtcTime::from_unix_nanos(u64::from(u32::from_be_bytes([1, 2, 3, 4])), TimeQuality::SYNCHRONIZED));
         publisher.set_gm_identity([0xAA; 8]);
@@ -66,7 +72,7 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(asdu.sample, &blocks[i][..], "sample block {i} was not written back verbatim");
         let expected = ((u32::from(start) + i as u32) % profile.smp_cnt_wrap()) as u16;
         assert_eq!(asdu.smp_cnt, expected, "smpCnt {i}");
-        assert_eq!(asdu.smp_synch, Some(SmpSynch::Global));
+        assert_eq!(asdu.smp_synch, Some(synch), "smpSynch survives the width its value needs");
         assert_eq!(asdu.gm_identity.is_some(), with_clock);
         assert_eq!(asdu.refr_tm.is_some(), with_clock);
     }

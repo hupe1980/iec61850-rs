@@ -78,4 +78,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo install cargo-fuzz --locked
-      - run: for t in goose_frame sv_frame sv_publisher mms_stack mms_association ber_data scl_load scl_subscriptions pcap_read; do cargo fuzz run $t -- -max_total_time=60 -max_len=2048; done
+      # Every target in `fuzz/fuzz_targets/`, discovered rather than listed: a target added
+      # to the directory and forgotten here is one nothing runs.
+      - run: |
+          targets=$(cargo fuzz list)
+          echo "$targets"
+          for t in $targets; do cargo fuzz run "$t" -- -max_total_time=60 -max_len=2048; done
