@@ -8,7 +8,8 @@
 //! What each test guards is on the test; why the whole file exists is D52 and D53.
 //!
 //! **Running it.** Point `IEC61850_LIBIEC61850` at a built checkout — `git clone
-//! https://github.com/mz-automation/libiec61850 && make examples` — and the tests run.
+//! https://github.com/mz-automation/libiec61850 && make examples && make -C
+//! examples/server_example_logging` — and the tests run.
 //! Without it they skip, because the dependency is a C library under a different licence and
 //! nothing here vendors it. `IEC61850_REQUIRE_INTEROP=1` turns the skip into a failure, which
 //! is what CI sets: an oracle that can quietly stop running is not an oracle.
@@ -31,24 +32,41 @@ use iec61850_rs::client::{Client, ControlModel, RcbSettings, TrgOps};
 use iec61850_rs::proto::data::{Typed, Value};
 use iec61850_rs::server::{Ied, Server, ServerHandle};
 
-/// A built libiec61850 checkout, or `None` (tests skip).
+/// Whether a missing checkout or an unbuilt tool is a failure rather than a skip.
 ///
-/// `IEC61850_REQUIRE_INTEROP=1` makes a missing or unbuilt checkout a failure instead.
+/// CI sets it, for the reason `IEC61850_REQUIRE_TSHARK` exists: an oracle that can quietly stop
+/// running is not an oracle.
+fn required() -> bool {
+    std::env::var("IEC61850_REQUIRE_INTEROP").is_ok_and(|v| v != "0")
+}
+
+/// A built libiec61850 checkout, or `None` (tests skip).
 fn libiec61850() -> Option<PathBuf> {
-    let required = std::env::var("IEC61850_REQUIRE_INTEROP").is_ok_and(|v| v != "0");
     let Ok(root) = std::env::var("IEC61850_LIBIEC61850").map(PathBuf::from) else {
-        assert!(!required, "IEC61850_REQUIRE_INTEROP is set, but IEC61850_LIBIEC61850 does not name a libiec61850 checkout");
+        assert!(!required(), "IEC61850_REQUIRE_INTEROP is set, but IEC61850_LIBIEC61850 does not name a libiec61850 checkout");
         eprintln!("skipping: set IEC61850_LIBIEC61850 to a built libiec61850 checkout to run the interop tests");
         return None;
     };
-    // One built binary is the proof that `make examples` ran; a source-only checkout is a
+    // `mms_utility` is the proof that `make examples` ran at all; a source-only checkout is a
     // more confusing failure than a missing one.
-    if !root.join("examples/mms_utility/mms_utility").is_file() {
-        assert!(!required, "IEC61850_REQUIRE_INTEROP is set, but {} holds no built examples (run `make examples`)", root.display());
-        eprintln!("skipping: {} holds no built examples; run `make examples` there", root.display());
-        return None;
+    tool(&root, "examples/mms_utility/mms_utility").map(|_| root)
+}
+
+/// One of their built binaries, or `None` (the test that needs it skips).
+///
+/// `make examples` does **not** build all of them: their makefile keeps two lists, and
+/// `server_example_logging` is in the model list and not the example list. So a test names the
+/// binary it needs and the failure says which `make` produces it, rather than
+/// `No such file or directory` from the far side of a `spawn`.
+fn tool(root: &Path, rel: &str) -> Option<PathBuf> {
+    let path = root.join(rel);
+    if path.is_file() {
+        return Some(path);
     }
-    Some(root)
+    let dir = root.join(Path::new(rel).parent().unwrap_or(Path::new("examples")));
+    assert!(!required(), "IEC61850_REQUIRE_INTEROP is set, but {} is not built — run `make -C {}`", path.display(), dir.display());
+    eprintln!("skipping: {} is not built; run `make -C {}`", path.display(), dir.display());
+    None
 }
 
 /// One of libiec61850's own engineering files, read from its tree rather than copied here.
@@ -76,7 +94,7 @@ fn serve(xml: &str) -> (String, ServerHandle, std::thread::JoinHandle<()>) {
 
 /// Run one of their tools to completion and return its standard output.
 fn run(root: &Path, rel: &str, args: &[&str]) -> String {
-    let path = root.join(rel);
+    let Some(path) = tool(root, rel) else { return String::new() };
     let out = Command::new(&path).args(args).output().unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -85,7 +103,7 @@ fn run(root: &Path, rel: &str, args: &[&str]) -> String {
 ///
 /// The child is handed straight into a [`Reaped`], which is what waits on it.
 #[allow(clippy::zombie_processes)]
-fn spawn_server(root: &Path, rel: &str, dir: &str) -> (Child, String) {
+fn spawn_server(bin: &Path) -> (Child, String) {
     // Their examples take the port as `argv[1]` and bind every interface, so a free one has
     // to be chosen here rather than asked for afterwards.
     let port = {
@@ -94,13 +112,16 @@ fn spawn_server(root: &Path, rel: &str, dir: &str) -> (Child, String) {
         drop(l);
         p
     };
-    let child = Command::new(root.join(rel))
+    // Their file store and their log are relative to the working directory, so it is the
+    // example's own directory and not the test's.
+    let dir = bin.parent().unwrap_or(Path::new("."));
+    let child = Command::new(bin)
         .arg(port.to_string())
-        .current_dir(root.join(dir))
+        .current_dir(dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap_or_else(|e| panic!("{rel}: {e}"));
+        .unwrap_or_else(|e| panic!("{}: {e}", bin.display()));
     let addr = format!("127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -109,7 +130,7 @@ fn spawn_server(root: &Path, rel: &str, dir: &str) -> (Child, String) {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("{rel} never started listening on {addr}");
+    panic!("{} never started listening on {addr}", bin.display());
 }
 
 /// A child that is killed when the test ends, however it ends.
@@ -185,6 +206,7 @@ fn libiec61850_operates_all_four_control_models_on_this_server() {
 #[test]
 fn libiec61850_takes_reports_from_this_server() {
     let Some(root) = libiec61850() else { return };
+    let Some(bin) = tool(&root, "examples/iec61850_client_example1/client_example1") else { return };
     let (addr, _handle, _joined) = serve(&model(&root, "examples/server_example_threadless/simpleIO_direct_control.cid"));
     let (host, port) = addr.split_once(':').expect("host:port");
 
@@ -192,14 +214,7 @@ fn libiec61850_takes_reports_from_this_server() {
     // test of the suite. It is run to *completion* rather than cut short: a C program writing
     // to a pipe buffers its output in blocks and flushes it at exit, so a client killed early
     // says nothing at all — which is exactly what a green-looking empty assertion would be.
-    let mut child = Reaped(
-        Command::new(root.join("examples/iec61850_client_example1/client_example1"))
-            .args([host, port])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start their reporting client"),
-    );
+    let mut child = Reaped(Command::new(&bin).args([host, port]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("start their reporting client"));
     let mut stdout = child.0.stdout.take().expect("piped");
     let text = std::thread::spawn(move || {
         use std::io::Read;
@@ -258,7 +273,8 @@ fn an_array_element_is_read_as_one_element_in_both_directions() {
     assert!(!component.contains('Z'), "a component of an element is smaller still: {component}");
 
     // Our client, their server, over the same model — the direction that needs the encoder.
-    let (child, addr) = spawn_server(&root, "examples/server_example_complex_array/server_example_ca", "examples/server_example_complex_array");
+    let Some(bin) = tool(&root, "examples/server_example_complex_array/server_example_ca") else { return };
+    let (child, addr) = spawn_server(&bin);
     let _reaped = Reaped(child);
     let mut c = Client::connect(&addr).expect("associate");
 
@@ -289,7 +305,8 @@ fn an_array_element_is_read_as_one_element_in_both_directions() {
 #[test]
 fn this_client_drives_a_libiec61850_server() {
     let Some(root) = libiec61850() else { return };
-    let (child, addr) = spawn_server(&root, "examples/server_example_basic_io/server_example_basic_io", "examples/server_example_basic_io");
+    let Some(bin) = tool(&root, "examples/server_example_basic_io/server_example_basic_io") else { return };
+    let (child, addr) = spawn_server(&bin);
     let _reaped = Reaped(child);
     let mut c = Client::connect(&addr).expect("associate with libiec61850");
 
@@ -340,7 +357,8 @@ fn this_client_drives_a_libiec61850_server() {
 #[test]
 fn this_client_reads_a_log_out_of_a_libiec61850_server() {
     let Some(root) = libiec61850() else { return };
-    let (child, addr) = spawn_server(&root, "examples/server_example_logging/server_example_logging", "examples/server_example_logging");
+    let Some(bin) = tool(&root, "examples/server_example_logging/server_example_logging") else { return };
+    let (child, addr) = spawn_server(&bin);
     let _reaped = Reaped(child);
     // The example writes one entry a second; one is enough.
     std::thread::sleep(Duration::from_secs(2));

@@ -87,6 +87,11 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/mz-automation/libiec61850 "$RUNNER_TEMP/libiec61850"
           make -C "$RUNNER_TEMP/libiec61850" -j"$(nproc)" examples
+          # `make examples` walks their makefile's *example* list, and
+          # `server_example_logging` is only in its *model* list — so it is built by name.
+          # `IEC61850_REQUIRE_INTEROP` turns a tool that is missing here into a failure rather
+          # than a test that quietly stops running.
+          make -C "$RUNNER_TEMP/libiec61850/examples/server_example_logging"
       - run: cargo test --all-features --test interop -- --test-threads=3
         env:
           IEC61850_LIBIEC61850: ${{ runner.temp }}/libiec61850

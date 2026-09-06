@@ -273,6 +273,7 @@ cargo test --all-features                     # captures and tshark tests skip i
 # The interop oracle: libiec61850 in both roles. Skips unless it is built and pointed at.
 git clone --depth 1 https://github.com/mz-automation/libiec61850 /tmp/libiec61850
 make -C /tmp/libiec61850 -j examples
+make -C /tmp/libiec61850/examples/server_example_logging   # not in their `examples` target
 IEC61850_LIBIEC61850=/tmp/libiec61850 cargo test --all-features --test interop
 
 SIM_SEED=42 cargo test --test simulation      # replay one simulation seed
