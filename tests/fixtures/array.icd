@@ -1,0 +1,73 @@
+<?xml version="1.0"?>
+<!--
+  A file that engineers an **array**, which is the shape most stacks stop short of.
+
+  `MHAI` — harmonics — is where arrays actually occur in the field: one `CMV` per harmonic,
+  sixteen of them, and a client that wants the third one's magnitude has no *name* to read.
+  MMS gives an array's elements none, so the reference `MHAI1.HA.phsAHar(2).cVal.mag.f` names
+  the variable `MHAI1$MX$HA$phsAHar` and carries everything from the index on as an ISO 9506
+  `alternateAccess`.
+
+  Three things about this file are the point.
+
+  `count` is on an `SDO`, and it is a **number** here and an attribute *name* on `sqHar` —
+  SCL types it as a union of the two ✅ (`tDACount`/`tSDOCount`, `SCL_Enums.xsd`), and both
+  mean the same thing.
+
+  The data set names array **elements**, at four different depths, which is what `FCDA/@ix`
+  is for ✅ (`tFCDA`, `SCL_IED.xsd`). `dsHar` deliberately writes the index only in `ix` — the
+  form the schema asks for — so the loader has to place it against the *model* rather than
+  against the last name in the reference.
+
+  And `ArrTrk` is a `CST` in a device that has an array, so a service against an element is
+  tracked like any other.
+-->
+<SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">
+  <Header id="array"/>
+  <IED name="IED1"><AccessPoint name="P1"><Server><LDevice inst="LD0">
+    <LN0 lnClass="LLN0" inst="" lnType="LLN0_T">
+      <DataSet name="dsHar">
+        <FCDA ldInst="LD0" lnClass="MHAI" lnInst="1" doName="HA" daName="phsAHar" fc="MX" ix="0"/>
+        <FCDA ldInst="LD0" lnClass="MHAI" lnInst="1" doName="HA" daName="phsAHar.cVal" fc="MX" ix="1"/>
+        <FCDA ldInst="LD0" lnClass="MHAI" lnInst="1" doName="HA" daName="phsAHar.cVal.mag.f" fc="MX" ix="2"/>
+        <FCDA ldInst="LD0" lnClass="MHAI" lnInst="1" doName="HA" daName="numHar" fc="MX"/>
+      </DataSet>
+      <ReportControl name="urcb" datSet="dsHar" confRev="1" indexed="false" bufTime="0">
+        <TrgOps dchg="true" qchg="true"/>
+        <OptFields seqNum="true" timeStamp="true" dataSet="true" reasonCode="true"/>
+      </ReportControl>
+    </LN0>
+    <LN lnClass="MHAI" inst="1" prefix="" lnType="MHAI_T"/>
+  </LDevice></Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="Mod" type="INC_T"/></LNodeType>
+    <LNodeType id="MHAI_T" lnClass="MHAI"><DO name="HA" type="HMV_T"/></LNodeType>
+
+    <DOType id="INC_T" cdc="INC">
+      <DA name="stVal" fc="ST" bType="Enum" type="Mod_E"/>
+      <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+    </DOType>
+    <!-- `numHar` is an ordinary attribute *and* the length of `sqHar`: `count` may name one
+         instead of holding a number, which is the half of the union a file uses when the
+         array's length is engineered in one place. -->
+    <DOType id="HMV_T" cdc="HMV">
+      <DA name="numHar" fc="MX" bType="INT16U"><Val>3</Val></DA>
+      <SDO name="phsAHar" type="CMV_T" count="16"/>
+      <SDO name="sqHar" type="CMV_T" count="numHar"/>
+      <DA name="q" fc="MX" bType="Quality"/>
+      <DA name="t" fc="MX" bType="Timestamp"/>
+    </DOType>
+    <DOType id="CMV_T" cdc="CMV">
+      <DA name="cVal" fc="MX" bType="Struct" type="Vector_T"/>
+      <DA name="q" fc="MX" bType="Quality"/>
+      <DA name="t" fc="MX" bType="Timestamp"/>
+    </DOType>
+    <DAType id="Vector_T">
+      <BDA name="mag" bType="Struct" type="AnalogueValue_T"/>
+      <BDA name="ang" bType="Struct" type="AnalogueValue_T"/>
+    </DAType>
+    <DAType id="AnalogueValue_T"><BDA name="f" bType="FLOAT32"/></DAType>
+    <EnumType id="Mod_E"><EnumVal ord="1">on</EnumVal></EnumType>
+  </DataTypeTemplates>
+</SCL>

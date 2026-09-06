@@ -58,7 +58,7 @@
 //!
 //! | Module | What it holds |
 //! |---|---|
-//! | [`common`] | The types every layer shares: [`UtcTime`], [`Quality`], [`ObjectReference`], [`Fc`], [`MacAddr`], [`Edition`], [`Limits`], and the IEC 61850-7-2 modelling types `TrgOps`, `OptFlds`, `ReasonCode` and [`ControlModel`](common::ControlModel) |
+//! | [`common`] | The types every layer shares: [`UtcTime`], [`Quality`], [`ObjectReference`], [`Fc`], [`MacAddr`], [`Edition`], [`Limits`], and the IEC 61850-7-2 modelling types `TrgOps`, `OptFlds`, `ReasonCode`, [`ControlModel`](common::ControlModel) and [`ServiceType`](common::ServiceType) |
 //! | [`ber`] | A panic-free BER codec for the subset IEC 61850 uses |
 //! | [`proto`] | The protocol cores: Ethernet framing, MMS `Data`, GOOSE, Sampled Values |
 //! | [`proto::sv::SampleLayout`] | What the octets of a sampled-value ASDU mean, read out of the engineering file |
@@ -71,7 +71,7 @@
 //! | [`proto::mms::journal`] | What a log entry is on the wire, and the ranges `QueryLogByTime`/`QueryLogAfterEntry` map onto (feature `mms`) |
 //! | [`proto::mms::typespec`] | `TypeSpecification` — what `GetVariableAccessAttributes` answers with (feature `mms`) |
 //! | [`client`] | A blocking MMS client: browse, read, write, reporting, control, files, logs, setting groups (feature `client`) |
-//! | [`server`] | A blocking MMS server: the SCL file is the namespace, with a report engine, the four control models, setting groups, a sandboxed file store and logs (feature `server`) |
+//! | [`server`] | A blocking MMS server: the SCL file is the namespace, with a report engine, the four control models, setting groups, service tracking, a sandboxed file store and logs (feature `server`) |
 //! | [`model`] | The IED model a publisher takes its addresses and data sets from |
 //! | [`scl`] | Reading that model out of an ICD, CID or SCD, resolving what an IED subscribes to, and checking the engineering the schema does not (feature `scl`) |
 //! | [`pcap`] | Classic capture files, for replaying traffic and recording what was built (feature `pcap`) |
@@ -89,19 +89,20 @@
 //!
 //! # Status
 //!
-//! Pre-release. The process bus is implemented and tested against real substation captures.
-//! On the station bus, the six OSI layers, the association over them and **both** ends above
-//! it — browse, read, write, report control blocks with decoded and reassembled reports, the
-//! four control models, file services, logs, setting groups, type discovery and data-set
-//! create/delete — are verified against a real capture and against each other over a socket.
-//! Service tracking, the raw-socket adapters and the IEC 62351 security profiles are not
-//! written yet. The API will change, and nothing here has been through a conformance
-//! laboratory.
+//! Pre-release. The process bus is tested against real substation captures; on the station
+//! bus, the six OSI layers, the association over them and both ends above it are verified
+//! against a real capture, against `tshark` and against each other over a socket. Not
+//! included: the raw-socket adapters and the IEC 62351 security profiles.
+//! The API will change, and nothing here has been through a conformance laboratory.
 //!
 //! The guide at <https://hupe1980.github.io/iec61850-rs/> covers the protocols themselves,
 //! and is explicit about what is verified and what is not.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+// docs.rs builds with every feature and on nightly, so each gated item can carry the
+// feature that unlocks it. Answering "which feature do I need for this?" from the page
+// itself is worth one nightly-only attribute.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::missing_panics_doc))]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

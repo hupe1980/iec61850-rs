@@ -272,6 +272,11 @@ impl Subscriber {
         self.stats
     }
 
+    /// The configuration this subscriber was built with.
+    pub const fn config(&self) -> &SubscriberConfig {
+        &self.cfg
+    }
+
     /// The [`FrameDeltas`] of the most recently accepted frame, or `None` before the second
     /// one arrives — a delta needs two frames.
     pub const fn deltas(&self) -> Option<FrameDeltas> {
@@ -281,6 +286,32 @@ impl Subscriber {
     /// The `stNum` of the current state, if any frame was accepted.
     pub fn st_num(&self) -> Option<u32> {
         self.state.map(|s| s.st_num)
+    }
+
+    /// The `confRev` of the stream: the one that was expected, or the first one seen when
+    /// the subscription adopts whatever arrives.
+    ///
+    /// This is what a supervision logical node publishes as `ConfRevNum`, and it is the field
+    /// a commissioning engineer looks at first when a subscription is dark for no visible
+    /// reason.
+    pub const fn conf_rev(&self) -> Option<u32> {
+        self.conf_rev
+    }
+
+    /// Whether the publisher is signalling `ndsCom` — it needs commissioning and its data is
+    /// not usable.
+    pub const fn needs_commissioning(&self) -> bool {
+        self.nds_com
+    }
+
+    /// True when the subscription is **live**: a frame has been accepted and its
+    /// `timeAllowedtoLive` has not run out.
+    ///
+    /// This is `LGOS.St`, and it is deliberately not "a frame has ever arrived": a stream
+    /// that stopped an hour ago is not a healthy subscription, and the whole point of the
+    /// supervision logical node is to say so.
+    pub const fn is_live(&self) -> bool {
+        self.state.is_some() && !self.expired
     }
 
     /// True while no frame has arrived within the last `timeAllowedtoLive`.

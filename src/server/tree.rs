@@ -28,10 +28,11 @@
 //! Building the tree once, at load, is what makes browse, read, write and type discovery three
 //! walks of the same structure instead of three interpretations of the model.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::common::Fc;
+use crate::common::{Fc, split_index};
 use crate::model::{BType, DataAttribute, DataObject, LogicalDevice, LogicalNode};
 use crate::proto::mms::typespec::{Component, TypeSpec};
 
@@ -43,6 +44,11 @@ pub const SEP: char = '$';
 pub enum VarKind {
     /// A structure; its components are the children.
     Structure,
+    /// An **array** of this many elements, all of one type. Its single child is the element
+    /// prototype and is *not* a named component: MMS gives an array's elements no names, so a
+    /// client reaches one with an `alternateAccess` index rather than with a longer name
+    /// ([`crate::proto::mms::alternate`]).
+    Array(u32),
     /// A leaf holding a value of this basic type.
     Leaf(BType),
 }
@@ -64,7 +70,7 @@ pub struct Variable {
 
 impl Variable {
     /// A structure node.
-    fn structure(name: impl Into<String>, fc: Option<Fc>, children: Vec<Variable>) -> Variable {
+    pub(crate) fn structure(name: impl Into<String>, fc: Option<Fc>, children: Vec<Variable>) -> Variable {
         Variable { name: name.into(), kind: VarKind::Structure, fc, children }
     }
 
@@ -73,23 +79,62 @@ impl Variable {
         Variable { name: name.into(), kind: VarKind::Leaf(btype), fc, children: Vec::new() }
     }
 
-    /// True when this node has components.
+    /// An array node of `count` elements shaped like `element`.
+    pub(crate) fn array(name: impl Into<String>, fc: Option<Fc>, count: u32, element: Variable) -> Variable {
+        Variable { name: name.into(), kind: VarKind::Array(count), fc, children: alloc::vec![element] }
+    }
+
+    /// True when this node has named components.
     pub fn is_structure(&self) -> bool {
         matches!(self.kind, VarKind::Structure)
     }
 
+    /// How many elements this node has, when it is an array.
+    pub const fn array_len(&self) -> Option<u32> {
+        match self.kind {
+            VarKind::Array(n) => Some(n),
+            VarKind::Structure | VarKind::Leaf(_) => None,
+        }
+    }
+
+    /// The shape of one element, when this node is an array.
+    pub fn element(&self) -> Option<&Variable> {
+        self.array_len().and(self.children.first())
+    }
+
     /// The component of this structure with `name`.
+    ///
+    /// An **array** has none: its elements are reached by index, and answering with the
+    /// element prototype here would let `LLN0$MX$HA$phsAHar$cVal` resolve to a name the
+    /// namespace does not contain and a client could never have browsed.
     pub fn child(&self, name: &str) -> Option<&Variable> {
+        if self.array_len().is_some() {
+            return None;
+        }
         self.children.iter().find(|c| c.name == name)
     }
 
     /// Walk `path` from this node.
+    ///
+    /// A component may carry an **array index** — `phsAHar(2)` — which descends into the
+    /// element rather than into a named child. An index on something that is not an array, or
+    /// one past its end, resolves to nothing: a server that clamped it would answer a
+    /// different question from the one it was asked.
     pub fn resolve<'a>(&'a self, path: &mut dyn Iterator<Item = &str>) -> Option<&'a Variable> {
         let mut node = self;
         for part in path {
-            node = node.child(part)?;
+            let (name, index) = split_index(part);
+            node = node.child(name)?;
+            if let Some(i) = index {
+                node = node.at(i)?;
+            }
         }
         Some(node)
+    }
+
+    /// The element at `index`, when this node is an array that has one.
+    pub fn at(&self, index: u32) -> Option<&Variable> {
+        (index < self.array_len()?).then(|| self.element()).flatten()
     }
 
     /// The type specification `GetVariableAccessAttributes` answers with.
@@ -104,6 +149,13 @@ impl Variable {
             VarKind::Structure => TypeSpec::Structure {
                 packed: false,
                 components: self.children.iter().map(|c| Component { name: Some(c.name.clone()), type_spec: c.type_spec() }).collect(),
+            },
+            // An array with no element prototype cannot happen from a loaded model, and a
+            // structure of nothing is the honest answer if it ever did.
+            VarKind::Array(n) => TypeSpec::Array {
+                packed: false,
+                elements: *n,
+                element_type: Box::new(self.element().map_or(TypeSpec::Structure { packed: false, components: Vec::new() }, Variable::type_spec)),
             },
             VarKind::Leaf(b) => type_of(b),
         }
@@ -129,9 +181,10 @@ pub fn type_of(btype: &BType) -> TypeSpec {
         BType::Float64 => TypeSpec::FloatingPoint { format_width: 64, exponent_width: 11 },
         // Exactly two bits, because a position code is two bits and nothing else.
         BType::Dbpos | BType::Tcmd => TypeSpec::BitString(2),
-        // `PhyComAddr` is a structure of its own (`Addr`, `PRIORITY`, `VID`, `APPID`) and
-        // `Struct` is one by definition; both are only reached here when the model gave a
-        // structure no components, which is a file that says nothing about its own shape.
+        // `PhyComAddr` is a structure of its own and is expanded into one by
+        // [`attribute_variable`], so it only reaches here as the type of a node that has
+        // already been given those components. `Struct` with nothing under it is a file that
+        // said nothing about its own shape.
         BType::PhyComAddr | BType::Struct | BType::Other(_) => TypeSpec::Structure { packed: false, components: Vec::new() },
         // At most: a quality is thirteen bits and a check is two, and the negative length is
         // what says "at most" rather than "exactly".
@@ -139,7 +192,7 @@ pub fn type_of(btype: &BType) -> TypeSpec {
         BType::Check => TypeSpec::BitString(-2),
         BType::TrgOps => TypeSpec::BitString(-6),
         BType::OptFlds => TypeSpec::BitString(-10),
-        BType::SvOptFlds => TypeSpec::BitString(-3),
+
         BType::Timestamp => TypeSpec::UtcTime,
         BType::EntryTime => TypeSpec::BinaryTime(true),
         BType::VisString32 => TypeSpec::VisibleString(-32),
@@ -150,6 +203,16 @@ pub fn type_of(btype: &BType) -> TypeSpec {
         BType::Currency => TypeSpec::VisibleString(-3),
         BType::Octet64 => TypeSpec::OctetString(-64),
         BType::EntryID => TypeSpec::OctetString(-8),
+        // Edition 2.1: exactly six and exactly sixteen octets — a MAC address and an IPv6
+        // one — so the length is positive, not a bound ✅ (`SCL_Enums.xsd`).
+        BType::Octet6 => TypeSpec::OctetString(6),
+        BType::Octet16 => TypeSpec::OctetString(16),
+        // The sampled-value and log option flags. Both bit assignments are Edition 2.1 and
+        // behind the paywall, so the width is a **bound** of one octet rather than a claim ⚠
+        // — every flag list either of them can express fits it (`SmvOpts` has seven
+        // attributes plus the reserved bit ✅ `SCL_IED.xsd`), and a bounded bit string is
+        // what says "at most" on the wire.
+        BType::SvOptFlds | BType::LogOptFlds => TypeSpec::BitString(-8),
         BType::Unicode255 => TypeSpec::MmsString(-255),
     }
 }
@@ -190,6 +253,12 @@ impl Domain {
 
 fn push_names(node: &Variable, prefix: &str, out: &mut Vec<String>) {
     out.push(String::from(prefix));
+    // An array's elements have no names, so the namespace stops here: everything below is
+    // reached with an `alternateAccess` and a `GetNameList` that listed it would be offering
+    // names no `Read` can resolve.
+    if node.array_len().is_some() {
+        return;
+    }
     for child in &node.children {
         let mut name = String::with_capacity(prefix.len() + 1 + child.name.len());
         name.push_str(prefix);
@@ -231,10 +300,28 @@ pub fn domain_of(ld: &LogicalDevice, extra: &mut dyn FnMut(&LogicalNode) -> Vec<
 }
 
 /// Every functional constraint any attribute of `ln` is under, in a stable order.
+///
+/// `SG` and `SE` always arrive **together**, whichever of the two the file names. They are two
+/// views of one setting — what is in force and the edit copy of it (IEC 61850-7-2 §11) — and
+/// SCL cannot declare them separately: the schema makes a `DA` name unique within its `DOType`
+/// ✅ (`uniqueDAorSDOInDOType`), so a `setMag` under `SG` and a `setMag` under `SE` in one
+/// `ASG` type is not a legal file. The `<Val sGroup="n">` list on a single `DAI` says the same
+/// thing from the other side: one declaration carries every group.
+///
+/// A server that published only what the file spells therefore had no `SE` namespace at all,
+/// and the whole setting-group edit service — select, write, confirm — answered
+/// `object-non-existent` on any file a schema would accept.
 fn functional_constraints(ln: &LogicalNode) -> Vec<Fc> {
     let mut out: Vec<Fc> = Vec::new();
     for d in &ln.data_objects {
         collect_fcs(d, &mut out);
+    }
+    if out.contains(&Fc::SG) || out.contains(&Fc::SE) {
+        for fc in [Fc::SG, Fc::SE] {
+            if !out.contains(&fc) {
+                out.push(fc);
+            }
+        }
     }
     out.sort_by_key(|fc| fc.as_str());
     out
@@ -253,19 +340,92 @@ fn collect_fcs(object: &DataObject, out: &mut Vec<Fc>) {
 
 /// The part of a data object that lives under `fc`, or `None` when none of it does.
 fn object_under(object: &DataObject, fc: Fc) -> Option<Variable> {
-    let mut children: Vec<Variable> = object.attributes.iter().filter(|a| a.fc == fc).map(attribute_variable).collect();
+    let mut children: Vec<Variable> = object.attributes.iter().filter(|a| belongs_under(a.fc, fc)).map(|a| attribute_variable(a, fc)).collect();
     children.extend(object.sub_objects.iter().filter_map(|s| object_under(s, fc)));
-    if children.is_empty() { None } else { Some(Variable::structure(object.name.clone(), Some(fc), children)) }
+    if children.is_empty() {
+        return None;
+    }
+    let element = Variable::structure(object.name.clone(), Some(fc), children);
+    // An `SDO` carries a `count` too: an array of sub data objects, the same rule one level up.
+    Some(match object.count {
+        Some(n) => Variable::array(object.name.clone(), Some(fc), n, element),
+        None => element,
+    })
+}
+
+/// Whether an attribute declared under `declared` is published under `fc`.
+///
+/// The identity everywhere except for the setting-group pair, where one declaration is
+/// published under both.
+fn belongs_under(declared: Fc, fc: Fc) -> bool {
+    matches!((declared, fc), (Fc::SG | Fc::SE, Fc::SG | Fc::SE)) || declared == fc
+}
+
+/// The `PhyComAddr` structure of IEC 61850-7-3: the link-layer address a control block
+/// publishes to.
+///
+/// It is a *structure* on the wire and not an octet string, and the four component names are
+/// the ones every stack uses 🌐 (libiec61850 `MmsMapping_createPhyComAddrStructure`). A model
+/// that left it a leaf would answer `GetVariableAccessAttributes` with a structure that has no
+/// components and `Read` with an octet string — two answers about one variable.
+pub fn phy_com_addr(name: impl Into<String>, fc: Option<Fc>) -> Variable {
+    Variable::structure(
+        name,
+        fc,
+        alloc::vec![
+            Variable::leaf("Addr", fc, BType::Octet6),
+            Variable::leaf("PRIORITY", fc, BType::Int8U),
+            Variable::leaf("VID", fc, BType::Int16U),
+            Variable::leaf("APPID", fc, BType::Int16U),
+        ],
+    )
 }
 
 /// A data attribute and its sub-attributes. A `Struct` with no components is a leaf: the file
 /// declared a structure and said nothing about its shape, and inventing one would be worse.
-fn attribute_variable(a: &DataAttribute) -> Variable {
-    if a.children.is_empty() {
-        Variable::leaf(a.name.clone(), Some(a.fc), a.btype.clone())
+/// One attribute as the variable published **under `fc`**.
+///
+/// The constraint comes from the view rather than from the declaration, because a setting is
+/// published under two: an `SE` node that claimed to be `SG` would be refused every write by
+/// the rule that says what is in force changes only by activating a group.
+fn attribute_variable(a: &DataAttribute, fc: Fc) -> Variable {
+    let element = if a.children.is_empty() {
+        // …except `PhyComAddr`, whose shape is fixed by the standard rather than by the file.
+        if a.btype == BType::PhyComAddr { phy_com_addr(a.name.clone(), Some(fc)) } else { Variable::leaf(a.name.clone(), Some(fc), a.btype.clone()) }
     } else {
-        Variable::structure(a.name.clone(), Some(a.fc), a.children.iter().map(attribute_variable).collect())
+        Variable::structure(a.name.clone(), Some(fc), a.children.iter().map(|c| attribute_variable(c, fc)).collect())
+    };
+    // SCL's `count` makes the *same shape* an array of it, which is why the element is built
+    // first and wrapped afterwards.
+    match a.count {
+        Some(n) => Variable::array(a.name.clone(), Some(fc), n, element),
+        None => element,
     }
+}
+
+/// The item path a name plus a selection addresses: `HA$phsAHar` + `(2).cVal` →
+/// `HA$phsAHar(2)$cVal`.
+///
+/// `None` when the selection is one this server cannot turn into a path — a range or "all
+/// elements", which name several values where a `Read` result holds one. Refusing is the
+/// point: the alternative is answering with the whole array, which is a different answer to a
+/// different question and carries no error to say so.
+pub fn item_with(item: &str, selection: &[crate::common::Selector<'_>]) -> Option<String> {
+    use crate::common::Selector;
+    let mut out = String::from(item);
+    for step in selection {
+        match step {
+            Selector::Component(name) => {
+                out.push(SEP);
+                out.push_str(name);
+            }
+            Selector::Index(i) => {
+                let _ = core::fmt::Write::write_fmt(&mut out, format_args!("({i})"));
+            }
+            Selector::IndexRange { .. } | Selector::AllElements => return None,
+        }
+    }
+    Some(out)
 }
 
 /// Split an MMS item name into the logical node, the functional constraint and the rest.

@@ -614,8 +614,28 @@ mod mms_server {
                 };
                 s.assoc.respond(invoke_id, &ConfirmedResponse::ReadJournal { entries, more_follows: !resuming }).unwrap();
             }
+            ConfirmedRequest::Status { .. } => {
+                s.assoc
+                    .respond(
+                        invoke_id,
+                        &ConfirmedResponse::Status {
+                            logical: iec61850_rs::proto::mms::vmd_logical::STATE_CHANGES_ALLOWED,
+                            physical: iec61850_rs::proto::mms::vmd_physical::OPERATIONAL,
+                            local_detail: None,
+                        },
+                    )
+                    .unwrap();
+            }
+            ConfirmedRequest::GetCapabilityList { .. } => {
+                s.assoc.respond(invoke_id, &ConfirmedResponse::GetCapabilityList { capabilities: alloc_capabilities(), more_follows: false }).unwrap();
+            }
             ConfirmedRequest::Other(_) => panic!("unexpected service"),
         }
+    }
+
+    /// What the test peer claims it can do.
+    fn alloc_capabilities() -> Vec<&'static str> {
+        vec!["IEC 61850-8-1:2011+AMD1:2020"]
     }
 
     /// The type a server answers for a control object's `Oper`.
@@ -788,3 +808,64 @@ pub use mms_server::{
     CONTROL_REFERENCE, DATA_SET_REFERENCE, FILE_CONTENTS, FILE_REFERENCE, LCB_REFERENCE, LOG_REFERENCE, RCB_REFERENCE, SGCB_REFERENCE, ServerBehaviour,
     spawn as spawn_mms_server, spawn_with as spawn_mms_server_with,
 };
+
+/// Write a client/server byte stream as a classic pcap of Ethernet/IPv4/TCP frames on
+/// port 102, so that Wireshark dissects it as TPKT ▸ COTP ▸ session ▸ presentation ▸
+/// ACSE ▸ MMS.
+///
+/// `packets` is `(client_to_server, payload)` in wire order. Sequence numbers advance per
+/// direction so the TCP dissector reassembles a TPKT packet that was split across segments;
+/// checksums are left zero, which Wireshark does not validate by default.
+pub fn write_pcap_tcp(path: &Path, packets: &[(bool, Vec<u8>)]) {
+    const CLIENT_PORT: u16 = 50_000;
+    const SERVER_PORT: u16 = 102;
+    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(packets.len() + 3);
+    let (mut c_seq, mut s_seq) = (1u32, 1u32);
+    // A three-way handshake, so the dissector treats what follows as one conversation.
+    frames.push(tcp_frame(true, CLIENT_PORT, SERVER_PORT, c_seq, 0, 0x02, &[]));
+    c_seq = c_seq.wrapping_add(1);
+    frames.push(tcp_frame(false, SERVER_PORT, CLIENT_PORT, s_seq, c_seq, 0x12, &[]));
+    s_seq = s_seq.wrapping_add(1);
+    frames.push(tcp_frame(true, CLIENT_PORT, SERVER_PORT, c_seq, s_seq, 0x10, &[]));
+    for (to_server, payload) in packets {
+        if payload.is_empty() {
+            continue;
+        }
+        let frame = if *to_server {
+            let f = tcp_frame(true, CLIENT_PORT, SERVER_PORT, c_seq, s_seq, 0x18, payload);
+            c_seq = c_seq.wrapping_add(payload.len() as u32);
+            f
+        } else {
+            let f = tcp_frame(false, SERVER_PORT, CLIENT_PORT, s_seq, c_seq, 0x18, payload);
+            s_seq = s_seq.wrapping_add(payload.len() as u32);
+            f
+        };
+        frames.push(frame);
+    }
+    write_pcap(path, &frames);
+}
+
+/// One Ethernet/IPv4/TCP frame carrying `payload`.
+fn tcp_frame(to_server: bool, src_port: u16, dst_port: u16, seq: u32, ack: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
+    let (src_ip, dst_ip): ([u8; 4], [u8; 4]) = if to_server { ([10, 0, 0, 1], [10, 0, 0, 5]) } else { ([10, 0, 0, 5], [10, 0, 0, 1]) };
+    let (src_mac, dst_mac): ([u8; 6], [u8; 6]) = if to_server { ([2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 5]) } else { ([2, 0, 0, 0, 0, 5], [2, 0, 0, 0, 0, 1]) };
+    let mut f = Vec::with_capacity(54 + payload.len());
+    f.extend_from_slice(&dst_mac);
+    f.extend_from_slice(&src_mac);
+    f.extend_from_slice(&0x0800u16.to_be_bytes());
+    let ip_len = 20 + 20 + payload.len();
+    f.extend_from_slice(&[0x45, 0x00]);
+    f.extend_from_slice(&(ip_len as u16).to_be_bytes());
+    f.extend_from_slice(&[0x00, 0x00, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00]);
+    f.extend_from_slice(&src_ip);
+    f.extend_from_slice(&dst_ip);
+    f.extend_from_slice(&src_port.to_be_bytes());
+    f.extend_from_slice(&dst_port.to_be_bytes());
+    f.extend_from_slice(&seq.to_be_bytes());
+    f.extend_from_slice(&ack.to_be_bytes());
+    f.extend_from_slice(&[0x50, flags]);
+    f.extend_from_slice(&0xFFFFu16.to_be_bytes());
+    f.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    f.extend_from_slice(payload);
+    f
+}

@@ -163,16 +163,14 @@ impl Report {
             return Err(Error::decode(DecodeReason::TrailingBytes, at));
         }
 
-        let entries = indices
-            .into_iter()
-            .enumerate()
-            .map(|(n, index)| ReportEntry {
-                index,
-                reference: references.get(n).cloned(),
-                value: entry_values.get(n).cloned().unwrap_or(Value::Boolean(false)),
-                reason: reasons.get(n).copied(),
-            })
-            .collect();
+        // One value per included member, and the loop above has already errored if any is
+        // missing — so a placeholder is not needed and must not exist. A wrong value in a
+        // report is worse than a report that does not decode: the first is acted on.
+        let mut entries = Vec::with_capacity(indices.len());
+        for (n, index) in indices.into_iter().enumerate() {
+            let value = entry_values.get(n).cloned().ok_or(Error::NotFound("a value for an included member"))?;
+            entries.push(ReportEntry { index, reference: references.get(n).cloned(), value, reason: reasons.get(n).copied() });
+        }
 
         Ok(Report { rpt_id, opt_flds, seq_num, time_of_entry, data_set, buf_ovfl, entry_id, conf_rev, sub_seq_num, more_segments_follow, inclusion, entries })
     }

@@ -18,7 +18,8 @@ use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
 
 /// A model with everything the server has a special case for: a report control block of each
-/// kind, a controllable object, a log, a setting group and a data set.
+/// kind, a controllable object, a log, a setting group, a data set — and the service tracking
+/// objects, so that the path that mirrors a control block into one is fuzzed too.
 const MODEL: &str = r#"<?xml version="1.0"?>
 <SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">
   <Header id="f"/>
@@ -35,6 +36,10 @@ const MODEL: &str = r#"<?xml version="1.0"?>
       <SettingControl numOfSGs="2" actSG="1"/>
     </LN0>
     <LN lnClass="PTRC" inst="1" prefix="" lnType="PTRC_T"/>
+    <!-- An **array**, so the `alternateAccess` decoder and the index-aware name resolution
+         are reached by a `Read` and not only by a unit test: an index is the one part of a
+         reference that can be out of range, and out-of-range is what a fuzzer is for. -->
+    <LN lnClass="MHAI" inst="1" prefix="" lnType="MHAI_T"/>
     <LN lnClass="CSWI" inst="1" prefix="" lnType="CSWI_T">
       <DOI name="Pos"><DAI name="ctlModel"><Val>sbo-with-enhanced-security</Val></DAI></DOI>
     </LN>
@@ -43,12 +48,30 @@ const MODEL: &str = r#"<?xml version="1.0"?>
     </LN>
   </LDevice></Server></AccessPoint></IED>
   <DataTypeTemplates>
-    <LNodeType id="LLN0_T" lnClass="LLN0"/>
+    <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="UrcbTrk" type="UTS_T"/><DO name="CtlTrk" type="CTS_T"/></LNodeType>
     <LNodeType id="PTRC_T" lnClass="PTRC"><DO name="Tr" type="ACT_T"/></LNodeType>
     <LNodeType id="CSWI_T" lnClass="CSWI"><DO name="Pos" type="DPC_T"/></LNodeType>
     <LNodeType id="PTOC_T" lnClass="PTOC"><DO name="StrVal" type="ASG_T"/></LNodeType>
+    <LNodeType id="MHAI_T" lnClass="MHAI"><DO name="HA" type="HMV_T"/></LNodeType>
+    <DOType id="HMV_T" cdc="HMV"><SDO name="phsAHar" type="CMV_T" count="4"/></DOType>
+    <DOType id="CMV_T" cdc="CMV"><DA name="cVal" fc="MX" bType="Struct" type="AV_T"/><DA name="q" fc="MX" bType="Quality"/></DOType>
     <DOType id="ACT_T" cdc="ACT"><DA name="general" fc="ST" bType="BOOLEAN"/><DA name="q" fc="ST" bType="Quality"/></DOType>
-    <DOType id="ASG_T" cdc="ASG"><DA name="setMag" fc="SG" bType="Struct" type="AV_T"/><DA name="setMag" fc="SE" bType="Struct" type="AV_T"/></DOType>
+    <!-- One declaration: the schema makes a `DA` name unique within its `DOType`, and the
+         server publishes the `SE` view of a setting itself. -->
+    <DOType id="ASG_T" cdc="ASG"><DA name="setMag" fc="SG" bType="Struct" type="AV_T"/></DOType>
+    <DOType id="UTS_T" cdc="UTS">
+      <DA name="objRef" fc="SR" bType="ObjRef"/><DA name="serviceType" fc="SR" bType="Enum" type="Svc_E"/>
+      <DA name="errorCode" fc="SR" bType="Enum" type="Err_E"/><DA name="originatorID" fc="SR" bType="Octet64"/>
+      <DA name="t" fc="SR" bType="Timestamp"/><DA name="rptEna" fc="SR" bType="BOOLEAN"/>
+      <DA name="datSet" fc="SR" bType="ObjRef"/><DA name="confRev" fc="SR" bType="INT32U"/>
+    </DOType>
+    <DOType id="CTS_T" cdc="CTS">
+      <DA name="objRef" fc="SR" bType="ObjRef"/><DA name="serviceType" fc="SR" bType="Enum" type="Svc_E"/>
+      <DA name="errorCode" fc="SR" bType="Enum" type="Err_E"/><DA name="t" fc="SR" bType="Timestamp"/>
+      <DA name="ctlVal" fc="SR" bType="Dbpos"/><DA name="ctlNum" fc="SR" bType="INT8U"/>
+      <DA name="T" fc="SR" bType="Timestamp"/><DA name="Test" fc="SR" bType="BOOLEAN"/>
+      <DA name="Check" fc="SR" bType="Check"/><DA name="respAddCause" fc="SR" bType="Enum" type="Add_E"/>
+    </DOType>
     <DOType id="DPC_T" cdc="DPC">
       <DA name="stVal" fc="ST" bType="Dbpos"/>
       <DA name="ctlModel" fc="CF" bType="Enum" type="CtlModel_E"/>
@@ -65,6 +88,9 @@ const MODEL: &str = r#"<?xml version="1.0"?>
     <DAType id="Or_T"><BDA name="orCat" bType="Enum" type="OrCat_E"/><BDA name="orIdent" bType="Octet64"/></DAType>
     <EnumType id="OrCat_E"><EnumVal ord="3">remote-control</EnumVal></EnumType>
     <EnumType id="CtlModel_E"><EnumVal ord="4">sbo-with-enhanced-security</EnumVal></EnumType>
+    <EnumType id="Svc_E"><EnumVal ord="25">SetURCBValues</EnumVal><EnumVal ord="45">Operate</EnumVal></EnumType>
+    <EnumType id="Err_E"><EnumVal ord="12">no-error</EnumVal></EnumType>
+    <EnumType id="Add_E"><EnumVal ord="0">Unknown</EnumVal></EnumType>
   </DataTypeTemplates>
 </SCL>"#;
 
@@ -102,7 +128,12 @@ fuzz_target!(|data: &[u8]| {
             Mms::parse(&pdu, &Limits::DEFAULT).expect("every report the server emits must decode");
         }
     }
-    acsi.on_association_closed(1);
-    acsi.on_association_closed(2);
+    acsi.on_association_closed(1, now);
+    acsi.on_association_closed(2, now);
+    // A `ResvTms` reservation outlives its association, so the timer that ends it has to run
+    // after the close — a reservation nothing expires is a block one client holds for ever.
+    for (_, pdu) in acsi.on_timeout(now.plus_millis(3_600_000)) {
+        Mms::parse(&pdu, &Limits::DEFAULT).expect("every report the server emits must decode");
+    }
     let _ = ConfirmedRequest::Identify;
 });

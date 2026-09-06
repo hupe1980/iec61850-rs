@@ -30,8 +30,8 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::{ConfirmedRequest, ConfirmedResponse, Initiate, Mms};
-use crate::ber::Encoder;
+use super::{ConfirmedRequest, ConfirmedResponse, Initiate, Mms, ServiceError, service_error};
+use crate::ber::{Cursor, Encoder, Tag};
 use crate::common::{Error, EventQueue, Instant, Limits, Result};
 use crate::proto::osi::acse::{self, Apdu, Associate};
 use crate::proto::osi::cotp::{self, Tpdu, Tsel};
@@ -102,7 +102,7 @@ impl Selectors {
         let arcs = self.ap_title.as_ref()?;
         let contents = oid::encode(arcs)?;
         let mut e = Encoder::new();
-        e.primitive(crate::ber::Tag::universal(crate::ber::universal::OID, false), &contents).ok()?;
+        e.primitive(Tag::universal(crate::ber::universal::OID, false), &contents).ok()?;
         Some(e.into_vec())
     }
 
@@ -110,7 +110,7 @@ impl Selectors {
     fn ae_qualifier_element(&self) -> Option<Vec<u8>> {
         let q = self.ae_qualifier?;
         let mut e = Encoder::new();
-        e.integer(crate::ber::Tag::universal(crate::ber::universal::INTEGER, false), q).ok()?;
+        e.integer(Tag::universal(crate::ber::universal::INTEGER, false), q).ok()?;
         Some(e.into_vec())
     }
 }
@@ -223,6 +223,17 @@ pub enum AssociationEvent {
         /// The encoded PDU.
         pdu: Vec<u8>,
     },
+    /// A confirmed request this end made was withdrawn by the peer, so no answer is coming.
+    Cancelled {
+        /// The request that was withdrawn.
+        invoke_id: i64,
+    },
+    /// A `Cancel` was refused — by the peer for a request this end asked to withdraw, or by
+    /// this end for one the peer asked to withdraw. Either way the request stands.
+    CancelRefused {
+        /// The request the cancel named.
+        invoke_id: i64,
+    },
     /// An `unconfirmed-PDU`: how IEC 61850 delivers a report.
     Unconfirmed {
         /// The encoded PDU.
@@ -231,7 +242,18 @@ pub enum AssociationEvent {
     /// A PDU arrived on an established association that this codec could not decode. The
     /// association survives it — one bad report is not a reason to drop a connection — and
     /// [`AssociationStats::malformed`] counts it.
-    Malformed(Error),
+    ///
+    /// `invoke_id` is present when the undecodable PDU was a confirmed one and named a request
+    /// this end has outstanding. That request is **over**: the peer has answered and will not
+    /// answer again, so the identifier is released here and the caller fails at once with the
+    /// decode error instead of waiting out its request timeout on octets that already arrived
+    /// (D46's rule, applied to the third PDU that ends a call without answering it).
+    Malformed {
+        /// The request it ends, if it named one.
+        invoke_id: Option<i64>,
+        /// Why it could not be decoded.
+        error: Error,
+    },
     /// The peer **rejected** a PDU: not a service that failed, but one it could not act on
     /// at all — an unrecognised service, an invoke identifier it cannot use, more requests
     /// outstanding than were negotiated, or octets that are not a PDU.
@@ -434,7 +456,7 @@ impl Association {
             self.stats.packets_received = self.stats.packets_received.saturating_add(1);
             if let Err(e) = self.on_tpdu(now, &tpdu) {
                 self.stats.malformed = self.stats.malformed.saturating_add(1);
-                self.emit(AssociationEvent::Malformed(e));
+                self.emit(AssociationEvent::Malformed { invoke_id: None, error: e });
                 self.close(CloseReason::ProtocolError);
                 return;
             }
@@ -518,6 +540,20 @@ impl Association {
     /// Answer a confirmed request (server role).
     pub fn respond(&mut self, invoke_id: i64, service: &ConfirmedResponse<'_>) -> Result<()> {
         self.send(&Mms::ConfirmedResponse { invoke_id, service: service.clone() })
+    }
+
+    /// Ask the peer to withdraw a confirmed request this end made.
+    ///
+    /// The request keeps its slot until the peer answers: a `cancel-Response` releases it
+    /// ([`AssociationEvent::Cancelled`]) and a `cancel-Error` leaves it outstanding
+    /// ([`AssociationEvent::CancelRefused`]). A cancel carries no invoke identifier of its
+    /// own — ISO 9506 numbers the request being withdrawn, not the withdrawal — so it costs
+    /// nothing against [`AssociationConfig::max_outstanding`].
+    pub fn cancel(&mut self, invoke_id: i64) -> Result<()> {
+        if !self.outstanding.contains_key(&invoke_id) {
+            return Err(Error::NotFound("no such outstanding request"));
+        }
+        self.send(&Mms::CancelRequest(invoke_id))
     }
 
     /// Send any MMS PDU on the established association.
@@ -812,9 +848,13 @@ impl Association {
     fn deliver_mms(&mut self, bytes: &[u8]) {
         let pdu = match Mms::parse(bytes, &self.cfg.limits) {
             Ok(p) => p,
-            Err(e) => {
+            Err(error) => {
                 self.stats.malformed = self.stats.malformed.saturating_add(1);
-                self.emit(AssociationEvent::Malformed(e));
+                // An answer we cannot read is still an answer: release the slot it names so
+                // the caller fails now with the reason, not in `request_timeout_ms` with
+                // "the server did not reply".
+                let invoke_id = Mms::peek_invoke_id(bytes).filter(|id| self.outstanding.remove(id).is_some());
+                self.emit(AssociationEvent::Malformed { invoke_id, error });
                 return;
             }
         };
@@ -844,6 +884,33 @@ impl Association {
                 self.stats.rejected = self.stats.rejected.saturating_add(1);
                 AssociationEvent::Rejected { invoke_id: reject.original_invoke_id, reject }
             }
+            // A `Cancel` naming a request this end is still working on would be answered by
+            // withdrawing it. There is no such request: every service here is answered in the
+            // turn it arrives, so by the time a cancel is decoded the thing it names has
+            // already been answered or never existed. The honest answer is a `cancel-Error`
+            // saying so — and it has to be *an* answer, because a cancel the peer never hears
+            // back from is the reject defect (D35) on a different PDU: the caller waits out
+            // its whole timeout for a reply that was never coming.
+            Mms::CancelRequest(invoke_id) => {
+                let invoke_id = *invoke_id;
+                // `serviceError [1]` inside a `Cancel-ErrorPDU`, which is not the `[2]` a
+                // `Confirmed-ErrorPDU` puts it at.
+                let error =
+                    ServiceError::encode(Tag::context_constructed(1), service_error::SERVICE, service_error::PRIMITIVES_OUT_OF_SEQUENCE).unwrap_or_default();
+                if let Ok(tlv) = Cursor::new(&error).next_required() {
+                    let _ = self.send_pdu_unchecked(&Mms::CancelError { invoke_id, error: tlv });
+                }
+                AssociationEvent::CancelRefused { invoke_id }
+            }
+            // The peer withdrew the request. It will never be answered any other way, so the
+            // slot is released here — the same rule a reject follows, and for the same reason.
+            Mms::CancelResponse(invoke_id) => {
+                let invoke_id = *invoke_id;
+                self.outstanding.remove(&invoke_id);
+                AssociationEvent::Cancelled { invoke_id }
+            }
+            // It refused: the request is *still* outstanding and must keep its slot.
+            Mms::CancelError { invoke_id, .. } => AssociationEvent::CancelRefused { invoke_id: *invoke_id },
             Mms::ConcludeRequest => {
                 // The MMS-level orderly release. Answer it and go.
                 let _ = self.send_pdu_unchecked(&Mms::ConcludeResponse);
@@ -889,7 +956,7 @@ impl Association {
             // mechanism names the IEC 61850-8-1 password, and the value is the `[0]`
             // GraphicString spelling of `Authentication-value`.
             let mut e = Encoder::new();
-            e.primitive(crate::ber::Tag::context(0), p.as_bytes())?;
+            e.primitive(Tag::context(0), p.as_bytes())?;
             password = e.into_vec();
             aarq.sender_requirements = Some((7, &[0x80]));
             aarq.mechanism_name = Some(Oid::PASSWORD_MECHANISM);
@@ -921,6 +988,8 @@ impl Association {
             protocol_version: Some((7, &[0x80])),
             context_name: Some(Oid::MMS_APPLICATION_CONTEXT),
             result: Some(acse::RESULT_ACCEPTED),
+            // Mandatory beside the result, and there is one value an acceptance carries.
+            result_diagnostic: Some(acse::DIAGNOSTIC_SERVICE_USER_NULL),
             responding_ap_title: responding.as_deref(),
             responding_ae_qualifier: responding_q.as_deref(),
             user_information: Some(acse::UserInformation {
@@ -1052,16 +1121,17 @@ const PARAMETER_CBB: (u8, &[u8]) = (5, &[0xF1, 0x00]);
 /// others.
 ///
 /// Bit 0 is the most significant bit of the first octet. Set here:
-/// `getNameList(1)`, `identify(2)`, `read(4)`, `write(5)`,
+/// `status(0)`, `getNameList(1)`, `identify(2)`, `read(4)`, `write(5)`,
 /// `getVariableAccessAttributes(6)`, `defineNamedVariableList(11)`,
 /// `getNamedVariableListAttributes(12)`, `deleteNamedVariableList(13)`, `readJournal(65)`,
-/// `fileOpen(72)`, `fileRead(73)`, `fileClose(74)`, `fileDelete(76)`, `fileDirectory(77)`,
-/// `informationReport(79)` and `conclude(82)`.
+/// `getCapabilityList(71)`, `fileOpen(72)`, `fileRead(73)`, `fileClose(74)`,
+/// `fileDelete(76)`, `fileDirectory(77)`, `informationReport(79)` and `conclude(82)`.
 ///
-/// It is deliberately not the whole table copied from another stack: a bit claimed here and
-/// not backed by code is a peer sending a request that gets a reject. `status(0)` is
-/// therefore *not* claimed — the reference capture's client does not claim it either.
-const SERVICES_SUPPORTED: (u8, &[u8]) = (4, &[0x6E, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0xED, 0x20]);
+/// It is deliberately not the whole table copied from another stack, and it is checked in
+/// **both** directions: a bit claimed here and not backed by code is a peer sending a request
+/// that gets a reject, and a service implemented and not claimed is one no careful client will
+/// ever call.
+const SERVICES_SUPPORTED: (u8, &[u8]) = (4, &[0xEE, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0xED, 0x20]);
 
 #[cfg(test)]
 mod tests {
@@ -1107,6 +1177,47 @@ mod tests {
         c.start(Instant::ZERO).unwrap();
         pump(&mut c, &mut s, Instant::ZERO);
         (c, s)
+    }
+
+    /// An answer this codec cannot decode **ends** the call it names.
+    ///
+    /// This is D46's rule applied to the third PDU that finishes a call without answering it,
+    /// and it was found the hard way: a `GetNameList` page with more identifiers than the
+    /// decoder's limit allowed produced a `Malformed` nobody could attribute, the invoke
+    /// identifier stayed outstanding, and the caller waited out its whole request timeout and
+    /// reported that the server had not replied — about a server whose answer was already in
+    /// the buffer.
+    #[test]
+    fn an_answer_that_does_not_decode_fails_its_call_rather_than_hanging() {
+        let (mut c, mut s) = connect();
+        let _ = events(&mut c);
+        let request = ConfirmedRequest::GetNameList { object_class: object_class::NAMED_VARIABLE, scope: ObjectScope::VmdSpecific, continue_after: None };
+        let invoke = c.call(Instant::ZERO, &request).unwrap();
+        pump(&mut c, &mut s, Instant::ZERO);
+        let _ = events(&mut s);
+
+        // A `confirmed-ResponsePDU` naming that invoke, whose service is nonsense: the
+        // identifier is readable and everything after it is not.
+        let mut e = Encoder::new();
+        e.constructed(Tag::context_constructed(1), |e| {
+            e.integer(Tag::universal(crate::ber::universal::INTEGER, false), invoke)?;
+            e.constructed(Tag::context_constructed(1), |e| {
+                e.primitive(Tag::context(9), &[0xFF])?;
+                Ok(())
+            })?;
+            Ok(())
+        })
+        .unwrap();
+        s.send_encoded(&e.into_vec()).unwrap();
+        pump(&mut s, &mut c, Instant::ZERO);
+
+        let seen = events(&mut c);
+        assert!(
+            seen.iter().any(|e| matches!(e, AssociationEvent::Malformed { invoke_id: Some(id), .. } if *id == invoke)),
+            "the failure has to name the call it ends: {seen:?}"
+        );
+        // …and the slot is released, so nothing is left to time out.
+        assert_eq!(c.outstanding(), 0);
     }
 
     /// ISO 9506 negotiates the outstanding-call budget *down*, exactly as it does the PDU
@@ -1488,10 +1599,12 @@ mod tests {
     fn services_supported_names_exactly_the_services_that_exist() {
         let (unused, bytes) = SERVICES_SUPPORTED;
         let bit = |n: usize| bytes.get(n / 8).is_some_and(|b| b >> (7 - (n % 8)) & 1 == 1);
-        for n in [1, 2, 4, 5, 6, 11, 12, 13, 65, 72, 73, 74, 76, 77, 79, 82] {
+        // Both directions. A claimed bit with no code behind it is a request that gets a
+        // reject; an implemented service that is not claimed is one no careful client calls.
+        for n in [0, 1, 2, 4, 5, 6, 11, 12, 13, 65, 71, 72, 73, 74, 76, 77, 79, 82] {
             assert!(bit(n), "service {n} is implemented and must be claimed");
         }
-        for n in [0, 3, 7, 46, 75, 80, 81] {
+        for n in [3, 7, 46, 66, 75, 80, 81] {
             assert!(!bit(n), "service {n} is not implemented and must not be claimed");
         }
         assert_eq!(bytes.len() * 8 - usize::from(unused), 84, "the highest claimed bit is 82");

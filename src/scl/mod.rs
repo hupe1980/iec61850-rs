@@ -215,6 +215,15 @@ fn attr_bool(n: Node<'_, '_>, name: &str, default: bool) -> bool {
 
 const MAX_TYPE_DEPTH: usize = 16;
 
+/// The largest `count` this loader will expand into an array.
+///
+/// SCL types `count` as `xs:unsignedInt` and puts no ceiling on it; a server expands an array
+/// into that many sets of values at load, so the file decides how much memory the process
+/// takes. Nothing in IEC 61850 comes near this — harmonics run to a few dozen and a
+/// sampled-value data set to a few hundred entries — and a file above it is a mistake or an
+/// attack, either way answered with a diagnostic rather than an allocation.
+pub const MAX_ARRAY: u32 = 4096;
+
 struct Templates<'a, 'i> {
     lns: HashMap<&'a str, Node<'a, 'i>>,
     dos: HashMap<&'a str, Node<'a, 'i>>,
@@ -376,7 +385,7 @@ impl<'a, 'i> Loader<'a, 'i> {
                     self.diag(DiagnosticCode::MissingAttribute, alloc::format!("LNodeType `{ln_type}`"), String::from("DO without name/type"))?;
                     continue;
                 };
-                if let Some(dobj) = self.data_object(&at, dname, dtype, 0)? {
+                if let Some(dobj) = self.data_object(&at, dname, dtype, None, 0)? {
                     data_objects.push(dobj);
                 }
             }
@@ -404,6 +413,7 @@ impl<'a, 'i> Loader<'a, 'i> {
                     do_name: String::from(f.attribute("doName").unwrap_or("")),
                     da_name: f.attribute("daName").filter(|s| !s.is_empty()).map(String::from),
                     fc,
+                    ix: f.attribute("ix").and_then(|v| v.trim().parse().ok()),
                 });
             }
             data_sets.push(DataSet { name: String::from(dname), members });
@@ -608,7 +618,7 @@ impl<'a, 'i> Loader<'a, 'i> {
         }
     }
 
-    fn data_object(&mut self, at: &str, name: &str, type_id: &str, depth: usize) -> Result<Option<DataObject>> {
+    fn data_object(&mut self, at: &str, name: &str, type_id: &str, count: Option<u32>, depth: usize) -> Result<Option<DataObject>> {
         let here = alloc::format!("{at}.{name}");
         if depth > MAX_TYPE_DEPTH {
             self.diag(DiagnosticCode::NestingTooDeep, here, String::from("SDO nesting deeper than 16"))?;
@@ -632,7 +642,8 @@ impl<'a, 'i> Loader<'a, 'i> {
                         self.diag(DiagnosticCode::MissingAttribute, here.clone(), String::from("SDO without name/type"))?;
                         continue;
                     };
-                    if let Some(sdo) = self.data_object(&here, sname, stype, depth + 1)? {
+                    let count = self.array_count(&here, n, depth)?;
+                    if let Some(sdo) = self.data_object(&here, sname, stype, count, depth + 1)? {
                         sub_objects.push(sdo);
                     }
                 }
@@ -645,6 +656,7 @@ impl<'a, 'i> Loader<'a, 'i> {
             type_id: String::from(type_id),
             attributes,
             sub_objects,
+            count,
         }))
     }
 
@@ -685,7 +697,59 @@ impl<'a, 'i> Loader<'a, 'i> {
                 self.diag(DiagnosticCode::MissingDAType, here.clone(), alloc::format!("DAType `{tid}` not found"))?;
             }
         }
-        Ok(Some(DataAttribute { name: String::from(name), fc, btype, type_id, children: children_out, value, group_values: Vec::new() }))
+        let count = self.array_count(&here, n, depth)?;
+        Ok(Some(DataAttribute { name: String::from(name), fc, btype, type_id, children: children_out, value, group_values: Vec::new(), count }))
+    }
+
+    /// The `count` of a `DA`, `BDA` or `SDO`, resolved to a number.
+    ///
+    /// SCL types it as a **union** of `xs:unsignedInt` and an attribute *name* ✅ (`tDACount`
+    /// and `tSDOCount`, `SCL_Enums.xsd`), so `count="16"` and `count="numHar"` are both legal
+    /// and mean the same thing: how many elements the array has. The second form points at a
+    /// sibling in the same type whose engineered `Val` holds the number — a *runtime* count
+    /// would be a different thing, and there is nowhere in a static model to put one.
+    ///
+    /// `0` is the schema's default and means "not an array", which is why this is an `Option`
+    /// rather than a `u32`: a scalar and an array of length zero are different, and only the
+    /// first exists.
+    fn array_count(&mut self, at: &str, n: Node<'a, 'i>, depth: usize) -> Result<Option<u32>> {
+        let Some(raw) = n.attribute("count").map(str::trim).filter(|c| !c.is_empty()) else { return Ok(None) };
+        if let Ok(n) = raw.parse::<u32>() {
+            // The schema types `count` as `xs:unsignedInt`, so a file may ask for four
+            // thousand million elements — and a server expands an array into that many sets of
+            // values at load. Nothing in IEC 61850 is anywhere near this: harmonics run to a
+            // few dozen. A file above the ceiling is diagnosed and its attribute loads as the
+            // scalar it will be served as, rather than as an allocation nobody survives.
+            if n > MAX_ARRAY {
+                self.diag(DiagnosticCode::ArrayTooLarge, String::from(at), alloc::format!("count {n} is above the {MAX_ARRAY} this loader expands"))?;
+                return Ok(None);
+            }
+            return Ok((n > 0).then_some(n));
+        }
+        if depth > MAX_TYPE_DEPTH {
+            return Ok(None);
+        }
+        // The other half of the union: a sibling attribute of the same type holds the number.
+        let sibling = n
+            .parent()
+            .into_iter()
+            .flat_map(|p| p.children().filter(Node::is_element))
+            .filter(|c| matches!(c.tag_name().name(), "DA" | "BDA"))
+            .find(|c| c.attribute("name") == Some(raw))
+            .and_then(|c| child(c, "Val"))
+            .and_then(|v| v.text())
+            .and_then(|t| t.trim().parse::<u32>().ok());
+        match sibling {
+            Some(n) if n > 0 && n <= MAX_ARRAY => Ok(Some(n)),
+            _ => {
+                self.diag(
+                    DiagnosticCode::UnresolvedArrayCount,
+                    String::from(at),
+                    alloc::format!("count `{raw}` names no sibling attribute with a number in it"),
+                )?;
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -997,10 +1061,13 @@ fn covers(m: &Fcda, x: &ExtRef) -> bool {
         && x.ln_class.as_deref().is_some_and(|c| c == m.ln_class)
         && x.ln_inst == m.ln_inst;
     let same_do = x.do_name.as_deref().is_some_and(|d| d == m.do_name);
+    // Either side may name the data object alone, and either way the signal travels in that
+    // control block: a member that names only a `DO` carries every attribute under it, and an
+    // `ExtRef` that names only a `DO` is satisfied by a member that carries one of them. The
+    // question here is *which control block publishes this*, and both answers are yes.
     let same_da = match (&m.da_name, &x.da_name) {
-        (None, _) => true,
+        (None, _) | (Some(_), None) => true,
         (Some(member), Some(wanted)) => member == wanted,
-        (Some(_), None) => false,
     };
     same_ln && same_do && same_da
 }
@@ -1370,6 +1437,67 @@ mod tests {
         let s = subscriptions(&file, "IED2", 50).unwrap();
         assert_eq!(s.goose.len(), 1, "{s:#?}");
         assert_eq!(s.goose[0].identifier, "IED1LD0/LLN0$GO$gcbTrip");
+    }
+
+    #[test]
+    fn an_input_naming_only_a_data_object_finds_the_attribute_that_carries_it() {
+        // The mirror of the case above, and just as common in the field: the input asks for
+        // `PTRC1.Tr` while the publisher's data set names `Tr.general` and `Tr.q`. The signal
+        // is in that GOOSE, so refusing to resolve it would be a false negative on a file
+        // that is entirely correct.
+        let file = ICD.replace(
+            r#"<ExtRef iedName="IED1" ldInst="LD0" lnClass="PTRC" lnInst="1" doName="Tr" daName="general"
+                    serviceType="GOOSE" srcLDInst="LD0" srcCBName="gcbTrip" intAddr="BI1"/>"#,
+            r#"<ExtRef iedName="IED1" ldInst="LD0" lnClass="PTRC" lnInst="1" doName="Tr" intAddr="BI1"/>"#,
+        );
+        let s = subscriptions(&file, "IED2", 50).unwrap();
+        assert_eq!(s.goose.len(), 1, "{s:#?}");
+        assert_eq!(s.goose[0].identifier, "IED1LD0/LLN0$GO$gcbTrip");
+        assert_eq!(s.goose[0].ext_refs.len(), 2);
+    }
+
+    /// `count` is a **union** of a number and an attribute *name* ✅ (`tDACount`/`tSDOCount`),
+    /// and a number the schema allows is not a number a server can expand.
+    #[test]
+    fn an_array_count_is_a_number_a_sibling_or_a_diagnostic() {
+        const XML: &str = r#"<?xml version="1.0"?>
+<SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">
+  <Header id="a"/>
+  <IED name="IED1"><AccessPoint name="P1"><Server><LDevice inst="LD0">
+    <LN0 lnClass="LLN0" inst="" lnType="LLN0_T"/>
+    <LN lnClass="MHAI" inst="1" prefix="" lnType="MHAI_T"/>
+  </LDevice></Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="Mod" type="INC_T"/></LNodeType>
+    <LNodeType id="MHAI_T" lnClass="MHAI"><DO name="HA" type="HMV_T"/></LNodeType>
+    <DOType id="INC_T" cdc="INC"><DA name="stVal" fc="ST" bType="INT32"/></DOType>
+    <DOType id="HMV_T" cdc="HMV">
+      <DA name="numHar" fc="MX" bType="INT16U"><Val>5</Val></DA>
+      <DA name="plain" fc="MX" bType="FLOAT32"/>
+      <DA name="fixed" fc="MX" bType="FLOAT32" count="16"/>
+      <DA name="named" fc="MX" bType="FLOAT32" count="numHar"/>
+      <DA name="zero" fc="MX" bType="FLOAT32" count="0"/>
+      <DA name="dangling" fc="MX" bType="FLOAT32" count="noSuchThing"/>
+      <DA name="huge" fc="MX" bType="FLOAT32" count="4294967295"/>
+    </DOType>
+  </DataTypeTemplates>
+</SCL>"#;
+        let model = IedModel::from_scl(XML, Some("IED1")).expect("load");
+        let ha = &model.logical_devices[0].logical_nodes.iter().find(|n| n.name == "MHAI1").expect("MHAI1").data_objects[0];
+        let count = |name: &str| ha.attributes.iter().find(|a| a.name == name).expect(name).count;
+        assert_eq!(count("plain"), None, "no `count` at all");
+        assert_eq!(count("fixed"), Some(16), "a number");
+        assert_eq!(count("named"), Some(5), "…or the name of a sibling that holds one");
+        // `0` is the schema's own default and means "not an array", which is a different
+        // thing from an array of length zero — only the first exists.
+        assert_eq!(count("zero"), None);
+        // The two that cannot be honoured load as scalars and say so, because a server that
+        // guessed a length would publish a type its own file does not describe.
+        assert_eq!(count("dangling"), None);
+        assert_eq!(count("huge"), None);
+        let codes: Vec<_> = model.diagnostics.iter().map(|d| d.code).collect();
+        assert!(codes.contains(&DiagnosticCode::UnresolvedArrayCount), "{:?}", model.diagnostics);
+        assert!(codes.contains(&DiagnosticCode::ArrayTooLarge), "{:?}", model.diagnostics);
     }
 
     #[test]

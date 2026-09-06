@@ -117,6 +117,10 @@ pub struct Controls {
     hook: Option<ControlHook>,
     sbo_timeout_ms: u64,
     pending: Vec<Termination>,
+    /// The `AddCause` of the most recent refusal, for the tracking object to publish as
+    /// `respAddCause`. It is taken rather than read, because it describes *one* command and a
+    /// second reader would be told about a command that had already been reported.
+    last_cause: Option<AddCause>,
 }
 
 /// Hand-written because a [`ControlHook`] is a closure and closures have no `Debug`; the
@@ -129,13 +133,14 @@ impl core::fmt::Debug for Controls {
             .field("hook", &self.hook.is_some())
             .field("sbo_timeout_ms", &self.sbo_timeout_ms)
             .field("pending", &self.pending.len())
+            .field("last_cause", &self.last_cause)
             .finish()
     }
 }
 
 impl Default for Controls {
     fn default() -> Controls {
-        Controls { selections: BTreeMap::new(), timed: Vec::new(), hook: None, sbo_timeout_ms: DEFAULT_SBO_TIMEOUT_MS, pending: Vec::new() }
+        Controls { selections: BTreeMap::new(), timed: Vec::new(), hook: None, sbo_timeout_ms: DEFAULT_SBO_TIMEOUT_MS, pending: Vec::new(), last_cause: None }
     }
 }
 
@@ -154,6 +159,14 @@ impl Controls {
     /// How long a selection is held.
     pub fn set_sbo_timeout_ms(&mut self, ms: u64) {
         self.sbo_timeout_ms = ms;
+    }
+
+    /// The `AddCause` of the most recent refusal, cleared by the read.
+    ///
+    /// `None` means the last command was not refused, which is what `respAddCause` publishes
+    /// as `AddCause::Unknown` — the standard's own "nothing to say".
+    pub fn take_last_cause(&mut self) -> Option<AddCause> {
+        self.last_cause.take()
     }
 
     /// Terminations produced by the last request, to be sent after its response.
@@ -181,9 +194,12 @@ impl Controls {
         let (due, waiting): (Vec<Timed>, Vec<Timed>) = core::mem::take(&mut self.timed).into_iter().partition(|t| now >= t.due);
         self.timed = waiting;
         for t in due {
-            // The hook is asked **now**, not when the command was accepted: an interlock that
-            // has closed in the meantime is exactly what a time-activated operate is for.
-            if let Err(cause) = self.ask(&t.object, Stage::Operate, &t.request, t.model) {
+            // The behaviour and the hook are both re-checked **now**, not when the command was
+            // accepted: a bay that went to test or blocked between the `Oper` and its `operTm`
+            // is exactly the case a time-activated operate has to notice.
+            let refusal =
+                mode_refusal(behaviour_of(ied, &t.object), t.request.test).map_or_else(|| self.ask(&t.object, Stage::Operate, &t.request, t.model), Err);
+            if let Err(cause) = refusal {
                 let error = LastApplError {
                     control_object: alloc::format!("{}$Oper", t.object),
                     error: ControlError::Unknown,
@@ -229,6 +245,11 @@ impl Controls {
         if self.held_by_other(object, assoc, now.mono) {
             return Value::VisibleString(String::new());
         }
+        // A bare `SBO` carries no `Test` flag, so it is an ordinary command by definition and
+        // a node under test, blocked or off must not hand out a selection for one.
+        if mode_refusal(behaviour_of(ied, object), false).is_some() {
+            return Value::VisibleString(String::new());
+        }
         let request = ControlRequest::new(Value::Boolean(false), 0, now.wall);
         if self.ask(object, Stage::Select, &request, ControlModel::SboNormal).is_err() {
             return Value::VisibleString(String::new());
@@ -247,6 +268,19 @@ impl Controls {
         let Some(model) = model_of(ied, object) else { return Err(DATA_ACCESS_DENIED) };
         let Ok(request) = ControlRequest::from_value(value) else { return Err(DATA_ACCESS_VALUE_INVALID) };
         self.on_timeout(ied, now.mono);
+
+        // The logical node's behaviour gates a select and an operate: a bay that is off,
+        // blocked or under test does not take the command the client thinks it is sending.
+        //
+        // **`Cancel` is exempt.** It withdraws a command rather than issuing one, and a node
+        // that went blocked while a client held a selection must still let that client let go
+        // — otherwise the only way out is the selection timing out.
+        if attribute != "Cancel" {
+            if let Some(cause) = mode_refusal(behaviour_of(ied, object), request.test) {
+                let stage = if attribute == "Oper" { Stage::Operate } else { Stage::Select };
+                return self.refuse(assoc, object, &request, model, stage, cause);
+            }
+        }
 
         match attribute {
             "SBOw" => {
@@ -347,6 +381,7 @@ impl Controls {
     /// select and reports the refusal afterwards leaves the client believing it holds a
     /// breaker it does not.
     fn refuse(&mut self, assoc: AssocId, object: &str, request: &ControlRequest, model: ControlModel, stage: Stage, cause: AddCause) -> Result<(), i64> {
+        self.last_cause = Some(cause);
         let error = LastApplError {
             control_object: alloc::format!("{object}$Oper"),
             error: ControlError::Unknown,
@@ -374,6 +409,90 @@ impl Controls {
             None => Ok(()),
         }
     }
+}
+
+/// The effective behaviour of a logical node (`Beh`, IEC 61850-7-4 §Beh / 7-1 §6.3).
+///
+/// It is what decides whether a command is allowed to reach the process at all, and it is the
+/// half of the control model that a server built only from `ctlModel` gets wrong: an IED whose
+/// bay is in **test** must refuse an ordinary command and accept a test one, and one whose
+/// outputs are **blocked** must refuse both. Ignoring it makes `Test` a field that travels and
+/// changes nothing, which is the opposite of what it is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Behaviour {
+    /// 1 — normal operation.
+    On,
+    /// 2 — the outputs are blocked; the node still reports.
+    Blocked,
+    /// 3 — test: only commands carrying `Test` are honoured.
+    Test,
+    /// 4 — test and blocked at once.
+    TestBlocked,
+    /// 5 — the node is off.
+    Off,
+}
+
+impl Behaviour {
+    /// From the `Beh`/`Mod` enumeration. Anything outside 1..=5 — including the zero a file
+    /// that declares `Beh` without engineering a value leaves behind — is read as `On`,
+    /// because a server that refused every command over an unset optional attribute would be
+    /// unusable as the simulator it is meant to be.
+    const fn from_code(code: i64) -> Behaviour {
+        match code {
+            2 => Behaviour::Blocked,
+            3 => Behaviour::Test,
+            4 => Behaviour::TestBlocked,
+            5 => Behaviour::Off,
+            _ => Behaviour::On,
+        }
+    }
+
+    /// True when commands may reach the process.
+    const fn accepts_commands(self) -> bool {
+        matches!(self, Behaviour::On | Behaviour::Test)
+    }
+
+    /// True when the node is in one of the two test behaviours, which is what a command's
+    /// `Test` flag has to agree with.
+    const fn is_test(self) -> bool {
+        matches!(self, Behaviour::Test | Behaviour::TestBlocked)
+    }
+}
+
+/// The `Beh` of the logical node `object` lives in, falling back to `Mod` and then to `On`.
+///
+/// `Beh` is the *effective* behaviour and `Mod` the requested one; a file that models only
+/// `Mod` (which is common) is read through it rather than treated as having neither.
+fn behaviour_of(ied: &Ied, object: &str) -> Behaviour {
+    let Some((domain, item)) = object.split_once('/') else { return Behaviour::On };
+    let Some((ln, _)) = item.split_once('$') else { return Behaviour::On };
+    for name in ["Beh", "Mod"] {
+        if let Some(v) = ied.value(&alloc::format!("{domain}/{ln}$ST${name}$stVal")) {
+            let code = match v {
+                Value::Integer(i) => Some(*i),
+                Value::Unsigned(u) => i64::try_from(*u).ok(),
+                _ => None,
+            };
+            if let Some(code) = code {
+                return Behaviour::from_code(code);
+            }
+        }
+    }
+    Behaviour::On
+}
+
+/// Why `request` may not be carried out in `behaviour`, if it may not.
+///
+/// Two rules, both from IEC 61850-7-2 §20 and 7-4: a node whose outputs are blocked or which
+/// is off refuses everything, and a `Test` command is honoured **only** in a test behaviour —
+/// in both directions, so an ordinary command in test mode is refused too. That symmetry is
+/// the point: a bay under test must not act on the control room's commands, and the control
+/// room's commands must not be silently swallowed as tests.
+fn mode_refusal(behaviour: Behaviour, test: bool) -> Option<AddCause> {
+    if !behaviour.accepts_commands() {
+        return Some(AddCause::BlockedByMode);
+    }
+    (test != behaviour.is_test()).then_some(AddCause::BlockedByMode)
 }
 
 /// The `ctlModel` of a controllable object, read out of the model the server serves.

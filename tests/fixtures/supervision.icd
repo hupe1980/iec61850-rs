@@ -1,0 +1,62 @@
+<?xml version="1.0"?>
+<!-- A subscribing IED: one GOOSE subscription supervised by an LGOS, one sampled-value
+     subscription supervised by an LSVS, and a report control block that carries both. -->
+<SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">
+  <Header id="supervision"/>
+  <IED name="IED2"><AccessPoint name="P1"><Server><LDevice inst="LD0">
+    <LN0 lnClass="LLN0" inst="" lnType="LLN0_T">
+      <DataSet name="dsSup">
+        <FCDA ldInst="LD0" lnClass="LGOS" lnInst="1" doName="St" daName="stVal" fc="ST"/>
+        <FCDA ldInst="LD0" lnClass="LGOS" lnInst="1" doName="NdsCom" daName="stVal" fc="ST"/>
+        <FCDA ldInst="LD0" lnClass="LSVS" lnInst="1" doName="St" daName="stVal" fc="ST"/>
+      </DataSet>
+      <ReportControl name="urcbSup" datSet="dsSup" confRev="1" indexed="false" bufTime="0">
+        <TrgOps dchg="true"/>
+        <OptFields seqNum="true" reasonCode="true" dataSet="true"/>
+      </ReportControl>
+    </LN0>
+    <!-- The LGOS supervises the trip GOOSE of IED1; `GoCBRef` is engineering, not status,
+         so it comes from the file and the runtime never writes it. -->
+    <LN lnClass="LGOS" inst="1" prefix="" lnType="LGOS_T">
+      <DOI name="GoCBRef"><DAI name="setSrcRef"><Val>IED1LD0/LLN0$GO$gcbTrip</Val></DAI></DOI>
+    </LN>
+    <!-- The LSVS declares fewer objects on purpose: a model without `LastStNum` or
+         `RxConfRevNum` must simply not get them. -->
+    <LN lnClass="LSVS" inst="1" prefix="" lnType="LSVS_T"/>
+  </LDevice></Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="Mod" type="INC_T"/></LNodeType>
+    <LNodeType id="LGOS_T" lnClass="LGOS">
+      <DO name="St" type="SPS_T"/>
+      <DO name="NdsCom" type="SPS_T"/>
+      <DO name="SimSt" type="SPS_T"/>
+      <DO name="LastStNum" type="INS_T"/>
+      <DO name="ConfRevNum" type="INS_T"/>
+      <DO name="RxConfRevNum" type="INS_T"/>
+      <DO name="GoCBRef" type="ORG_T"/>
+    </LNodeType>
+    <LNodeType id="LSVS_T" lnClass="LSVS">
+      <DO name="St" type="SPS_T"/>
+      <DO name="ConfRevNum" type="INS_T"/>
+    </LNodeType>
+    <DOType id="INC_T" cdc="INC">
+      <DA name="stVal" fc="ST" bType="Enum" type="Mod_E"/>
+      <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+    </DOType>
+    <DOType id="SPS_T" cdc="SPS">
+      <DA name="stVal" fc="ST" bType="BOOLEAN"/>
+      <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+    </DOType>
+    <DOType id="INS_T" cdc="INS">
+      <DA name="stVal" fc="ST" bType="INT32"/>
+      <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+    </DOType>
+    <DOType id="ORG_T" cdc="ORG">
+      <DA name="setSrcRef" fc="SP" bType="ObjRef"/>
+    </DOType>
+    <EnumType id="Mod_E"><EnumVal ord="1">on</EnumVal></EnumType>
+  </DataTypeTemplates>
+</SCL>

@@ -144,6 +144,29 @@ impl<'a> FileAttributes<'a> {
     }
 }
 
+/// The `DirectoryEntry` elements inside a `listOfDirectoryEntry [0]`.
+///
+/// The field is `[0] SEQUENCE OF DirectoryEntry` with **no** `IMPLICIT` ✅, so a conforming
+/// server writes `a0 { 30 { 30 … } }` and the entries are the children of the inner
+/// `SEQUENCE`. A server that tagged it implicitly puts them directly under `[0]`, and both
+/// are in the field; the two are told apart by what the first child *contains* — a
+/// `DirectoryEntry` starts with `filename [0]`, the `SEQUENCE OF` wrapper starts with another
+/// `SEQUENCE` — so this reads either without guessing.
+pub(super) fn directory_entries<'a>(list: &Tlv<'a>) -> Cursor<'a> {
+    let mut outer = list.children();
+    let Some(Ok(first)) = outer.next() else { return list.children() };
+    if first.tag != Tag::universal(universal::SEQUENCE, true) {
+        return list.children();
+    }
+    // Explicit: the wrapper's own first child is a `DirectoryEntry`, i.e. a SEQUENCE. An
+    // empty wrapper (`a0 02 30 00`) is an empty listing and is explicit too.
+    match first.children().next() {
+        Some(Ok(inner)) if inner.tag == Tag::universal(universal::SEQUENCE, true) => first.children(),
+        None => first.children(),
+        _ => list.children(),
+    }
+}
+
 /// One entry of a `FileDirectory` response.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DirectoryEntry<'a> {

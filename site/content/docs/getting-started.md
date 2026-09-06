@@ -254,6 +254,7 @@ repository and `cargo run --example <name>`.
 | `mms_loopback` | The association state machine driving both roles of a real association over a loopback socket |
 | `server_from_scl` | A real server built from an SCL file and a real client against it, in one process: browse, report, control |
 | `scl_model` | An SCD as the configuration: model, subscriptions, addressing, control models, validation |
+| `supervised_subscriber` | A GOOSE subscription's health published as an `LGOS` and read back by a client |
 
 ## Next
 

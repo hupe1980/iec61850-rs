@@ -25,7 +25,7 @@ use core::result::Result;
 
 use super::acsi::AssocId;
 use super::ied::{BlockKind, DATA_ACCESS_DENIED, DATA_ACCESS_VALUE_INVALID, Ied};
-use crate::common::{EntryTime, Fc};
+use crate::common::{Fc, Instant, Now};
 use crate::proto::data::Value;
 
 /// One logical device's setting groups.
@@ -43,6 +43,13 @@ struct Groups {
     values: BTreeMap<u32, BTreeMap<String, Value>>,
     /// The association that holds the edit reservation.
     editor: Option<AssocId>,
+    /// When that reservation lapses, from the `SGCB`'s `ResvTms`.
+    ///
+    /// A client that selects a group for editing and then goes quiet without closing its
+    /// association would otherwise hold the whole logical device's settings for ever;
+    /// `ResvTms` is the attribute that exists to stop it, and a server that publishes it and
+    /// never acts on it is the case D40 is about.
+    editor_until: Option<Instant>,
 }
 
 /// The setting-group engine over every logical device of an [`Ied`].
@@ -72,7 +79,7 @@ impl SettingGroups {
                     }
                 }
             }
-            devices.push(Groups { block: block.reference.clone(), domain: block.domain.clone(), count, values, editor: None });
+            devices.push(Groups { block: block.reference.clone(), domain: block.domain.clone(), count, values, editor: None, editor_until: None });
         }
         SettingGroups { devices }
     }
@@ -102,8 +109,12 @@ impl SettingGroups {
     }
 
     /// A write to an `SGCB` attribute.
-    pub fn on_block_write(&mut self, assoc: AssocId, ied: &mut Ied, block: &str, attribute: &str, value: &Value, wall: EntryTime) -> Result<(), i64> {
+    pub fn on_block_write(&mut self, assoc: AssocId, ied: &mut Ied, block: &str, attribute: &str, value: &Value, now: Now) -> Result<(), i64> {
         let Some(domain) = self.devices.iter().find(|g| g.block == block).map(|g| g.domain.clone()) else { return Ok(()) };
+        // An expired reservation is released before the write is judged, or a client would be
+        // refused by a hold that has already run out.
+        self.expire(now.mono);
+        let wall = now.wall;
         match attribute {
             "ActSG" => {
                 let Some(group) = unsigned_of(value) else { return Err(DATA_ACCESS_VALUE_INVALID) };
@@ -124,6 +135,7 @@ impl SettingGroups {
                         return Err(DATA_ACCESS_DENIED);
                     }
                     g.editor = None;
+                    g.editor_until = None;
                     return Ok(());
                 }
                 if group > g.count {
@@ -133,12 +145,15 @@ impl SettingGroups {
                     return Err(DATA_ACCESS_DENIED);
                 }
                 g.editor = Some(assoc);
+                g.editor_until = reservation_deadline(ied, block, now.mono);
                 let group_values = g.values.get(&group).cloned().unwrap_or_default();
                 // Selecting a group for editing fills the edit copy with what that group
                 // currently holds, so a client that changes one setting does not blank the
-                // rest when it confirms.
+                // rest when it confirms. It is the *server* filling in a scratch copy, so it
+                // goes in through `set_internal` and does not make a report claim the
+                // settings changed — nothing in force has moved.
                 for (reference, v) in group_values {
-                    let _ = ied.write_leaf(&edit_reference(&reference), v);
+                    let _ = ied.set_internal(&edit_reference(&reference), v);
                 }
                 Ok(())
             }
@@ -177,9 +192,39 @@ impl SettingGroups {
                 }
                 Ok(())
             }
-            // `NumOfSG`, `LActTm` and `ResvTms` are the device's to say, not the client's.
+            // `ResvTms` is how long the *client* wants the edit reservation held for, so it
+            // is the client's to write — and writing it re-arms a reservation already held.
+            "ResvTms" => {
+                let Some(seconds) = unsigned_of(value) else { return Err(DATA_ACCESS_VALUE_INVALID) };
+                let Some(g) = self.device_mut(&domain) else { return Ok(()) };
+                if g.editor.is_some_and(|e| e != assoc) {
+                    return Err(DATA_ACCESS_DENIED);
+                }
+                if g.editor == Some(assoc) {
+                    g.editor_until = (seconds > 0).then(|| now.mono.plus_millis(u64::from(seconds) * 1000));
+                }
+                Ok(())
+            }
+            // `NumOfSG` and `LActTm` are the device's to say, not the client's.
             _ => Err(DATA_ACCESS_DENIED),
         }
+    }
+
+    /// A **read** of a setting under `SE`.
+    ///
+    /// `GetEditSGValue` is rejected while `EditSG = 0` (IEC 61850-7-2 §11): with no group
+    /// selected there is no edit copy, and answering with the scratch the model was seeded
+    /// with would tell a client it is looking at a setting group when it is not.
+    ///
+    /// The reservation itself is *not* checked. A second client may look at what the first is
+    /// editing — that is an operator watching a change being made, and refusing it would hide
+    /// the one thing an operator most wants to see.
+    pub fn on_edit_read(&self, assoc: AssocId, ied: &Ied, reference: &str) -> Result<(), i64> {
+        let _ = assoc;
+        let Some((domain, _)) = reference.split_once('/') else { return Err(DATA_ACCESS_DENIED) };
+        let Some(g) = self.device(domain) else { return Err(DATA_ACCESS_DENIED) };
+        let group = ied.value(&alloc::format!("{}$EditSG", g.block)).and_then(unsigned_of).unwrap_or(0);
+        if group == 0 { Err(DATA_ACCESS_DENIED) } else { Ok(()) }
     }
 
     /// A write to a setting under `SE`.
@@ -205,11 +250,52 @@ impl SettingGroups {
     }
 
     /// An association ended: release the edit reservation it held.
+    ///
+    /// Unlike a report control block's `ResvTms`, this one does **not** outlive the
+    /// association. A report reservation exists so a client can come back to a subscription;
+    /// an edit reservation holds a half-written protection group, and leaving a device's
+    /// settings locked by a client that is gone is the opposite of what `CnfEdit` is for.
     pub fn on_association_closed(&mut self, assoc: AssocId) {
         for g in &mut self.devices {
             if g.editor == Some(assoc) {
                 g.editor = None;
+                g.editor_until = None;
             }
+        }
+    }
+
+    /// Release edit reservations whose `ResvTms` has run out.
+    pub fn on_timeout(&mut self, ied: &mut Ied, now: Instant) {
+        let lapsed: Vec<String> =
+            self.devices.iter().filter(|g| g.editor.is_some() && g.editor_until.is_some_and(|u| now >= u)).map(|g| g.block.clone()).collect();
+        self.expire(now);
+        // `EditSG` back to zero, because "no group is selected" is what the release means and
+        // a client reading the block has to see it.
+        for block in lapsed {
+            let _ = ied.set_internal(&alloc::format!("{block}$EditSG"), Value::Unsigned(0));
+        }
+    }
+
+    /// When this layer next needs [`SettingGroups::on_timeout`].
+    pub fn next_timeout(&self) -> Option<Instant> {
+        self.devices.iter().filter(|g| g.editor.is_some()).filter_map(|g| g.editor_until).min()
+    }
+
+    fn expire(&mut self, now: Instant) {
+        for g in &mut self.devices {
+            if g.editor_until.is_some_and(|u| now >= u) {
+                g.editor = None;
+                g.editor_until = None;
+            }
+        }
+    }
+
+    /// `CnfEdit` is a **command**, not a state: it is written true to apply the edit and the
+    /// server puts it back, exactly as `GI` and `PurgeBuf` work on a report control block. A
+    /// server that leaves it true answers "is an edit being confirmed?" with yes for ever.
+    pub fn after_block_write(&mut self, ied: &mut Ied, block: &str, attribute: &str) {
+        if attribute == "CnfEdit" && self.devices.iter().any(|g| g.block == block) {
+            let _ = ied.set_internal(&alloc::format!("{block}$CnfEdit"), Value::Boolean(false));
         }
     }
 
@@ -223,6 +309,15 @@ impl SettingGroups {
         }
         let _ = ied.write_leaf(&alloc::format!("{block}$ActSG"), Value::Unsigned(u64::from(group)));
     }
+}
+
+/// When an edit reservation taken now lapses, from the block's `ResvTms`.
+///
+/// Zero — the usual engineered value — means no deadline: the reservation then lives exactly
+/// as long as the association does.
+fn reservation_deadline(ied: &Ied, block: &str, now: Instant) -> Option<Instant> {
+    let seconds = ied.value(&alloc::format!("{block}$ResvTms")).and_then(unsigned_of).unwrap_or(0);
+    (seconds > 0).then(|| now.plus_millis(u64::from(seconds) * 1000))
 }
 
 /// The `SE` form of a setting whose `SG` reference is given.

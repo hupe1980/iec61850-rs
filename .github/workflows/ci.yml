@@ -52,12 +52,46 @@ jobs:
       # The examples are documentation that has to keep working: each one runs to completion
       # with no network, no device and no arguments.
       - run: |
-          for e in goose_roundtrip sv_merging_unit mms_loopback scl_model server_from_scl; do
+          for e in goose_roundtrip sv_merging_unit mms_loopback scl_model server_from_scl supervised_subscriber; do
             cargo run --all-features --example "$e" > /dev/null || exit 1
           done
+      # What docs.rs builds, and therefore what a reader sees. Only the all-features build is
+      # linted: a link from the crate root to a feature-gated module cannot resolve in a
+      # subset build, and deleting those links to make a subset green would trade real
+      # documentation for a green log. Subsets are checked for *compilation* above.
       - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+      # The docs.rs build itself: nightly, with `--cfg docsrs`, so `feature(doc_cfg)` puts a
+      # "available on crate feature X" badge on every gated item. Advisory, because the
+      # attribute is unstable and nightly renames it from time to time — a broken badge must
+      # not turn a release branch red, but nobody should find out about it from docs.rs.
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo +nightly doc --no-deps --all-features
+        continue-on-error: true
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+  # The one oracle that checks *behaviour* rather than octets: libiec61850's client against
+  # this server, and this client against libiec61850's server. `tshark` reads every PDU either
+  # half emits and never reads a **sequence**, and the two halves of this crate share one
+  # codec, so they agree by construction — this is the third party that does neither.
+  #
+  # It is a job of its own because it builds a C library, and `IEC61850_REQUIRE_INTEROP`
+  # makes a skip a failure: an oracle that can quietly stop running is not an oracle.
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build libiec61850
+        run: |
+          git clone --depth 1 https://github.com/mz-automation/libiec61850 "$RUNNER_TEMP/libiec61850"
+          make -C "$RUNNER_TEMP/libiec61850" -j"$(nproc)" examples
+      - run: cargo test --all-features --test interop -- --test-threads=3
+        env:
+          IEC61850_LIBIEC61850: ${{ runner.temp }}/libiec61850
+          IEC61850_REQUIRE_INTEROP: "1"
+
   no_std:
     runs-on: ubuntu-latest
     steps:

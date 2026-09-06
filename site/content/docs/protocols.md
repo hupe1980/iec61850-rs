@@ -129,15 +129,13 @@ while let Some(event) = subscriber.poll_event() { /* … */ }
 let wake_at = subscriber.next_timeout();
 ```
 
-That is not architectural taste. It is what makes a state machine testable: the same code
-runs under a tokio task, on a bare-metal timer, and inside a deterministic simulation that
-delays, duplicates and replays frames across hundreds of seeds — with no I/O to mock and no
-wall clock to wait for. It is also what allows a `no_std` build, because nothing in the core
-needs an operating system.
+That is what makes a state machine testable: the same code runs under a tokio task, on a
+bare-metal timer, and inside a deterministic simulation that delays, duplicates and replays
+frames across hundreds of seeds — with no I/O to mock and no wall clock to wait for. It is
+also what allows a `no_std` build.
 
-There is deliberately no `Machine` trait to implement. Every core exposes the same four
-inherent methods, and a trait nobody would be generic over would only have forced the frame
-type to be owned rather than borrowed.
+There is deliberately no `Machine` trait to implement: every core exposes the same four
+inherent methods, and a trait would only have forced the frame type to be owned.
 
 ## What the standards are called
 

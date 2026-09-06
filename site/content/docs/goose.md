@@ -262,6 +262,24 @@ publisher marks its own clock unsynchronised.
 Counters survive even when the bounded event queue drops events, so a busy application loses
 notifications but never statistics.
 
+### And somewhere to say it
+
+A number a device computes and cannot be asked for is not a diagnostic. IEC 61850-7-4 gives
+every subscription an `LGOS` — one logical node per GOOSE subscription — so a SCADA client can
+read what this subscriber thinks of its stream, and a report control block can carry it:
+
+```rust
+use iec61850_rs::server::SubscriptionStatus;
+
+updates.txn().supervise("IED2LD0/LGOS1", &SubscriptionStatus::from_goose(&subscriber)).commit();
+```
+
+`St` is whether the stream is live, `NdsCom` the publisher's own flag, `SimSt` the simulation
+takeover, and `LastStNum`/`ConfRevNum`/`RxConfRevNum` what the subscriber already holds. The
+details — including why an unchanged status writes nothing — are in
+[Server](@/docs/server.md#supervising-what-this-ied-subscribes-to), and
+`cargo run --example supervised_subscriber` runs the whole thing with no network.
+
 ## From SCL
 
 Rather than filling in MAC addresses by hand, take them from the engineering file:
@@ -300,7 +318,7 @@ does not:
 Strictness on decode buys nothing on a multicast bus where you cannot ask the sender to
 retry. It belongs in the encoder, and that is where it stays.
 
-## Not implemented yet
+## Not included
 
 *Emitting* fixed-length encoded GOOSE (`GSEControl.fixedOffs`, Edition 2.1 — decoding it
 works), the IEC 62351-6 layer-2 authentication extension, routable GOOSE over UDP

@@ -110,6 +110,9 @@ impl StreamConfig {
 pub struct StreamState {
     /// Last `smpCnt` accepted.
     pub last_smp_cnt: Option<u16>,
+    /// Last `confRev` seen — what a supervision logical node publishes as `RxConfRevNum`,
+    /// and the first thing a commissioning engineer compares against the file.
+    pub conf_rev: Option<u32>,
     /// Last `smpSynch` seen.
     pub smp_synch: Option<SmpSynch>,
     /// Last `gmIdentity` seen.
@@ -508,6 +511,7 @@ impl Subscriber {
                 events.push(SubscriberEvent::Gap { stream: i, expected, received: asdu.smp_cnt, lost });
             }
         }
+        s.state.conf_rev = Some(asdu.conf_rev);
         if s.state.smp_synch != asdu.smp_synch {
             events.push(SubscriberEvent::SyncChanged { stream: i, from: s.state.smp_synch, to: asdu.smp_synch });
             s.state.smp_synch = asdu.smp_synch;

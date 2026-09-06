@@ -1,0 +1,74 @@
+<?xml version="1.0"?>
+<SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">
+  <Header id="relay"/>
+  <IED name="IED1"><AccessPoint name="P1"><Server><LDevice inst="LD0">
+    <LN0 lnClass="LLN0" inst="" lnType="LLN0_T">
+      <DataSet name="dsTrip">
+        <FCDA ldInst="LD0" lnClass="PTRC" lnInst="1" doName="Tr" daName="general" fc="ST"/>
+        <FCDA ldInst="LD0" lnClass="PTRC" lnInst="1" doName="Tr" daName="q" fc="ST"/>
+      </DataSet>
+      <ReportControl name="urcb" datSet="dsTrip" confRev="3" indexed="false" bufTime="0">
+        <TrgOps dchg="true" qchg="true"/>
+        <OptFields seqNum="true" timeStamp="true" dataSet="true" reasonCode="true" configRef="true"/>
+      </ReportControl>
+      <Log name="GeneralLog"/>
+      <LogControl name="lcb01" datSet="dsTrip" logName="GeneralLog"><TrgOps dchg="true"/></LogControl>
+      <SettingControl numOfSGs="4" actSG="1"/>
+    </LN0>
+    <LN lnClass="PTRC" inst="1" prefix="" lnType="PTRC_T"/>
+    <LN lnClass="MMXU" inst="1" prefix="" lnType="MMXU_T"/>
+    <LN lnClass="CSWI" inst="1" prefix="" lnType="CSWI_T">
+      <DOI name="Pos"><DAI name="ctlModel"><Val>direct-with-normal-security</Val></DAI></DOI>
+    </LN>
+  </LDevice></Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="Mod" type="INC_T"/></LNodeType>
+    <LNodeType id="PTRC_T" lnClass="PTRC"><DO name="Tr" type="ACT_T"/></LNodeType>
+    <LNodeType id="MMXU_T" lnClass="MMXU"><DO name="TotW" type="MV_T"/></LNodeType>
+    <LNodeType id="CSWI_T" lnClass="CSWI"><DO name="Pos" type="DPC_T"/></LNodeType>
+    <DOType id="INC_T" cdc="INC">
+      <DA name="stVal" fc="ST" bType="Enum" type="Mod_E"/>
+      <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+    </DOType>
+    <DOType id="ACT_T" cdc="ACT">
+      <DA name="general" fc="ST" bType="BOOLEAN"/>
+      <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+    </DOType>
+    <DOType id="MV_T" cdc="MV">
+      <DA name="mag" fc="MX" bType="Struct" type="AnalogueValue_T"/>
+      <DA name="q" fc="MX" bType="Quality"/>
+    </DOType>
+    <DOType id="DPC_T" cdc="DPC">
+      <DA name="stVal" fc="ST" bType="Dbpos"/>
+      <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+      <DA name="ctlModel" fc="CF" bType="Enum" type="CtlModel_E"/>
+      <DA name="Oper" fc="CO" bType="Struct" type="Oper_T"/>
+      <DA name="SBOw" fc="CO" bType="Struct" type="Oper_T"/>
+      <DA name="Cancel" fc="CO" bType="Struct" type="Cancel_T"/>
+      <DA name="SBO" fc="CO" bType="ObjRef"/>
+    </DOType>
+    <DAType id="AnalogueValue_T"><BDA name="f" bType="FLOAT32"/></DAType>
+    <DAType id="Oper_T">
+      <BDA name="ctlVal" bType="Dbpos"/>
+      <BDA name="origin" bType="Struct" type="Originator_T"/>
+      <BDA name="ctlNum" bType="INT8U"/>
+      <BDA name="T" bType="Timestamp"/>
+      <BDA name="Test" bType="BOOLEAN"/>
+      <BDA name="Check" bType="Check"/>
+    </DAType>
+    <DAType id="Cancel_T">
+      <BDA name="ctlVal" bType="Dbpos"/>
+      <BDA name="origin" bType="Struct" type="Originator_T"/>
+      <BDA name="ctlNum" bType="INT8U"/>
+      <BDA name="T" bType="Timestamp"/>
+      <BDA name="Test" bType="BOOLEAN"/>
+    </DAType>
+    <DAType id="Originator_T"><BDA name="orCat" bType="Enum" type="OrCat_E"/><BDA name="orIdent" bType="Octet64"/></DAType>
+    <EnumType id="Mod_E"><EnumVal ord="1">on</EnumVal></EnumType>
+    <EnumType id="OrCat_E"><EnumVal ord="3">remote-control</EnumVal></EnumType>
+    <EnumType id="CtlModel_E"><EnumVal ord="1">direct-with-normal-security</EnumVal></EnumType>
+  </DataTypeTemplates>
+</SCL>

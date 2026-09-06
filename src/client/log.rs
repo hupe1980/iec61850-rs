@@ -17,8 +17,8 @@ use alloc::vec::Vec;
 use super::Client;
 use crate::common::{EntryTime, Error, Fc, ObjectReference, Result};
 use crate::proto::data::{DataView, Typed, Value};
-use crate::proto::mms::journal::{AfterEntry, TimeOfDay};
-use crate::proto::mms::report::TrgOps;
+use crate::proto::mms::journal::{AfterEntry, REASON_CODE_TAG, TimeOfDay};
+use crate::proto::mms::report::{ReasonCode, TrgOps};
 use crate::proto::mms::{ConfirmedRequest, ConfirmedResponse, Mms, ObjectName, ReadJournal};
 
 /// One entry of a log, as the server delivered it.
@@ -30,6 +30,14 @@ pub struct LogEntry {
     pub occurred: EntryTime,
     /// The values it recorded: the data attribute's reference and what it was.
     pub variables: Vec<(String, Value)>,
+    /// Why the entry was made, when the log control block records reasons
+    /// (SCL `LogControl/@reasonCode`, which defaults to *true*).
+    ///
+    /// A journal entry has no field for it, so IEC 61850 carries it as one more variable
+    /// under the reserved tag `ReasonCode` 🌐; it is lifted out here rather than left in
+    /// [`LogEntry::variables`], where it would look like a data attribute called
+    /// `ReasonCode`.
+    pub reason: Option<ReasonCode>,
     /// The text, for an annotation entry.
     pub annotation: Option<String>,
 }
@@ -90,7 +98,15 @@ impl Lcb {
 }
 
 /// The attributes of a log control block (IEC 61850-7-2 §17).
-const LCB_ATTRIBUTES: &[&str] = &["LogEna", "LogRef", "DatSet", "OldEntrTm", "NewEntrTm", "OldEnt", "NewEnt", "TrgOps", "IntgPd"];
+///
+/// The last two are the same two attributes under the **other** spelling the field uses.
+/// IEC 61850-7-2 names the buffer cursor `OldEnt`/`NewEnt` — which is what its own `LTS`
+/// tracking class mirrors as `oldEnt`/`newEnt` — and libiec61850 publishes `OldEntr`/`NewEntr`
+/// 🌐 (`logging.c`). Both are read, whichever answers is kept, and a server is asked for two
+/// names it does not have at the cost of two entries in one `Read`: the alternative is a
+/// client that cannot resume a log against half the devices in the field, because
+/// [`Lcb::oldest`] is the resume point and it comes from exactly this attribute.
+const LCB_ATTRIBUTES: &[&str] = &["LogEna", "LogRef", "DatSet", "OldEntrTm", "NewEntrTm", "OldEnt", "NewEnt", "TrgOps", "IntgPd", "OldEntr", "NewEntr"];
 
 impl Client {
     /// Read a log control block — `GetLCBValues` and `GetLogStatusValues` in one round trip.
@@ -111,8 +127,8 @@ impl Client {
                 "DatSet" => lcb.data_set = v.as_str().map(String::from),
                 "OldEntrTm" => lcb.old_entry_time = entry_time(&v),
                 "NewEntrTm" => lcb.new_entry_time = entry_time(&v),
-                "OldEnt" => lcb.old_entry = octets(&v),
-                "NewEnt" => lcb.new_entry = octets(&v),
+                "OldEnt" | "OldEntr" => lcb.old_entry = lcb.old_entry.take().or_else(|| octets(&v)),
+                "NewEnt" | "NewEntr" => lcb.new_entry = lcb.new_entry.take().or_else(|| octets(&v)),
                 "TrgOps" => lcb.trg_ops = TrgOps::from_value(&v),
                 "IntgPd" => lcb.intg_pd = v.as_u64().and_then(|n| u32::try_from(n).ok()),
                 _ => {}
@@ -136,11 +152,17 @@ impl Client {
     /// `QueryLogByTime`: every entry between two moments.
     ///
     /// `log` is the log itself — `IED1LD0/LLN0$GeneralLog`, or the `LogRef` an [`Lcb`] gave.
-    /// `to` of `None` means "up to now".
+    /// `to` of `None` means "everything from `from` onward", and it is sent as
+    /// [`EntryTime::MAX`] rather than as an absent field: ISO 9506 makes
+    /// `rangeStopSpecification` optional, but the ACSI service above it is a *range* and
+    /// libiec61850 rejects a half-open one outright — `invalid-argument`, before it looks at
+    /// the log 🌐 (`mms_journal_service.c`, "missing valid argument combination"). An omitted
+    /// bound is therefore a request no field device answers, and the honest way to say
+    /// "everything" is the largest time the field can hold.
     pub fn query_log_by_time(&mut self, log: &str, from: EntryTime, to: Option<EntryTime>) -> Result<LogPage> {
         let (domain, item) = log_name(log)?;
         let name = ObjectName::DomainSpecific { domain: &domain, item: &item };
-        self.read_journal(&ReadJournal::by_time(name, TimeOfDay::dated(from), to.map(TimeOfDay::dated)))
+        self.read_journal(&ReadJournal::by_time(name, TimeOfDay::dated(from), Some(TimeOfDay::dated(to.unwrap_or(EntryTime::MAX)))))
     }
 
     /// `QueryLogAfterEntry`: every entry after the one a client last saw.
@@ -185,11 +207,16 @@ impl Client {
         let mut out = Vec::with_capacity(entries.len());
         for e in &entries {
             let mut variables = Vec::with_capacity(e.variables.len());
+            let mut reason = None;
             for v in &e.variables {
                 let value = DataView::from_tlv(v.value)?.to_owned(&self.limits)?;
+                if v.tag == REASON_CODE_TAG {
+                    reason = ReasonCode::from_value(&value);
+                    continue;
+                }
                 variables.push((String::from(v.tag), value));
             }
-            out.push(LogEntry { entry_id: e.entry_id.to_vec(), occurred: e.occurred.time, variables, annotation: e.annotation.map(String::from) });
+            out.push(LogEntry { entry_id: e.entry_id.to_vec(), occurred: e.occurred.time, variables, reason, annotation: e.annotation.map(String::from) });
         }
         Ok(LogPage { entries: out, more_follows })
     }

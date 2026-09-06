@@ -105,6 +105,15 @@ pub struct AfterEntry<'a> {
     pub entry_id: &'a [u8],
 }
 
+/// The `variableTag` a log entry's **reason** travels under.
+///
+/// A journal entry is a list of `(tag, value)` pairs and there is no field in `EntryContent`
+/// for why the entry was made, so IEC 61850's `ReasonCode` is carried as one more variable
+/// with this reserved name — which is what libiec61850 writes and what a client looks for
+/// 🌐. A data attribute can never collide with it: every real tag is an object reference
+/// containing a `/`.
+pub const REASON_CODE_TAG: &str = "ReasonCode";
+
 /// One value inside a journal entry: the reference of a data attribute and what it was.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct JournalVariable<'a> {
@@ -195,8 +204,21 @@ impl<'a> JournalEntry<'a> {
     pub(super) fn write(&self, e: &mut Encoder) -> Result<()> {
         e.constructed(TAG_SEQUENCE, |e| {
             e.primitive(Tag::context(0), self.entry_id)?;
-            if let Some(o) = self.origin {
-                e.primitive(o.tag, o.value)?;
+            // `originatingApplication [1] ApplicationReference` is **mandatory** in
+            // `JournalEntry` ✅ and both of its own fields are optional, so an entry that
+            // names nobody still writes the empty `SEQUENCE`. Leaving the field out makes the
+            // entry malformed to a dissector reading the SEQUENCE positionally; libiec61850
+            // writes exactly `a1 02 30 00` for the same reason 🌐.
+            match self.origin {
+                Some(o) => {
+                    e.primitive(o.tag, o.value)?;
+                }
+                None => {
+                    e.constructed(Tag::context_constructed(1), |e| {
+                        e.constructed(TAG_SEQUENCE, |_| Ok(()))?;
+                        Ok(())
+                    })?;
+                }
             }
             e.constructed(Tag::context_constructed(2), |e| {
                 e.primitive(Tag::context(0), &self.occurred.to_octets())?;
@@ -234,6 +256,35 @@ impl<'a> JournalEntry<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ber::Cursor;
+
+    /// `originatingApplication [1] ApplicationReference` is **mandatory** in `JournalEntry`,
+    /// and both of the reference's own fields are optional — so an entry that names nobody
+    /// still writes the empty `SEQUENCE` inside it.
+    ///
+    /// Leaving it out produced entries Wireshark called malformed (`BER Error: Wrong field in
+    /// SEQUENCE: expected class:CONTEXT(2) tag:1 but found class:CONTEXT(2) tag:2`), which is
+    /// what `tests/tshark_mms.rs` now catches; libiec61850 writes exactly `a1 02 30 00` 🌐.
+    #[test]
+    fn a_journal_entry_always_names_an_originating_application() {
+        let entry = JournalEntry::annotated(&[0, 0, 0, 0, 0, 0, 0, 1], TimeOfDay::from_unix_millis(1_700_000_000_000), "started");
+        let mut e = Encoder::new();
+        entry.write(&mut e).expect("encode");
+        let bytes = e.into_vec();
+        let mut c = Cursor::new(&bytes).next_required().expect("entry").children();
+        assert_eq!(c.next_required().expect("entryIdentifier").tag, Tag::context(0));
+        let origin = c.next_required().expect("originatingApplication");
+        assert_eq!(origin.tag, Tag::context_constructed(1));
+        assert_eq!(origin.value, &[0x30, 0x00], "an empty ApplicationReference is a SEQUENCE with no fields");
+        assert_eq!(c.next_required().expect("entryContent").tag, Tag::context_constructed(2));
+
+        // …and an entry that arrived with one keeps it, byte for byte.
+        let back = JournalEntry::parse(&Cursor::new(&bytes).next_required().expect("tlv"), &Limits::DEFAULT).expect("decode");
+        let mut re = Encoder::new();
+        back.write(&mut re).expect("re-encode");
+        assert_eq!(re.into_vec(), bytes);
+        assert_eq!(back.annotation, Some("started"));
+    }
 
     #[test]
     fn a_time_of_day_keeps_the_width_it_arrived_in() {

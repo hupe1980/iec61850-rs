@@ -15,6 +15,7 @@
 //! the same type. A report's `AccessResult` is an MMS `Data`, and having one decoder for both
 //! is the reason a subscriber and a client agree about what a floating point is.
 
+pub mod alternate;
 pub mod association;
 pub mod control;
 pub mod file;
@@ -25,6 +26,8 @@ pub mod typespec;
 
 use alloc::vec::Vec;
 
+pub use self::alternate::Path as AlternateAccess;
+pub use self::alternate::Selector;
 use crate::ber::{Class, Cursor, Encoder, Tag, Tlv, universal};
 use crate::common::{DecodeReason, Error, Limits, Result};
 use crate::proto::data::DataView;
@@ -109,7 +112,36 @@ pub struct ServiceError {
     pub additional: Option<i64>,
 }
 
+/// `errorClass` choice tags of an ISO 9506 [`ServiceError`], and the codes inside the ones
+/// this crate emits.
+pub mod service_error {
+    /// `service [4]`.
+    pub const SERVICE: u32 = 4;
+    /// `service: primitives-out-of-sequence (1)` — the PDU arrived where it cannot be acted
+    /// on, which is what a `Cancel` naming a request that is no longer outstanding is.
+    pub const PRIMITIVES_OUT_OF_SEQUENCE: i64 = 1;
+}
+
 impl ServiceError {
+    /// The encoded `ServiceError` element for one class and code, under `tag`.
+    ///
+    /// The PDUs that carry one keep it as raw octets ([`Mms::ConfirmedError`],
+    /// [`Mms::CancelError`]) so that a peer's error re-encodes exactly as it arrived; this is
+    /// how *this* end builds one to send. The tag belongs to the **PDU**, not to the error —
+    /// ISO 9506 puts `serviceError` at `[2]` in a `Confirmed-ErrorPDU` and at `[1]` in a
+    /// `Cancel-ErrorPDU` — so the caller names it and a wrong one cannot be defaulted in.
+    pub fn encode(tag: Tag, class: u32, code: i64) -> Result<Vec<u8>> {
+        let mut e = Encoder::new();
+        e.constructed(tag, |e| {
+            e.constructed(Tag::context_constructed(0), |e| {
+                e.integer(Tag::context(class), code)?;
+                Ok(())
+            })?;
+            Ok(())
+        })?;
+        Ok(e.into_vec())
+    }
+
     /// Decode the `ServiceError` an [`Mms::ConfirmedError`] keeps encoded.
     pub fn parse(t: &Tlv<'_>) -> Result<ServiceError> {
         let mut out = ServiceError::default();
@@ -203,12 +235,47 @@ impl<'a> ObjectScope<'a> {
 }
 
 /// `VariableSpecification ::= CHOICE { name [0] ObjectName, … }`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VariableSpecification<'a> {
-    /// `name [0]` — the only form IEC 61850 uses.
+    /// `name [0]` — the whole named variable.
     Name(ObjectName<'a>),
+    /// `name [0]` with the item's `alternateAccess [5]`: one *part* of the named variable —
+    /// an element of an array, a component of a structure, or a path through both.
+    ///
+    /// The two live in one type because they are one question with two answers, and a caller
+    /// that forgets the second reads a sixteen-element array where it asked for one harmonic.
+    /// On the wire they are siblings inside the list item, which [`AlternateAccess`] documents.
+    Element {
+        /// The named variable the selection is relative to.
+        name: ObjectName<'a>,
+        /// Which part of it.
+        access: AlternateAccess<'a>,
+    },
     /// Any other form (address, description, scattered access, invalidated), kept whole.
     Other(Tlv<'a>),
+}
+
+impl<'a> VariableSpecification<'a> {
+    /// The named variable, whichever form this is.
+    pub const fn name(&self) -> Option<&ObjectName<'a>> {
+        match self {
+            VariableSpecification::Name(n) | VariableSpecification::Element { name: n, .. } => Some(n),
+            VariableSpecification::Other(_) => None,
+        }
+    }
+
+    /// The part of it that is selected, if any.
+    pub const fn access(&self) -> Option<&AlternateAccess<'a>> {
+        match self {
+            VariableSpecification::Element { access, .. } => Some(access),
+            VariableSpecification::Name(_) | VariableSpecification::Other(_) => None,
+        }
+    }
+
+    /// A specification for `name`, with `access` when it selects something.
+    pub fn of(name: ObjectName<'a>, access: AlternateAccess<'a>) -> VariableSpecification<'a> {
+        if access.is_empty() { VariableSpecification::Name(name) } else { VariableSpecification::Element { name, access } }
+    }
 }
 
 /// `VariableAccessSpecification ::= CHOICE { listOfVariable [0], variableListName [1] }`.
@@ -501,8 +568,12 @@ impl<'a> ReadJournal<'a> {
     }
 }
 
+/// `status`.
+const SERVICE_STATUS: u32 = 0;
 /// `getVariableAccessAttributes`.
 const SERVICE_GET_VARIABLE_ACCESS_ATTRIBUTES: u32 = 6;
+/// `getCapabilityList`.
+const SERVICE_GET_CAPABILITY_LIST: u32 = 71;
 /// `defineNamedVariableList`.
 const SERVICE_DEFINE_NVL: u32 = 11;
 /// `deleteNamedVariableList`.
@@ -522,9 +593,47 @@ const SERVICE_FILE_DIRECTORY: u32 = 77;
 
 const TAG_VISIBLE_STRING: Tag = Tag::universal(universal::VISIBLE_STRING, false);
 
+/// `vmdLogicalStatus` of a `Status` response (ISO 9506-2).
+pub mod vmd_logical {
+    /// The VMD will accept requests that change its state.
+    pub const STATE_CHANGES_ALLOWED: i64 = 0;
+    /// It will not.
+    pub const NO_STATE_CHANGES_ALLOWED: i64 = 1;
+    /// Only some services are available.
+    pub const LIMITED_SERVICES_ALLOWED: i64 = 2;
+    /// Only support services are available.
+    pub const SUPPORT_SERVICES_ALLOWED: i64 = 3;
+}
+
+/// `vmdPhysicalStatus` of a `Status` response (ISO 9506-2).
+pub mod vmd_physical {
+    /// The device is working.
+    pub const OPERATIONAL: i64 = 0;
+    /// Some of it is.
+    pub const PARTIALLY_OPERATIONAL: i64 = 1;
+    /// None of it is.
+    pub const INOPERABLE: i64 = 2;
+    /// It has not been commissioned.
+    pub const NEEDS_COMMISSIONING: i64 = 3;
+}
+
 /// A confirmed service request.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConfirmedRequest<'a> {
+    /// `status [0]` — is the VMD healthy? The boolean is `extendedDerivation`: the client
+    /// asking the server to *re-derive* its status rather than report the cached one.
+    ///
+    /// It is the first thing many SCADA clients send and the last thing they send before
+    /// giving up on a link, which is why IEC 61850-8-1 keeps it as an ACSI service at all.
+    Status {
+        /// `extendedDerivation`.
+        extended_derivation: bool,
+    },
+    /// `getCapabilityList [71]` — what the VMD says it can do, as free-form strings.
+    GetCapabilityList {
+        /// Continue after this capability, when a previous answer said `moreFollows`.
+        continue_after: Option<&'a str>,
+    },
     /// `getNameList [1]` — browse the server's names.
     GetNameList {
         /// The object class asked for, as its encoded integer.
@@ -600,6 +709,22 @@ pub enum ConfirmedRequest<'a> {
 /// A confirmed service response.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConfirmedResponse<'a> {
+    /// `status [0]`.
+    Status {
+        /// `vmdLogicalStatus`; see [`vmd_logical`].
+        logical: i64,
+        /// `vmdPhysicalStatus`; see [`vmd_physical`].
+        physical: i64,
+        /// `localDetail`, a bit string the vendor defines, kept as `(unused_bits, octets)`.
+        local_detail: Option<(u8, &'a [u8])>,
+    },
+    /// `getCapabilityList [71]`.
+    GetCapabilityList {
+        /// What the VMD says it can do.
+        capabilities: Vec<&'a str>,
+        /// Whether the server has more to give.
+        more_follows: bool,
+    },
     /// `getNameList [1]`.
     GetNameList {
         /// The names.
@@ -734,6 +859,22 @@ pub enum Mms<'a> {
     /// way, and a peer that treats it as an unsolicited PDU waits out its whole request
     /// timeout for something that already arrived.
     Reject(Reject),
+    /// `cancel-RequestPDU [5]` — withdraw a confirmed request that is still outstanding.
+    ///
+    /// The value is the `originalInvokeID`: ISO 9506 numbers the *request* being withdrawn,
+    /// not the withdrawal, so a cancel carries no invoke identifier of its own and is
+    /// answered by `cancel-ResponsePDU` or `cancel-ErrorPDU` naming the same number.
+    CancelRequest(i64),
+    /// `cancel-ResponsePDU [6]` — the named request was withdrawn.
+    CancelResponse(i64),
+    /// `cancel-ErrorPDU [7]` — it was not, and this is why. The `ServiceError` is kept
+    /// encoded; [`ServiceError::parse`] decodes it.
+    CancelError {
+        /// The request that could not be withdrawn.
+        invoke_id: i64,
+        /// The `ServiceError`.
+        error: Tlv<'a>,
+    },
     /// `initiate-RequestPDU [8]`.
     InitiateRequest(Initiate<'a>),
     /// `initiate-ResponsePDU [9]`.
@@ -775,7 +916,14 @@ fn parse_variable_list<'a>(t: &Tlv<'a>, limits: &Limits) -> Result<Vec<VariableS
         let mut c = item?.expect(TAG_SEQUENCE)?.children();
         let spec = c.next_required()?;
         out.push(if spec.tag == Tag::context_constructed(0) {
-            VariableSpecification::Name(ObjectName::parse(&spec.children().next_required()?)?)
+            let name = ObjectName::parse(&spec.children().next_required()?)?;
+            // `alternateAccess [5]` is the sibling that turns "this variable" into "this part
+            // of it". A decoder that skips it hands the caller a name it will read whole,
+            // which is a *different* answer to a question nobody notices was changed.
+            match alternate::next_alternate(&mut c)? {
+                Some(access) => VariableSpecification::Element { name, access },
+                None => VariableSpecification::Name(name),
+            }
         } else {
             VariableSpecification::Other(spec)
         });
@@ -788,6 +936,10 @@ fn write_variable_list(items: &[VariableSpecification<'_>], tag: Tag, e: &mut En
         for item in items {
             e.constructed(TAG_SEQUENCE, |e| match item {
                 VariableSpecification::Name(n) => e.constructed(Tag::context_constructed(0), |e| n.write(e)).map(|_| ()),
+                VariableSpecification::Element { name, access } => {
+                    e.constructed(Tag::context_constructed(0), |e| name.write(e))?;
+                    access.write(e)
+                }
                 VariableSpecification::Other(t) => e.primitive(t.tag, t.value).map(|_| ()),
             })?;
         }
@@ -829,7 +981,14 @@ impl<'a> ConfirmedRequest<'a> {
                 let continue_after = c.next_if_tag(Tag::context(2))?.map(|t| t.visible_string()).transpose()?;
                 ConfirmedRequest::GetNameList { object_class, scope, continue_after }
             }
+            SERVICE_STATUS => ConfirmedRequest::Status { extended_derivation: t.boolean()? },
             2 => ConfirmedRequest::Identify,
+            SERVICE_GET_CAPABILITY_LIST => {
+                // `continueAfter` is untagged in ISO 9506-2, so it is a universal
+                // `VisibleString` rather than a context tag — the one field of this codec
+                // where the optional is recognised by its universal tag.
+                ConfirmedRequest::GetCapabilityList { continue_after: t.children().next_if_tag(TAG_VISIBLE_STRING)?.map(|s| s.visible_string()).transpose()? }
+            }
             4 => {
                 let mut c = t.children();
                 let specification_with_result = c.next_if_tag(Tag::context(0))?.map(|t| t.boolean()).transpose()?.unwrap_or(false);
@@ -869,8 +1028,8 @@ impl<'a> ConfirmedRequest<'a> {
                 let mut names = Vec::new();
                 if let Some(list) = c.next_if_tag(Tag::context_constructed(1))? {
                     for n in list.children() {
-                        if names.len() >= limits.max_dataset_members {
-                            return Err(Error::LimitExceeded { limit: "max_dataset_members", value: names.len() + 1 });
+                        if names.len() >= limits.max_list_items {
+                            return Err(Error::LimitExceeded { limit: "max_list_items", value: names.len() + 1 });
                         }
                         names.push(ObjectName::parse(&n?)?);
                     }
@@ -910,6 +1069,18 @@ impl<'a> ConfirmedRequest<'a> {
                     e.constructed(Tag::context_constructed(1), |e| scope.write(e))?;
                     if let Some(after) = continue_after {
                         e.visible_string(Tag::context(2), after)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            ConfirmedRequest::Status { extended_derivation } => {
+                // `Status-Request ::= BOOLEAN`, implicitly tagged: a primitive octet.
+                e.boolean(Tag::context(SERVICE_STATUS), *extended_derivation)?;
+            }
+            ConfirmedRequest::GetCapabilityList { continue_after } => {
+                e.constructed(Tag::context_constructed(SERVICE_GET_CAPABILITY_LIST), |e| {
+                    if let Some(after) = continue_after {
+                        e.visible_string(TAG_VISIBLE_STRING, after)?;
                     }
                     Ok(())
                 })?;
@@ -1029,13 +1200,35 @@ impl<'a> ConfirmedResponse<'a> {
             return Err(Error::decode(DecodeReason::UnexpectedTag, t.offset));
         }
         Ok(match t.tag.number {
+            SERVICE_STATUS => {
+                let mut c = t.children();
+                let logical = c.next_tag(Tag::context(0))?.integer_i64()?;
+                let physical = c.next_tag(Tag::context(1))?.integer_i64()?;
+                let local_detail = c.next_if_tag(Tag::context(2))?.map(|t| t.bit_string()).transpose()?;
+                ConfirmedResponse::Status { logical, physical, local_detail }
+            }
+            SERVICE_GET_CAPABILITY_LIST => {
+                let mut c = t.children();
+                let list = c.next_tag(Tag::context_constructed(0))?;
+                let mut capabilities = Vec::new();
+                for cap in list.children() {
+                    if capabilities.len() >= limits.max_list_items {
+                        return Err(Error::LimitExceeded { limit: "max_list_items", value: capabilities.len() + 1 });
+                    }
+                    capabilities.push(cap?.expect(TAG_VISIBLE_STRING)?.visible_string()?);
+                }
+                let more_follows = c.next_if_tag(Tag::context(1))?.map(|t| t.boolean()).transpose()?.unwrap_or(true);
+                ConfirmedResponse::GetCapabilityList { capabilities, more_follows }
+            }
             1 => {
                 let mut c = t.children();
                 let list = c.next_tag(Tag::context_constructed(0))?;
                 let mut identifiers = Vec::new();
                 for id in list.children() {
-                    if identifiers.len() >= limits.max_dataset_members {
-                        return Err(Error::LimitExceeded { limit: "max_dataset_members", value: identifiers.len() + 1 });
+                    // A name list is the whole namespace of a logical device, not a data
+                    // set: `max_list_items`, or a real IED cannot be browsed at all.
+                    if identifiers.len() >= limits.max_list_items {
+                        return Err(Error::LimitExceeded { limit: "max_list_items", value: identifiers.len() + 1 });
                     }
                     identifiers.push(id?.expect(TAG_IDENTIFIER)?.visible_string()?);
                 }
@@ -1097,8 +1290,8 @@ impl<'a> ConfirmedResponse<'a> {
                 let list = c.next_tag(Tag::context_constructed(0))?;
                 let mut entries = Vec::new();
                 for entry in list.children() {
-                    if entries.len() >= limits.max_dataset_members {
-                        return Err(Error::LimitExceeded { limit: "max_dataset_members", value: entries.len() + 1 });
+                    if entries.len() >= limits.max_list_items {
+                        return Err(Error::LimitExceeded { limit: "max_list_items", value: entries.len() + 1 });
                     }
                     entries.push(JournalEntry::parse(&entry?, limits)?);
                 }
@@ -1127,9 +1320,9 @@ impl<'a> ConfirmedResponse<'a> {
                 let mut c = t.children();
                 let list = c.next_tag(Tag::context_constructed(0))?;
                 let mut entries = Vec::new();
-                for entry in list.children() {
-                    if entries.len() >= limits.max_dataset_members {
-                        return Err(Error::LimitExceeded { limit: "max_dataset_members", value: entries.len() + 1 });
+                for entry in file::directory_entries(&list) {
+                    if entries.len() >= limits.max_list_items {
+                        return Err(Error::LimitExceeded { limit: "max_list_items", value: entries.len() + 1 });
                     }
                     entries.push(DirectoryEntry::parse(&entry?, limits)?);
                 }
@@ -1151,6 +1344,32 @@ impl<'a> ConfirmedResponse<'a> {
                         }
                         Ok(())
                     })?;
+                    if !*more_follows {
+                        e.boolean(Tag::context(1), false)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            ConfirmedResponse::Status { logical, physical, local_detail } => {
+                e.constructed(Tag::context_constructed(SERVICE_STATUS), |e| {
+                    e.integer(Tag::context(0), *logical)?;
+                    e.integer(Tag::context(1), *physical)?;
+                    if let Some((unused, bits)) = local_detail {
+                        e.bit_string(Tag::context(2), *unused, bits)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            ConfirmedResponse::GetCapabilityList { capabilities, more_follows } => {
+                e.constructed(Tag::context_constructed(SERVICE_GET_CAPABILITY_LIST), |e| {
+                    e.constructed(Tag::context_constructed(0), |e| {
+                        for c in capabilities {
+                            e.visible_string(TAG_VISIBLE_STRING, c)?;
+                        }
+                        Ok(())
+                    })?;
+                    // `DEFAULT TRUE`, so only the false case is written — the same rule
+                    // `GetNameList` follows two arms down.
                     if !*more_follows {
                         e.boolean(Tag::context(1), false)?;
                     }
@@ -1249,10 +1468,19 @@ impl<'a> ConfirmedResponse<'a> {
             }
             ConfirmedResponse::FileDirectory { entries, more_follows } => {
                 e.constructed(Tag::context_constructed(SERVICE_FILE_DIRECTORY), |e| {
+                    // `listOfDirectoryEntry [0] SEQUENCE OF DirectoryEntry` is the one field
+                    // of the file services that is **not** implicitly tagged ✅, so the
+                    // entries live inside an inner universal SEQUENCE: `a0 { 30 { 30 … } }`.
+                    // Writing them straight under `[0]` produces a response Wireshark and
+                    // libiec61850 both call malformed — and it is invisible to a suite where
+                    // the same codec decodes it again, which is why this has a Wireshark test.
                     e.constructed(Tag::context_constructed(0), |e| {
-                        for entry in entries {
-                            entry.write(e)?;
-                        }
+                        e.constructed(TAG_SEQUENCE, |e| {
+                            for entry in entries {
+                                entry.write(e)?;
+                            }
+                            Ok(())
+                        })?;
                         Ok(())
                     })?;
                     if *more_follows {
@@ -1282,6 +1510,28 @@ fn invoke_id_of(t: &Tlv<'_>) -> Result<i64> {
 }
 
 impl<'a> Mms<'a> {
+    /// The invoke identifier of a confirmed PDU, read **without** decoding its service.
+    ///
+    /// A response this codec cannot decode still answers the request it names: the peer has
+    /// spoken and will say nothing more, so the caller has to fail now rather than wait out
+    /// its whole request timeout on octets that have already arrived (D46). Reading the
+    /// identifier is cheap and independent of everything after it — it is the first field of
+    /// all four confirmed PDU types — so the failure can be attributed even when the rest is
+    /// unreadable. `None` for an unconfirmed PDU, a reject, or bytes that are not a PDU at all.
+    pub fn peek_invoke_id(buf: &[u8]) -> Option<i64> {
+        let top = Cursor::new(buf).next_required().ok()?;
+        if top.tag.class != Class::Context || !matches!(top.tag.number, 0 | 1 | 2 | 5) {
+            return None;
+        }
+        let first = top.children().next()?.ok()?;
+        // `confirmed-RequestPDU` and `confirmed-ResponsePDU` write it as a universal INTEGER;
+        // `confirmed-ErrorPDU` and `cancel-*` tag it `[0]`.
+        if first.tag != TAG_INTEGER && first.tag != Tag::context(0) {
+            return None;
+        }
+        first.integer_i64().ok()
+    }
+
     /// Decode an MMS PDU, enforcing `limits` on the lists inside it.
     pub fn parse(buf: &'a [u8], limits: &Limits) -> Result<Mms<'a>> {
         let top = Cursor::new(buf).next_required()?;
@@ -1330,6 +1580,13 @@ impl<'a> Mms<'a> {
                 })
             }
             4 => Mms::Reject(Reject::parse(&top)?),
+            5 => Mms::CancelRequest(invoke_id_of(&top)?),
+            6 => Mms::CancelResponse(invoke_id_of(&top)?),
+            7 => {
+                let mut c = top.children();
+                let invoke_id = invoke_id_of(&c.next_tag(Tag::context(0))?)?;
+                Mms::CancelError { invoke_id, error: c.next_required()? }
+            }
             8 => Mms::InitiateRequest(Initiate::parse(&top)?),
             9 => Mms::InitiateResponse(Initiate::parse(&top)?),
             10 => Mms::InitiateError(top),
@@ -1376,6 +1633,19 @@ impl<'a> Mms<'a> {
                     Unconfirmed::Other(t) => e.primitive(t.tag, t.value).map(|_| ()),
                 })?;
             }
+            Mms::CancelRequest(invoke_id) => {
+                out.unsigned(Tag::context(5), u64::try_from(*invoke_id).unwrap_or(0))?;
+            }
+            Mms::CancelResponse(invoke_id) => {
+                out.unsigned(Tag::context(6), u64::try_from(*invoke_id).unwrap_or(0))?;
+            }
+            Mms::CancelError { invoke_id, error } => {
+                out.constructed(Tag::context_constructed(7), |e| {
+                    e.unsigned(Tag::context(0), u64::try_from(*invoke_id).unwrap_or(0))?;
+                    e.primitive(error.tag, error.value)?;
+                    Ok(())
+                })?;
+            }
             Mms::InitiateRequest(i) => i.write(Tag::context_constructed(8), out)?,
             Mms::InitiateResponse(i) => i.write(Tag::context_constructed(9), out)?,
             Mms::ConcludeRequest => {
@@ -1403,6 +1673,9 @@ impl<'a> Mms<'a> {
     pub fn invoke_id(&self) -> Option<i64> {
         match self {
             Mms::ConfirmedRequest { invoke_id, .. } | Mms::ConfirmedResponse { invoke_id, .. } | Mms::ConfirmedError { invoke_id, .. } => Some(*invoke_id),
+            // A cancel names the request it withdraws, which is what an invoke-tracking peer
+            // has to release — the cancel itself is not a request and has no number.
+            Mms::CancelRequest(id) | Mms::CancelResponse(id) | Mms::CancelError { invoke_id: id, .. } => Some(*id),
             // A reject names the request it rejects, which is what makes it an answer.
             Mms::Reject(r) => r.original_invoke_id,
             _ => None,
@@ -1412,6 +1685,58 @@ impl<'a> Mms<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// A name list is the namespace of a whole logical device, not a data set.
+    ///
+    /// libiec61850's own `LTRK` test model has 643 names in one device, and every real IED has
+    /// more. Applying the data-set limit here made the client refuse a page of them — and,
+    /// because a refused answer used to leave the request outstanding, report that the server
+    /// had never replied. The bound that matters is the reassembled TSDU, which is enforced a
+    /// layer down; `max_list_items` is what says so at the decoder.
+    #[test]
+    fn a_name_list_may_be_larger_than_a_data_set() {
+        use crate::ber::{Encoder, Tag};
+        use alloc::string::String;
+        use alloc::vec::Vec;
+
+        let names: Vec<String> = (0..2_000).map(|i| alloc::format!("GGIO1$ST$Ind{i}$stVal")).collect();
+        let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+        let pdu = Mms::ConfirmedResponse { invoke_id: 1, service: ConfirmedResponse::GetNameList { identifiers: borrowed, more_follows: false } }
+            .to_vec()
+            .expect("encode");
+        match Mms::parse(&pdu, &Limits::DEFAULT).expect("a real device's namespace decodes") {
+            Mms::ConfirmedResponse { service: ConfirmedResponse::GetNameList { identifiers, .. }, .. } => assert_eq!(identifiers.len(), 2_000),
+            other => panic!("not a name list: {other:?}"),
+        }
+        // It is still bounded: the limit is generous, not absent.
+        let tight = Limits { max_list_items: 100, ..Limits::DEFAULT };
+        assert!(matches!(Mms::parse(&pdu, &tight), Err(Error::LimitExceeded { limit: "max_list_items", .. })));
+
+        // …and a *data set* is still held to the data-set limit, which is the whole reason
+        // the two are separate numbers: an engineered list of 600 members is a file to fix,
+        // a namespace of 2 000 names is an ordinary IED.
+        let mut e = Encoder::new();
+        e.constructed(Tag::universal(universal::SEQUENCE, true), |e| {
+            for _ in 0..600 {
+                e.constructed(Tag::universal(universal::SEQUENCE, true), |e| {
+                    e.constructed(Tag::context_constructed(0), |e| {
+                        e.constructed(Tag::context_constructed(1), |e| {
+                            e.visible_string(TAG_IDENTIFIER, "IED1LD0")?;
+                            e.visible_string(TAG_IDENTIFIER, "GGIO1$ST$Ind1$stVal")?;
+                            Ok(())
+                        })?;
+                        Ok(())
+                    })?;
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let list = e.into_vec();
+        let tlv = Cursor::new(&list).next_required().unwrap();
+        assert!(matches!(parse_variable_list(&tlv, &Limits::DEFAULT), Err(Error::LimitExceeded { limit: "max_dataset_members", .. })));
+    }
+
     /// `invokeID` is `Unsigned32` in every PDU that carries one. A negative one is not an
     /// identifier a peer could have issued — and accepting it made the *answer* unencodable,
     /// because a reject has to name it and `originalInvokeID` is `Unsigned32` too. A request
@@ -1504,6 +1829,78 @@ mod tests {
         let pdu = round_trip(wire);
         assert_eq!(pdu.invoke_id(), Some(4431));
         assert!(matches!(pdu, Mms::ConfirmedRequest { service: ConfirmedRequest::Identify, .. }));
+    }
+
+    /// `listOfDirectoryEntry [0]` is the one file-service field that is **not** implicitly
+    /// tagged, so the entries sit inside an inner universal `SEQUENCE`.
+    ///
+    /// Both halves of this crate had it wrong in the same way and therefore agreed with each
+    /// other, which is precisely the failure the Wireshark oracle exists to catch — it did,
+    /// on its first run (`tests/tshark_mms.rs`). The octets asserted here are the shape
+    /// `mms.asn` states ✅ and libiec61850 writes 🌐: `bf 4d { a0 { 30 { 30 … } } }`.
+    #[test]
+    fn a_file_directory_response_wraps_its_entries_in_a_sequence() {
+        let response = ConfirmedResponse::FileDirectory {
+            entries: alloc::vec![DirectoryEntry {
+                name: FileName::from_encoded(&[0x19, 0x01, b'a']),
+                attributes: FileAttributes { size: 7, last_modified: None },
+            }],
+            more_follows: false,
+        };
+        let mut e = Encoder::new();
+        Mms::ConfirmedResponse { invoke_id: 1, service: response }.write(&mut e).expect("encode");
+        let bytes = e.into_vec();
+        // Walk the encoding: response ▸ fileDirectory [77] ▸ listOfDirectoryEntry [0] ▸ the
+        // inner `SEQUENCE OF` ▸ one `DirectoryEntry` ▸ its `filename [0]`.
+        let mut c = Cursor::new(&bytes).next_required().expect("pdu").children();
+        c.next_required().expect("invokeID");
+        let service = c.next_tag(Tag::context_constructed(SERVICE_FILE_DIRECTORY)).expect("fileDirectory");
+        let list = service.children().next_tag(Tag::context_constructed(0)).expect("listOfDirectoryEntry");
+        let inner = list.children().next_required().expect("the SEQUENCE OF");
+        assert_eq!(inner.tag, TAG_SEQUENCE, "`listOfDirectoryEntry [0]` is not implicitly tagged");
+        let entry = inner.children().next_required().expect("one entry");
+        assert_eq!(entry.tag, TAG_SEQUENCE);
+        assert_eq!(entry.children().next_required().expect("filename").tag, Tag::context_constructed(0));
+
+        let back = Mms::parse(&bytes, &Limits::DEFAULT).expect("decode");
+        let Mms::ConfirmedResponse { service: ConfirmedResponse::FileDirectory { entries, .. }, .. } = &back else { panic!("not a file directory") };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name.display(), "a");
+        assert_eq!(entries[0].attributes.size, 7);
+        assert_eq!(back.to_vec().expect("re-encode"), bytes);
+
+        // A server that tagged it implicitly is still read, because refusing a peer over a
+        // tag we can tell apart would be refusing its file listing for nothing.
+        let mut implicit = Encoder::new();
+        implicit
+            .constructed(Tag::context_constructed(2), |e| {
+                e.integer(TAG_INTEGER, 1)?;
+                e.constructed(Tag::context_constructed(SERVICE_FILE_DIRECTORY), |e| {
+                    e.constructed(Tag::context_constructed(0), |e| {
+                        e.constructed(TAG_SEQUENCE, |e| {
+                            e.constructed(Tag::context_constructed(0), |e| {
+                                e.primitive(file::TAG_GRAPHIC_STRING, b"a")?;
+                                Ok(())
+                            })?;
+                            e.constructed(Tag::context_constructed(1), |e| {
+                                e.unsigned(Tag::context(0), 7)?;
+                                Ok(())
+                            })?;
+                            Ok(())
+                        })?;
+                        Ok(())
+                    })?;
+                    Ok(())
+                })?;
+                Ok(())
+            })
+            .expect("encode");
+        let mut implicit = implicit.into_vec();
+        implicit[0] = 0xA1; // a confirmed *response*
+        let back = Mms::parse(&implicit, &Limits::DEFAULT).expect("decode the implicit spelling");
+        let Mms::ConfirmedResponse { service: ConfirmedResponse::FileDirectory { entries, .. }, .. } = back else { panic!("not a file directory") };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name.display(), "a");
     }
 
     #[test]

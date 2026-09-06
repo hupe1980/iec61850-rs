@@ -29,7 +29,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::ber::{Encoder, Tag, Tlv};
+use crate::ber::{Cursor, Encoder, Tag, Tlv};
 use crate::common::{DecodeReason, Error, Limits, Result};
 use crate::proto::data::tag;
 
@@ -156,9 +156,17 @@ impl TypeSpec {
             tag::INTEGER => TypeSpec::Integer(width(t)?),
             tag::UNSIGNED => TypeSpec::Unsigned(width(t)?),
             FLOATING_POINT => {
+                // The two widths are **unnamed** members of the SEQUENCE, so ISO 9506-2
+                // encodes them as universal INTEGERs — not as `[0]`/`[1]`. Wireshark's
+                // stripped module has no `floating-point` in `TypeSpecification` at all, so
+                // the oracle cannot tell the two apart and only a second stack can: this is
+                // what libiec61850 writes and reads 🌐. The context-tagged form is accepted
+                // too, because this crate itself emitted it before the interop run and a
+                // decoder that refuses a peer's octets over a tag it can read is D11's
+                // mistake in the other direction.
                 let mut c = t.children();
-                let format_width = width(&c.next_tag(Tag::context(0))?)?;
-                let exponent_width = width(&c.next_tag(Tag::context(1))?)?;
+                let format_width = width(&next_width(&mut c, 0)?)?;
+                let exponent_width = width(&next_width(&mut c, 1)?)?;
                 TypeSpec::FloatingPoint { format_width, exponent_width }
             }
             tag::OCTET_STRING => TypeSpec::OctetString(t.integer_i32()?),
@@ -225,8 +233,8 @@ impl TypeSpec {
             }
             TypeSpec::FloatingPoint { format_width, exponent_width } => {
                 e.constructed(Tag::context_constructed(FLOATING_POINT), |e| {
-                    e.unsigned(Tag::context(0), u64::from(*format_width))?;
-                    e.unsigned(Tag::context(1), u64::from(*exponent_width))?;
+                    e.unsigned(Tag::universal(crate::ber::universal::INTEGER, false), u64::from(*format_width))?;
+                    e.unsigned(Tag::universal(crate::ber::universal::INTEGER, false), u64::from(*exponent_width))?;
                     Ok(())
                 })?;
             }
@@ -275,6 +283,20 @@ impl TypeSpec {
     }
 }
 
+/// One width of a `floating-point` type specification, in either encoding.
+///
+/// ISO 9506-2 leaves `format-width` and `exponent-width` unnamed, so the conformant octets are
+/// universal INTEGERs; `tag` is the context number this crate used to write instead, and is
+/// still accepted on the way in.
+fn next_width<'a>(c: &mut Cursor<'a>, tag: u32) -> Result<Tlv<'a>> {
+    let t = c.next_required()?;
+    if t.tag == Tag::universal(crate::ber::universal::INTEGER, false) || t.tag == Tag::context(tag) {
+        Ok(t)
+    } else {
+        Err(Error::decode(DecodeReason::UnexpectedTag, t.offset))
+    }
+}
+
 fn width(t: &Tlv<'_>) -> Result<u8> {
     u8::try_from(t.unsigned_lenient_u32()?).map_err(|_| Error::decode(DecodeReason::BadValue, t.value_offset))
 }
@@ -291,6 +313,43 @@ mod tests {
         let back = TypeSpec::parse(&Cursor::new(&bytes).next_required().unwrap(), &Limits::DEFAULT).unwrap();
         assert_eq!(&back, spec);
         back
+    }
+
+    /// The octets a second stack actually puts on the wire for `MMXU1$MX$TotW$mag`.
+    ///
+    /// `floating-point [7]`'s two widths are **unnamed** members of the SEQUENCE, so they are
+    /// universal INTEGERs and not `[0]`/`[1]`. Nothing in this repository could have caught
+    /// the difference: Wireshark's stripped module has no `floating-point` in
+    /// `TypeSpecification` at all, so the oracle dissects either form without complaint, and
+    /// both halves of this crate shared the wrong encoder. libiec61850 refused what we wrote
+    /// and we refused what it wrote — in both directions, silently, as a timeout.
+    #[test]
+    fn a_floating_point_type_is_the_octets_the_field_writes() {
+        // libiec61850 1.6.2, `GetVariableAccessAttributes` for `GGIO1$MX$AnIn1` 🌐.
+        const VENDOR: &[u8] = &[
+            0xa2, 0x31, 0xa1, 0x2f, 0x30, 0x1a, 0x80, 0x03, b'm', b'a', b'g', 0xa1, 0x13, 0xa2, 0x11, 0xa1, 0x0f, 0x30, 0x0d, 0x80, 0x01, b'f', 0xa1, 0x08,
+            0xa7, 0x06, 0x02, 0x01, 0x20, 0x02, 0x01, 0x08, 0x30, 0x08, 0x80, 0x01, b'q', 0xa1, 0x03, 0x84, 0x01, 0xf3, 0x30, 0x07, 0x80, 0x01, b't', 0xa1,
+            0x02, 0x91, 0x00,
+        ];
+        let spec = TypeSpec::parse(&Cursor::new(VENDOR).next_required().unwrap(), &Limits::DEFAULT).expect("the field's octets decode");
+        assert_eq!(spec.component_names(), ["mag", "q", "t"]);
+        assert_eq!(spec.component("mag").and_then(|m| m.component("f")), Some(&TypeSpec::FloatingPoint { format_width: 32, exponent_width: 8 }));
+        // And we write what it writes, byte for byte — which is the half a round trip through
+        // our own encoder can never prove.
+        let mut e = Encoder::new();
+        spec.write(&mut e).unwrap();
+        assert_eq!(e.into_vec(), VENDOR);
+    }
+
+    /// The context-tagged form this crate used to emit is still read, because a peer's octets
+    /// that can be understood are understood (D11) — even when the peer was us.
+    #[test]
+    fn the_older_context_tagged_widths_are_still_accepted() {
+        const LEGACY: &[u8] = &[0xa7, 0x06, 0x80, 0x01, 0x40, 0x81, 0x01, 0x0b];
+        let spec = TypeSpec::parse(&Cursor::new(LEGACY).next_required().unwrap(), &Limits::DEFAULT).expect("decode");
+        assert_eq!(spec, TypeSpec::FloatingPoint { format_width: 64, exponent_width: 11 });
+        // Anything else in that position is still a refusal rather than a guess.
+        assert!(TypeSpec::parse(&Cursor::new(&[0xa7, 0x06, 0x83, 0x01, 0x40, 0x81, 0x01, 0x0b]).next_required().unwrap(), &Limits::DEFAULT).is_err());
     }
 
     #[test]

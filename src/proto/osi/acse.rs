@@ -36,6 +36,23 @@ pub const RESULT_REJECTED_PERMANENT: i64 = 1;
 /// `Associate-result`: rejected (transient).
 pub const RESULT_REJECTED_TRANSIENT: i64 = 2;
 
+/// The contents of `result-source-diagnostic [3]` for `service-user null(0)` — the answer an
+/// acceptance carries.
+///
+/// The field is **mandatory** in `AARE-apdu` (X.227 `AARE-apdu ::= SEQUENCE { … result [2]
+/// Associate-result, result-source-diagnostic [3] Associate-source-diagnostic, … }` ✅), and
+/// omitting it makes the AARE malformed to any dissector that reads the SEQUENCE positionally
+/// — Wireshark says so, and libiec61850 writes exactly these five octets (`acse.c`,
+/// `AcseConnection_createAssociateResponseMessage`) 🌐. It is a constant here rather than a
+/// builder because there is one value an acceptance can carry.
+pub const DIAGNOSTIC_SERVICE_USER_NULL: &[u8] = &[0xA1, 0x03, 0x02, 0x01, 0x00];
+
+/// `result-source-diagnostic [3]` for a `service-user` refusal, e.g.
+/// `authentication-failure(13)`.
+pub const fn diagnostic_service_user(reason: u8) -> [u8; 5] {
+    [0xA1, 0x03, 0x02, 0x01, reason]
+}
+
 /// An ACSE APDU.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Apdu<'a> {
@@ -232,8 +249,20 @@ impl<'a> Apdu<'a> {
                                 Ok(())
                             })?;
                         }
-                        if let Some(d) = a.result_diagnostic {
-                            e.primitive(Tag::context_constructed(3), d)?;
+                        // `result-source-diagnostic [3]` is **mandatory** whenever there is a
+                        // result: an AARE without it is malformed, and every peer that reads
+                        // the SEQUENCE positionally says so rather than skipping it. A
+                        // response that did not carry one is therefore given the acceptance
+                        // value rather than left short — an AARE this stack emits is never
+                        // one a dissector calls malformed.
+                        match (a.result_diagnostic, a.result) {
+                            (Some(d), _) => {
+                                e.primitive(Tag::context_constructed(3), d)?;
+                            }
+                            (None, Some(_)) => {
+                                e.primitive(Tag::context_constructed(3), DIAGNOSTIC_SERVICE_USER_NULL)?;
+                            }
+                            (None, None) => {}
                         }
                         for (n, v) in [(4, a.responding_ap_title), (5, a.responding_ae_qualifier)] {
                             if let Some(v) = v {
@@ -308,6 +337,41 @@ impl<'a> Apdu<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `result-source-diagnostic [3]` is **mandatory** in an AARE, and an AARE without it is
+    /// malformed to anything that reads the SEQUENCE positionally.
+    ///
+    /// Our server omitted it and only our own client ever read the result — the two agreed,
+    /// which is the trap the notes call out. Wireshark did not: `BER Error: Wrong field in
+    /// SEQUENCE: expected class:CONTEXT(2) tag:3 but found class:CONTEXT(2) tag:30`.
+    #[test]
+    fn an_aare_that_carries_a_result_carries_a_diagnostic_too() {
+        let initiate = [0xA9u8, 0x00];
+        let aare = Associate {
+            protocol_version: Some((7, &[0x80])),
+            context_name: Some(Oid::MMS_APPLICATION_CONTEXT),
+            result: Some(RESULT_ACCEPTED),
+            user_information: Some(UserInformation { direct_reference: Some(Oid::BER), indirect_reference: Some(3), value: &initiate }),
+            ..Associate::default()
+        };
+        let bytes = Apdu::AssociateResponse(aare).to_vec().expect("encode");
+        let mut c = Cursor::new(&bytes).next_required().expect("aare").children();
+        assert_eq!(c.next_required().expect("protocol-version").tag, Tag::context(0));
+        assert_eq!(c.next_required().expect("aSO-context-name").tag, Tag::context_constructed(1));
+        assert_eq!(c.next_required().expect("result").tag, Tag::context_constructed(2));
+        let diagnostic = c.next_required().expect("result-source-diagnostic");
+        assert_eq!(diagnostic.tag, Tag::context_constructed(3));
+        assert_eq!(diagnostic.value, DIAGNOSTIC_SERVICE_USER_NULL, "service-user null(0)");
+        assert_eq!(c.next_required().expect("user-information").tag, Tag::context_constructed(30));
+
+        // A refusal names why, and the same five octets carry it.
+        assert_eq!(diagnostic_service_user(13), [0xA1, 0x03, 0x02, 0x01, 13], "authentication-failure");
+
+        // An AARE that arrived with a diagnostic keeps the one it arrived with.
+        let Apdu::AssociateResponse(back) = Apdu::parse(&bytes).expect("decode") else { panic!("not an AARE") };
+        assert_eq!(back.result_diagnostic, Some(DIAGNOSTIC_SERVICE_USER_NULL));
+        assert_eq!(Apdu::AssociateResponse(back).to_vec().expect("re-encode"), bytes);
+    }
 
     /// The AARQ of frame 11 of the reference capture, byte for byte, with the MMS Initiate
     /// PDU cut to two octets.

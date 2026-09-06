@@ -202,7 +202,10 @@ fn scl_show_and_validate() {
 
     let show = run(&["scl", "show", path]);
     assert!(show.ok, "{}", show.stderr);
-    for expected in ["IED IED1", "LD IED1LD0", "LN LLN0", "GSEControl gcbTrip", "DataSet dsTrip", "IED1LD0/PTRC1$ST$Tr$general"] {
+    // The common data class beside each object: `DPC` is a controllable double point and
+    // `ACT` a protection activation, and it is the first thing anyone reading an unfamiliar
+    // file wants next to the name.
+    for expected in ["IED IED1", "LD IED1LD0", "LN LLN0", "DO Tr [ACT]", "GSEControl gcbTrip", "DataSet dsTrip", "IED1LD0/PTRC1$ST$Tr$general"] {
         assert!(show.stdout.contains(expected), "missing {expected} in {}", show.stdout);
     }
     assert!(run(&["scl", "validate", path]).ok, "a conforming file must validate");
@@ -478,6 +481,12 @@ fn the_mms_client_subcommands_talk_to_a_server() {
     assert!(id.stdout.contains("vendor    hupe1980"), "{}", id.stdout);
     assert!(id.stdout.contains("max PDU"), "{}", id.stdout);
 
+    let status = run(&["mms", "status", &common::spawn_mms_server(0)]);
+    assert!(status.ok, "{}", status.stderr);
+    assert!(status.stdout.contains("logical   state-changes-allowed"), "{}", status.stdout);
+    assert!(status.stdout.contains("physical  operational"), "{}", status.stdout);
+    assert!(status.stdout.contains("IEC 61850-8-1"), "{}", status.stdout);
+
     let browse = run(&["mms", "browse", &common::spawn_mms_server(0)]);
     assert!(browse.ok, "{}", browse.stderr);
     assert!(browse.stdout.contains("IED1LD0"), "{}", browse.stdout);
@@ -489,9 +498,15 @@ fn the_mms_client_subcommands_talk_to_a_server() {
     assert!(read.ok, "{}", read.stderr);
     assert_eq!(read.stdout.trim(), "IED1LD0/MMXU1.TotW.mag.f = 1.5");
 
-    let write = run(&["mms", "write", &common::spawn_mms_server(0), "IED1LD0/GGIO1.SPCSO1.stVal", "true", "--type", "bool"]);
+    let write = run(&["mms", "write", &common::spawn_mms_server(0), "IED1LD0/GGIO1.SPCSO1.stVal", "true", "--type", "bool", "--fc", "SP"]);
     assert!(write.ok, "{}", write.stderr);
     assert!(write.stdout.contains("<- true"), "{}", write.stdout);
+
+    // A write without `--fc` is refused here rather than at the far end: the default that
+    // suits a read is the one constraint a conforming server must refuse for a write.
+    let no_fc = run(&["mms", "write", "127.0.0.1:1", "IED1LD0/GGIO1.SPCSO1.stVal", "true"]);
+    assert!(!no_fc.ok);
+    assert!(no_fc.stderr.contains("a write needs --fc"), "{}", no_fc.stderr);
 
     let reports = run(&["mms", "report", &common::spawn_mms_server(2), "--seconds", "2"]);
     assert!(reports.ok, "{}", reports.stderr);

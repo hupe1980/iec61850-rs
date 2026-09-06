@@ -1,0 +1,232 @@
+<?xml version="1.0"?>
+<!--
+  A file that engineers **service tracking** (IEC 61850-7-2 §14, §15.3.2, §20.6.2).
+
+  Three things about it are the point.
+
+  The tracking objects are found by their `cdc`, not by their name: IEC 61850-7-4 names them
+  and this crate does not need to know what it calls them, so `UrcbTrk`, `BrcbTrk`, `SgcbTrk`,
+  `CtlTrk`, `LocbTrk`, `LogTrk` and `GenTrk` here could be called anything and the server would
+  still fill them in.
+
+  Their specific attributes are the control block's own with a lower-case first letter —
+  `rptEna` for `RptEna`, `actSG` for `ActSG` — which is what lets one rule replace nine tables.
+  `T`, `Test` and `Check` keep an upper-case one, which §20.6.2 note 2 says out loud.
+
+  And the `EnumType` for `serviceType`/`errorCode` is declared, so the ordinals come from the
+  file rather than from a table behind the IEC paywall. Only a few values are listed, because a
+  file only has to declare what it uses.
+-->
+<SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">
+  <Header id="tracking"/>
+  <IED name="IED1"><AccessPoint name="P1"><Server><LDevice inst="LD0">
+    <LN0 lnClass="LLN0" inst="" lnType="LLN0_T">
+      <DataSet name="dsTrk">
+        <FCDA ldInst="LD0" lnClass="LLN0" doName="UrcbTrk" fc="SR"/>
+        <FCDA ldInst="LD0" lnClass="LLN0" doName="CtlTrk" fc="SR"/>
+      </DataSet>
+      <ReportControl name="urcb" datSet="dsTrk" confRev="1" indexed="false" bufTime="0">
+        <TrgOps dchg="true" dupd="true" gi="true"/>
+        <OptFields seqNum="true" timeStamp="true" dataSet="true" reasonCode="true" dataRef="true"/>
+      </ReportControl>
+      <ReportControl name="brcb" datSet="dsTrk" confRev="1" buffered="true" indexed="false" bufTime="0">
+        <TrgOps dchg="true" dupd="true" gi="true"/>
+        <OptFields seqNum="true" timeStamp="true" dataSet="true" reasonCode="true" entryID="true"/>
+      </ReportControl>
+      <Log name="EventLog"/>
+      <LogControl name="lcb" datSet="dsTrk" logName="EventLog" reasonCode="true"><TrgOps dchg="true"/></LogControl>
+      <SettingControl numOfSGs="2" actSG="1"/>
+    </LN0>
+    <LN lnClass="CSWI" inst="1" prefix="" lnType="CSWI_T">
+      <DOI name="Pos"><DAI name="ctlModel"><Val>direct-with-normal-security</Val></DAI></DOI>
+    </LN>
+    <LN lnClass="GGIO" inst="1" prefix="" lnType="GGIO_T">
+      <DOI name="SPCSO1"><DAI name="ctlModel"><Val>direct-with-normal-security</Val></DAI></DOI>
+    </LN>
+  </LDevice></Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0">
+      <DO name="GenTrk" type="CST_T"/>
+      <DO name="UrcbTrk" type="UTS_T"/>
+      <DO name="BrcbTrk" type="BTS_T"/>
+      <DO name="SgcbTrk" type="STS_T"/>
+      <DO name="SpcTrk" type="CTS_Bool_T"/>
+      <DO name="CtlTrk" type="CTS_T"/>
+      <DO name="LocbTrk" type="LTS_T"/>
+      <DO name="LogTrk" type="OTS_T"/>
+    </LNodeType>
+    <LNodeType id="CSWI_T" lnClass="CSWI"><DO name="Pos" type="DPC_T"/></LNodeType>
+    <LNodeType id="GGIO_T" lnClass="GGIO"><DO name="SPCSO1" type="SPC_T"/></LNodeType>
+
+    <!-- Table 25: the common half every tracking class inherits. -->
+    <DOType id="CST_T" cdc="CST">
+      <DA name="objRef" fc="SR" bType="ObjRef"/>
+      <DA name="serviceType" fc="SR" bType="Enum" type="ServiceType_E"/>
+      <DA name="errorCode" fc="SR" bType="Enum" type="ServiceError_E"/>
+      <DA name="originatorID" fc="SR" bType="Octet64"/>
+      <DA name="t" fc="SR" bType="Timestamp"/>
+    </DOType>
+    <!-- Table 29: the unbuffered report control block's own attributes, lower-cased. -->
+    <DOType id="UTS_T" cdc="UTS">
+      <DA name="objRef" fc="SR" bType="ObjRef"/>
+      <DA name="serviceType" fc="SR" bType="Enum" type="ServiceType_E"/>
+      <DA name="errorCode" fc="SR" bType="Enum" type="ServiceError_E"/>
+      <DA name="originatorID" fc="SR" bType="Octet64"/>
+      <DA name="t" fc="SR" bType="Timestamp"/>
+      <DA name="rptID" fc="SR" bType="VisString129"/>
+      <DA name="rptEna" fc="SR" bType="BOOLEAN"/>
+      <DA name="datSet" fc="SR" bType="ObjRef"/>
+      <DA name="confRev" fc="SR" bType="INT32U"/>
+      <DA name="intgPd" fc="SR" bType="INT32U"/>
+    </DOType>
+    <!-- Table 30: the buffered block, **whole**. `gi` is the one attribute the lower-case
+         rule alone gets wrong — the block spells it `GI`, with two capitals — so a fixture
+         that leaves it out is a fixture that cannot see the bug (D42's rule 11). -->
+    <DOType id="BTS_T" cdc="BTS">
+      <DA name="objRef" fc="SR" bType="ObjRef"/>
+      <DA name="serviceType" fc="SR" bType="Enum" type="ServiceType_E"/>
+      <DA name="errorCode" fc="SR" bType="Enum" type="ServiceError_E"/>
+      <DA name="originatorID" fc="SR" bType="Octet64"/>
+      <DA name="t" fc="SR" bType="Timestamp"/>
+      <DA name="rptID" fc="SR" bType="VisString129"/>
+      <DA name="rptEna" fc="SR" bType="BOOLEAN"/>
+      <DA name="datSet" fc="SR" bType="ObjRef"/>
+      <DA name="confRev" fc="SR" bType="INT32U"/>
+      <DA name="optFlds" fc="SR" bType="OptFlds"/>
+      <DA name="bufTm" fc="SR" bType="INT32U"/>
+      <DA name="sqNum" fc="SR" bType="INT16U"/>
+      <DA name="trgOps" fc="SR" bType="TrgOps"/>
+      <DA name="intgPd" fc="SR" bType="INT32U"/>
+      <DA name="gi" fc="SR" bType="BOOLEAN"/>
+      <DA name="purgeBuf" fc="SR" bType="BOOLEAN"/>
+      <DA name="entryID" fc="SR" bType="EntryID"/>
+      <DA name="timeOfEntry" fc="SR" bType="EntryTime"/>
+      <DA name="resvTms" fc="SR" bType="INT16"/>
+    </DOType>
+    <!-- Table 33: the log control block. -->
+    <DOType id="LTS_T" cdc="LTS">
+      <DA name="objRef" fc="SR" bType="ObjRef"/>
+      <DA name="serviceType" fc="SR" bType="Enum" type="ServiceType_E"/>
+      <DA name="errorCode" fc="SR" bType="Enum" type="ServiceError_E"/>
+      <DA name="originatorID" fc="SR" bType="Octet64"/>
+      <DA name="t" fc="SR" bType="Timestamp"/>
+      <DA name="logEna" fc="SR" bType="BOOLEAN"/>
+      <DA name="datSet" fc="SR" bType="ObjRef"/>
+      <DA name="trgOps" fc="SR" bType="TrgOps"/>
+      <DA name="intgPd" fc="SR" bType="INT32U"/>
+      <DA name="logRef" fc="SR" bType="ObjRef"/>
+    </DOType>
+    <!-- Table 34: the two log **queries**. Their specific half is the query's own range, and
+         `objRef` names the log rather than a control block, so nothing is mirrored. -->
+    <DOType id="OTS_T" cdc="OTS">
+      <DA name="objRef" fc="SR" bType="ObjRef"/>
+      <DA name="serviceType" fc="SR" bType="Enum" type="ServiceType_E"/>
+      <DA name="errorCode" fc="SR" bType="Enum" type="ServiceError_E"/>
+      <DA name="originatorID" fc="SR" bType="Octet64"/>
+      <DA name="t" fc="SR" bType="Timestamp"/>
+      <DA name="rangeStartTime" fc="SR" bType="EntryTime"/>
+      <DA name="rangeStopTime" fc="SR" bType="EntryTime"/>
+      <DA name="entryID" fc="SR" bType="EntryID"/>
+      <DA name="entryTime" fc="SR" bType="EntryTime"/>
+    </DOType>
+    <!-- Table 35. -->
+    <DOType id="STS_T" cdc="STS">
+      <DA name="objRef" fc="SR" bType="ObjRef"/>
+      <DA name="serviceType" fc="SR" bType="Enum" type="ServiceType_E"/>
+      <DA name="errorCode" fc="SR" bType="Enum" type="ServiceError_E"/>
+      <DA name="t" fc="SR" bType="Timestamp"/>
+      <DA name="numOfSG" fc="SR" bType="INT8U"/>
+      <DA name="actSG" fc="SR" bType="INT8U"/>
+      <DA name="editSG" fc="SR" bType="INT8U"/>
+    </DOType>
+    <!-- Table 55. `T`, `Test` and `Check` keep their upper-case first letter. -->
+    <DOType id="CTS_T" cdc="CTS">
+      <DA name="objRef" fc="SR" bType="ObjRef"/>
+      <DA name="serviceType" fc="SR" bType="Enum" type="ServiceType_E"/>
+      <DA name="errorCode" fc="SR" bType="Enum" type="ServiceError_E"/>
+      <DA name="originatorID" fc="SR" bType="Octet64"/>
+      <DA name="t" fc="SR" bType="Timestamp"/>
+      <DA name="ctlVal" fc="SR" bType="Dbpos"/>
+      <DA name="origin" fc="SR" bType="Struct" type="Originator_T"/>
+      <DA name="ctlNum" fc="SR" bType="INT8U"/>
+      <DA name="T" fc="SR" bType="Timestamp"/>
+      <DA name="Test" fc="SR" bType="BOOLEAN"/>
+      <DA name="Check" fc="SR" bType="Check"/>
+      <DA name="respAddCause" fc="SR" bType="Enum" type="AddCause_E"/>
+    </DOType>
+
+    <!-- The second control tracker: same class, a different `ctlVal` type. IEC 61850-7-4's
+         `LTRK` carries one per kind of controlled object, so which one records a command is
+         decided by that type and by nothing else — and this one is declared **first**, so a
+         server that took "the first CTS in the logical device" would put every double-point
+         command in it. -->
+    <DOType id="CTS_Bool_T" cdc="CTS">
+      <DA name="objRef" fc="SR" bType="ObjRef"/>
+      <DA name="serviceType" fc="SR" bType="Enum" type="ServiceType_E"/>
+      <DA name="errorCode" fc="SR" bType="Enum" type="ServiceError_E"/>
+      <DA name="t" fc="SR" bType="Timestamp"/>
+      <DA name="ctlVal" fc="SR" bType="BOOLEAN"/>
+      <DA name="ctlNum" fc="SR" bType="INT8U"/>
+    </DOType>
+    <DOType id="SPC_T" cdc="SPC">
+      <DA name="stVal" fc="ST" bType="BOOLEAN"/>
+      <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+      <DA name="ctlModel" fc="CF" bType="Enum" type="CtlModel_E"/>
+      <DA name="Oper" fc="CO" bType="Struct" type="OperBool_T"/>
+    </DOType>
+    <DAType id="OperBool_T">
+      <BDA name="ctlVal" bType="BOOLEAN"/>
+      <BDA name="origin" bType="Struct" type="Originator_T"/>
+      <BDA name="ctlNum" bType="INT8U"/>
+      <BDA name="T" bType="Timestamp"/>
+      <BDA name="Test" bType="BOOLEAN"/>
+      <BDA name="Check" bType="Check"/>
+    </DAType>
+
+    <DOType id="DPC_T" cdc="DPC">
+      <DA name="stVal" fc="ST" bType="Dbpos"/>
+      <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+      <DA name="ctlModel" fc="CF" bType="Enum" type="CtlModel_E"/>
+      <DA name="Oper" fc="CO" bType="Struct" type="Oper_T"/>
+      <DA name="Cancel" fc="CO" bType="Struct" type="Cancel_T"/>
+    </DOType>
+    <DAType id="Oper_T">
+      <BDA name="ctlVal" bType="Dbpos"/>
+      <BDA name="origin" bType="Struct" type="Originator_T"/>
+      <BDA name="ctlNum" bType="INT8U"/>
+      <BDA name="T" bType="Timestamp"/>
+      <BDA name="Test" bType="BOOLEAN"/>
+      <BDA name="Check" bType="Check"/>
+    </DAType>
+    <DAType id="Cancel_T">
+      <BDA name="ctlVal" bType="Dbpos"/>
+      <BDA name="origin" bType="Struct" type="Originator_T"/>
+      <BDA name="ctlNum" bType="INT8U"/>
+      <BDA name="T" bType="Timestamp"/>
+      <BDA name="Test" bType="BOOLEAN"/>
+    </DAType>
+    <DAType id="Originator_T"><BDA name="orCat" bType="Enum" type="OrCat_E"/><BDA name="orIdent" bType="Octet64"/></DAType>
+
+    <!-- The ordinals the server uses come from here, not from IEC 61850-8-1. -->
+    <EnumType id="ServiceType_E">
+      <EnumVal ord="7">SetDataValues</EnumVal>
+      <EnumVal ord="15">SelectActiveSG</EnumVal>
+      <EnumVal ord="25">SetURCBValues</EnumVal>
+      <EnumVal ord="23">SetBRCBValues</EnumVal>
+      <EnumVal ord="27">SetLCBValues</EnumVal>
+      <EnumVal ord="28">QueryLogByTime</EnumVal>
+      <EnumVal ord="29">QueryLogAfter</EnumVal>
+      <EnumVal ord="45">Operate</EnumVal>
+      <EnumVal ord="53">InternalChange</EnumVal>
+    </EnumType>
+    <EnumType id="ServiceError_E">
+      <EnumVal ord="2">access-violation</EnumVal>
+      <EnumVal ord="12">no-error</EnumVal>
+    </EnumType>
+    <EnumType id="AddCause_E"><EnumVal ord="0">Unknown</EnumVal><EnumVal ord="1">Not-supported</EnumVal></EnumType>
+    <EnumType id="OrCat_E"><EnumVal ord="3">remote-control</EnumVal></EnumType>
+    <EnumType id="CtlModel_E"><EnumVal ord="1">direct-with-normal-security</EnumVal></EnumType>
+  </DataTypeTemplates>
+</SCL>

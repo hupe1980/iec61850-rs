@@ -1,6 +1,6 @@
 [package]
 name = "iec61850-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -15,6 +15,12 @@ exclude = ["specs/", "concepts/", "fuzz/", "site/", ".github/", "scripts/"]
 
 [lib]
 name = "iec61850_rs"
+
+[package.metadata.docs.rs]
+# The interesting surface is spread across the features; document all of them, and pass
+# `--cfg docsrs` so every gated item shows the feature it needs.
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["std", "goose", "sv", "mms", "scl", "pcap", "client", "server"]
@@ -57,6 +63,9 @@ proptest = "1.11"
 unsafe_code = "deny"
 missing_docs = "warn"
 unused_qualifications = "warn"
+# `docsrs` is set only by the docs.rs build (see [package.metadata.docs.rs]); declare it
+# so the lint does not report the crate's own gate as a typo.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
 
 [lints.clippy]
 unwrap_used = "deny"
@@ -122,9 +131,22 @@ path = "tests/tshark_oracle.rs"
 required-features = ["goose", "sv", "pcap"]
 
 [[test]]
+name = "tshark_mms"
+path = "tests/tshark_mms.rs"
+required-features = ["client", "server"]
+
+[[test]]
 name = "regressions"
 path = "tests/regressions.rs"
 required-features = ["mms"]
+
+# Interop against libiec61850, in both roles — the only third party that checks the
+# *sequence* rather than the octets. Skips unless `IEC61850_LIBIEC61850` names a built
+# checkout; nothing from it is vendored here.
+[[test]]
+name = "interop"
+path = "tests/interop.rs"
+required-features = ["client", "server"]
 
 [[test]]
 name = "cli"
@@ -165,3 +187,9 @@ required-features = ["scl", "sv", "mms"]
 [[example]]
 name = "server_from_scl"
 required-features = ["client", "server"]
+
+[[example]]
+name = "supervised_subscriber"
+# The seam between the two buses: a GOOSE subscriber's state published into the `LGOS` the
+# SCL file declares, and read back over MMS.
+required-features = ["client", "server", "goose"]

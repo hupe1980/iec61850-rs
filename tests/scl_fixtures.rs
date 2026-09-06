@@ -152,6 +152,10 @@ fn the_corpus_validates_with_the_findings_it_is_known_to_have() {
     // IED2's control block has no `GSE` address, so IED1's inputs bound to it cannot be
     // subscribed — which is the finding a commissioning engineer needs.
     assert!(codes.contains(&FindingCode::UnresolvedSubscription), "{codes:?}");
+    // Nobody's type templates declare a member twice, which is the point of asserting it on a
+    // file this project did not write: a check that only ever fires on its own fixtures has
+    // not been tested against anything.
+    assert!(!codes.contains(&FindingCode::DuplicateTypeMember), "{report:#?}");
 }
 
 #[test]

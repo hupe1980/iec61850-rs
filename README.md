@@ -9,37 +9,34 @@ encoders checked against real substation captures frame for frame.
 
 📖 **[Documentation and guide](https://hupe1980.github.io/iec61850-rs/)** · 📋 **[Changelog](CHANGELOG.md)**
 
-> **Pre-release.** The process bus works and is tested; the MMS client associates, browses,
-> reads, writes, **receives decoded reports**, **operates controllable objects**, **pulls files
-> off a server**, **reads logs** and **edits setting groups** through all six of its OSI
-> layers — and the **server** does the other half of every one of those, straight from an SCL
-> file. What is not written yet is service tracking, TLS and the raw-socket adapters. The API
-> will change, and everything here is tested against itself rather than against another
-> vendor's stack — see
-> [Verification](https://hupe1980.github.io/iec61850-rs/docs/verification/).
+> **Pre-release.** The API will change, and nothing here has been through a conformance
+> laboratory — see [Verification](https://hupe1980.github.io/iec61850-rs/docs/verification/).
 
 ## What works today
 
 | | |
 |---|---|
-| **GOOSE** (IEC 61850-8-1) | Codec, publisher with the T1…T0 retransmission curve, subscriber with the IEC 62351-6 replay rule, Edition 2 simulation-bit semantics, and the delta features a substation IDS is built on |
-| **Sampled Values** (IEC 61850-9-2) | Codec, template-patching publisher for the 9-2LE and IEC 61869-9 profiles — `smpSynch`, `refrTm` and `gmIdentity` patched in place — multi-stream subscriber tracking continuity, sync, grandmaster, staleness and the Edition 2 simulation rule. **Any data set decodes**: the SCL file gives each ASDU channel a name, a type and an offset, so a merging unit that is not 9-2LE needs no special case |
-| **MMS** (IEC 61850-8-1) | The whole OSI stack under it — TPKT with a stream reader, COTP class 0 with TSDU reassembly, session, presentation, ACSE — the MMS PDUs, and the **association state machine** over all six: client *and* server roles, invoke tracking, TSDU segmentation, timeouts, orderly release, ACSE password. A service that fails and a PDU that is *rejected* are different answers, decoded and emitted as such. Values share their codec with GOOSE |
-| **MMS client** | Blocking, no runtime, no dependency: connect (from the SCD if you like), `Identify`, browse the server with `moreFollows` paging, read one value or many or a whole data set, write, ask what *type* a variable is, create and delete data sets |
-| **Reporting** (IEC 61850-8-1 §17) | Read a report control block attribute by attribute, configure it, enable it with `RptEna` written last, ask for a general interrogation — and get reports **decoded**: `RptID`, `SqNum`, `TimeOfEntry`, `EntryID`, the inclusion bit string, and per member its index, reference, value and reason for inclusion. A report split across **segments** is joined before you see it, or not delivered at all |
-| **Files** (IEC 61850-8-1 §23) | List a server's files, pull one off it, delete one. The `frsmID` a `FileOpen` returns is given back even when a read fails partway — a leaked handle is a file left open in a relay. The server's store is read in **ranges**, so an open costs a name and a read costs a chunk however big the record is. This is how a COMTRADE record gets off an IED |
-| **Logs** (IEC 61850-7-2 §17) | Read a log control block, then `QueryLogByTime` or `QueryLogAfterEntry` — the second carries the `EntryID` *and* its time, so a reconnecting client resumes exactly where it stopped, without a gap and without duplicates |
-| **Setting groups** (IEC 61850-7-2 §11) | Read the `SGCB`, activate a group, or select ▸ write ▸ confirm ▸ release an edit in one call — which refuses to confirm if any write was rejected, because a half-written protection group must not be activated |
-| **Control** (IEC 61850-7-2 §20) | All four control models behind one `execute` — direct and select-before-operate, normal and enhanced security — with `origin`, `ctlNum`, `Check`, `Test`, time-activated operate and `Cancel`. A refused command comes back as its `AddCause`, not as success |
-| **Server** (IEC 61850-8-1) | An SCL file is the whole configuration — no generated model, no build step. It publishes the flattened, sorted namespace the 8-1 mapping requires, answers browse, read, write and type discovery from the model, runs a report engine (one client per block, `BufTm` gathering, `GI`, integrity, and a buffered block that replays what a disconnected client missed), enforces all four control models with an application hook, keeps a value per setting group, serves files from a **sandboxed** store and writes logs. Timers run on a monotonic clock and `TimeOfEntry`, log times and `LActTm` on a pluggable wall clock — two different questions, never derived from one another. It takes its **edition** from the file's own schema version, so an Edition 1 file serves an Edition 1 report control block — no `ResvTms`, no `Owner`. `ied sim relay.icd` is a working IED |
-| **SCL** (IEC 61850-6) | Load an IED model from ICD/CID/SCD — data sets, control blocks, addresses — resolve what an IED subscribes to from its `Inputs/ExtRef`, and check the engineering errors the XML schema permits. Lenient by default with stable diagnostic codes; strict on request |
-| **`ied`** | Command line: `sim` (serve an SCD's IEDs), `mu`, `sv monitor` (`--scd` to name the channels), `goose sniff`, `mms sniff`, `mms identify/browse/read/write/rcb/report/control/type/files/get/log/sg` against a live server, `pcap info`, `scl validate`, `scl show`, `scl subs` |
+| **GOOSE** (IEC 61850-8-1) | Codec, publisher with the T1…T0 retransmission curve, subscriber with the IEC 62351-6 replay rule and Edition 2 simulation-bit semantics |
+| **Sampled Values** (IEC 61850-9-2) | Codec, template-patching publisher for the 9-2LE and IEC 61869-9 profiles, multi-stream subscriber tracking continuity, sync, grandmaster and staleness. **Any** engineered data set decodes: the SCL file gives each ASDU channel its name, type and offset |
+| **MMS** (IEC 61850-8-1) | TPKT, COTP class 0 with TSDU reassembly, session, presentation, ACSE, the MMS PDUs, and the association state machine over all six in **both roles** — invoke tracking, segmentation, timeouts, orderly release, ACSE password, typed rejects |
+| **MMS client** | Blocking, no runtime, no dependency. Connect (from the SCD if you like), `Status`, `Identify`, `GetCapabilityList`, browse with `moreFollows` paging, read and write, type discovery, data-set create and delete. Reconnects on a `Backoff` you state; what belonged to the old association is yours to re-enable |
+| **Arrays** (IEC 61850-8-1 §7.3) | An array is where the MMS namespace stops, so the reference is the whole API: `read("…/MHAI1.HA.phsAHar(2).cVal.mag.f")` becomes one named variable plus an ISO 9506 selection. SCL's `count` builds the array, `FCDA/@ix` puts one element in a data set, and a selection the server cannot serve is refused rather than answered with the whole array |
+| **Reporting** (IEC 61850-8-1 §17) | Configure and enable a control block, request a general interrogation, and receive reports **decoded** — per member its index, reference, value and reason. A member that names a data *object* is one member, carried as the structure it is. Reports too large for the negotiated PDU are **segmented** by the server and rejoined by the client |
+| **Files** (IEC 61850-8-1 §23) | List, read and delete. The `frsmID` is released even when a read fails partway; the server's store is read in **ranges**, so a read costs a chunk however big the record is |
+| **Logs** (IEC 61850-7-2 §17) | Read the control block, then `QueryLogByTime` or `QueryLogAfterEntry` — the latter carries the `EntryID` *and* its time, so a reconnecting client resumes without a gap or a duplicate. Server-side entries live behind a `LogStore` trait |
+| **Supervision** (IEC 61850-7-4) | `LGOS` and `LSVS`: a subscriber's own state — live, `ndsCom`, arriving `confRev`, simulated — published into the logical node the SCL file declares |
+| **Service tracking** (IEC 61850-7-2 §14) | What happened on the *wire*, which no report can say: who enabled that control block, which client was refused with what, and who read the sequence-of-events log. The file declares a tracking object by its `cdc`, the server fills it in, and an ordinary report control block carries it. All ten classes, including the log queries (`OTS`) and one control tracker per kind of controlled object |
+| **Setting groups** (IEC 61850-7-2 §11) | Read the `SGCB`, activate a group, or select ▸ write ▸ confirm ▸ release an edit in one call, which refuses to confirm if any write was rejected. The server serves a setting under **both** `SG` and `SE` from the one declaration SCL allows, and expires an abandoned edit reservation on `ResvTms` |
+| **Control** (IEC 61850-7-2 §20) | All four models behind one `execute`, with `origin`, `ctlNum`, `Check`, `Test`, time-activated operate and `Cancel`. The model is **read off the server** when the caller does not state one, so a select-before-operate object is not driven as a direct control. A refusal comes back as its `AddCause` |
+| **Server** (IEC 61850-8-1) | An SCL file is the whole configuration — no generated model, no build step. The 8-1 namespace, browse, read, write, type discovery, a report engine (`BufTm` gathering, `GI`, integrity, buffered replay), all four control models behind an application hook, per-group setting values, a sandboxed file store, logs, and the GOOSE and SV control blocks with the addresses the file gives them. A client may write what the **functional constraint** allows and nothing else; a command is refused unless `Beh` takes it. Monotonic clock for timers, pluggable wall clock for timestamps. The **edition** comes from the file's own schema version. Every queue is bounded, including the one that holds a slow client's reports |
+| **SCL** (IEC 61850-6) | Load an IED model from ICD/CID/SCD, resolve what an IED subscribes to from its `Inputs/ExtRef`, and check the engineering errors the XML schema permits — and the few it forbids, since the loader does not validate against the XSD. Lenient by default with stable diagnostic codes; strict on request |
+| **`ied`** | `sim`, `mu`, `sv monitor`, `goose sniff`, `mms sniff`, `mms status/identify/browse/read/write/rcb/report/control/type/files/get/log/sg`, `pcap info`, `scl validate`, `scl show`, `scl subs` |
 | Supporting | Panic-free BER codec, the IEC 61850 wire types, classic pcap reader and writer |
 
-**Not yet:** service tracking, `ObtainFile`, a durable log store, the edition-dependent
+**Not included:** `ObtainFile`/`SetFile`, a durable `LogStore` backend, the edition-dependent
 enumerations, raw-socket adapters, the IEC 62351-6 authentication extension, routable GOOSE/SV
 (IEC TR 61850-90-5), TLS, and *emitting* fixed-length encoded GOOSE — decoding it works; the
-widths table that encoding needs is behind the IEC paywall and is not worth guessing.
+widths table encoding needs is behind the IEC paywall.
 
 ## Install
 
@@ -79,11 +76,9 @@ for event in sub.feed(now, &frame) {
 
 Every core takes inputs with the caller's notion of *now*, yields outputs, and says when it
 wants to be called again — no sockets, no threads, no clock reads, no trait to implement.
-That is what lets the same code run under tokio, on a bare-metal timer, or inside a
-deterministic simulation.
 
-The engineering file is the configuration, for subscribers too. Addresses, APPIDs and
-`confRev` are written once, in the SCD, and never a second time in code:
+The engineering file is the configuration for subscribers too: addresses, APPIDs and
+`confRev` are written once, in the SCD.
 
 ```rust
 let subs = iec61850_rs::scl::subscriptions(&scd, "IED2", 50)?;   // 50 Hz system
@@ -93,8 +88,7 @@ for s in &subs.goose {
 ```
 
 A sampled-value subscription carries the publisher's **channel layout** with it, so samples
-arrive decoded rather than as a block of octets — for any engineered data set, not only
-9-2LE's fixed one:
+arrive decoded rather than as a block of octets — for any engineered data set:
 
 ```rust
 let mut sv = iec61850_rs::proto::sv::Subscriber::new(subs.sv.iter().map(|s| s.sv_config()).collect());
@@ -121,9 +115,8 @@ let w = c.read("IED1LD0/MMXU1.TotW.mag.f", Fc::MX)?;   // one round trip, typed 
 c.release()?;
 ```
 
-Reports come back **decoded**. Which fields a report carries is decided entirely by the
-control block's `OptFlds` — there is no tag on the wire to fall back on — so the same code that
-enables the block is what knows how to read what it sends:
+Reports come back **decoded**. Which fields one carries is decided entirely by the control
+block's `OptFlds`, so the code that enables the block is what knows how to read it:
 
 ```rust
 use iec61850_rs::client::{RcbSettings, TrgOps};
@@ -139,8 +132,8 @@ while let Some(r) = c.next_report(Duration::from_secs(5))? {
 }
 ```
 
-Controls are one call whichever of the four models the object is engineered with — and a
-command the substation *refuses* comes back as a refusal, not as a successful write:
+Controls are one call whichever of the four models the object is engineered with, and a
+refusal comes back as a refusal rather than as a successful write:
 
 ```rust
 use iec61850_rs::client::{Check, ControlModel, OriginCategory};
@@ -153,8 +146,7 @@ c.control("IED1LD0/CSWI1.Pos")
     .execute(&Value::dbpos(Dbpos::On))?;               // Err(ControlRejected { add_cause })
 ```
 
-A COMTRADE record, a log and a setting group are the three things a commissioning engineer
-reaches for after the values, and each is one call:
+A COMTRADE record, a log and a setting group are one call each:
 
 ```rust
 for f in c.file_directory(Some("COMTRADE"))? {              // list, then pull
@@ -170,15 +162,14 @@ c.edit_setting_group("IED1LD0/LLN0$SP$SGCB", 2,             // select ▸ write 
                      &[("IED1LD0/PTOC1.StrVal.setMag.f", Value::Float32(1.25))])?;
 ```
 
-And when a write is refused because the value was the wrong shape, the server will say what
-the right one is:
+When a write is refused for the wrong shape, the server will say what the right one is:
 
 ```rust
 let oper = c.variable_type("IED1LD0/CSWI1.Pos.Oper", Fc::CO)?;
 assert_eq!(oper.component_names(), ["ctlVal", "origin", "ctlNum", "T", "Test", "Check"]);
 ```
 
-And the other half: an SCL file is a **server**. No generated model, no build step, no second
+The other half: an SCL file is a **server**. No generated model, no build step, no second
 description of the IED to keep in step with the first.
 
 ```rust
@@ -206,6 +197,7 @@ ied sv monitor stream.pcap                           # the library's own subscri
 ied sv monitor stream.pcap --scd bay.scd             # …with every ASDU channel named by the SCD
 ied goose sniff bay.pcap                             # gocbRef, stNum/sqNum, TAL, simulation bit
 ied mms sniff station.pcap                           # six OSI layers: association, services, values
+ied mms status 10.0.0.5                              # is it alive? the cheapest round trip there is
 ied mms browse 10.0.0.5                              # a live server: devices, data, data sets
 ied mms read 10.0.0.5 IED1LD0/MMXU1.TotW.mag.f --fc MX
 ied mms rcb 10.0.0.5 IED1LD0/LLN0.urcb01             # a report control block's configuration
@@ -220,14 +212,12 @@ ied scl validate relay.icd                           # the engineering errors th
 ied scl subs bay.scd IED2                            # every ExtRef resolved to its publisher
 ```
 
-`ied sim` serves every IED in an SCD, each on its own port, and prints the map. It is a real
-server — browse it, enable a report control block on it, operate its breaker — which is also
-how the `ied mms` subcommands are tested in CI: one binary talking to itself over a real
-association, with no device and no network interface.
+`ied sim` serves every IED in an SCD, each on its own port. It is a real server — browse it,
+enable a report control block, operate its breaker — and it is how the `ied mms` subcommands
+are tested in CI: one binary talking to itself, with no device and no network interface.
 
-`goose sniff` and `sv monitor` run the library's own subscriber state machines over the
-capture, so what they report about a frame is what a subscribing IED would decide about it —
-replays and all, not a second implementation that could drift from the first.
+`goose sniff` and `sv monitor` drive the library's own subscriber state machines, so what they
+report about a frame is what a subscribing IED would decide about it.
 
 ## Examples
 
@@ -239,45 +229,38 @@ cargo run --example mms_loopback        # the association state machine, both ro
 cargo run --example goose_roundtrip     # a publisher driving a subscriber
 cargo run --example sv_merging_unit     # 2400 frames/s, decoded back
 cargo run --example scl_model           # an SCD as the configuration
+cargo run --example supervised_subscriber  # a GOOSE subscription's health, published as LGOS
 ```
 
 ## Why trust it
 
-- Every frame of a two-IED SEL **GOOSE capture** and all **10,161 frames** of a 9-2LE
-  sampled-value capture decode and **re-encode byte for byte**. The sampled-value publisher,
-  configured as that merging unit was, reproduces its frames exactly.
-- A real **MMS association** — 165 packets — decodes through TPKT, COTP, session,
-  presentation, ACSE and MMS, and **653 of its 656 encodings come back byte for byte**. The
-  three that do not are where that server writes a length non-minimally; those are held to
-  being a fixed point instead.
-- **The stack is its own test peer, on both sides.** The suite loads an SCL file into the real
-  server and runs the real client against it over a loopback socket: browse the namespace and
-  check it is sorted and complete, enable a control block and watch a change arrive with the
-  right reason code, take that block over from a second client, replay a buffered block to a
-  client that was not there, run all four control models, activate a setting group, pull a file
-  and fail to escape its sandbox. That proves the two halves agree about the *mapping* — not
-  that either is right; two implementations by one author sharing one codec agree by
-  construction, and only interop against another stack moves that.
-- **Wireshark is the oracle**: frames the encoders emit are dissected by `tshark` on every
-  push, and a malformed marker fails the build.
+- A two-IED SEL **GOOSE capture** and all **10,161 frames** of a 9-2LE sampled-value capture
+  decode and **re-encode byte for byte**; the publisher, configured as that merging unit was,
+  reproduces its frames exactly.
+- A real 165-packet **MMS association** decodes through all six OSI layers, and 653 of its 656
+  encodings come back byte for byte. The three that do not are where that server writes a
+  length non-minimally, and are held to being a fixed point instead.
+- **Wireshark is the oracle, for both buses.** A recording proxy runs one full association
+  between the real client and the real server through every service it answers; the capture is
+  dissected as TPKT ▸ COTP ▸ session ▸ presentation ▸ ACSE ▸ MMS and asserted in Wireshark's
+  own field names. It found three malformed PDUs that a self-checking suite could not.
+- **libiec61850 drives this server, and this client drives libiec61850's**, in CI. Their
+  client browses, reads, discovers types, operates all four control models, reads array
+  elements and takes reports; this client does the same against their server, plus the log
+  services. A dissector says whether a PDU is well-formed; only a peer says whether it is the
+  PDU that was expected, in the order it was expected — which is where most of the defects
+  found so far have lived.
+- **The stack is its own test peer on both sides**, over a loopback socket, from an SCL file.
+  That proves the two halves agree about the mapping — not that either is right, which is why
+  the two entries above exist.
 - An **adversarial simulation** runs publisher against subscriber under loss, reordering,
-  duplication, replay and partition across 512 seeds in CI, asserting invariants that are
-  themselves mutation-tested.
-- **Zero allocations** in the steady state is a *measured* number, not a claim: a counting
-  global allocator asserts none across a thousand GOOSE retransmissions, a thousand state
-  changes, and a second of IEC 61869-9 publishing and reception.
+  duplication, replay and partition across 512 seeds in CI.
+- **Zero allocations** in the steady state is a measured number: a counting global allocator
+  asserts none across a thousand GOOSE retransmissions and a second of IEC 61869-9 publishing.
 - **Ten fuzz targets**, `#![forbid(unsafe_code)]`, and `unwrap`/`expect`/`panic`/indexing
-  denied by lint in library code. An input that once crashed a fuzzer is renamed after the bug
-  and kept as a regression test, not left in a gitignored artifacts directory.
-- Every MMS, report and control encoder is required to be a **fixed point** — the only
-  automatic check on a format with no tags to catch a field read at the wrong offset. Every
-  feature builds and tests **on its own** in CI, and so does none of them.
-- **A negative is pinned too**: the reference capture's 115 information reports are ICCP
-  data-set reports, *not* IEC 61850 reports, and the client's classifier has to say so rather
-  than inventing a report identifier out of the first value.
+  denied by lint in library code. Every fuzzer crash is kept as a named regression test.
 - **Real corpora, not fixtures**: every data-set member of OpenSCD's SCL files must resolve,
-  and the SCL-described channel layout must decode all 10,161 captured ASDUs exactly as the
-  hard-coded 9-2LE path does.
+  and the SCL-described channel layout must decode all 10,161 captured ASDUs.
 
 Details, and an honest list of what this does *not* prove, in
 [Verification](https://hupe1980.github.io/iec61850-rs/docs/verification/).
@@ -286,6 +269,12 @@ Details, and an honest list of what this does *not* prove, in
 
 ```bash
 cargo test --all-features                     # captures and tshark tests skip if absent
+
+# The interop oracle: libiec61850 in both roles. Skips unless it is built and pointed at.
+git clone --depth 1 https://github.com/mz-automation/libiec61850 /tmp/libiec61850
+make -C /tmp/libiec61850 -j examples
+IEC61850_LIBIEC61850=/tmp/libiec61850 cargo test --all-features --test interop
+
 SIM_SEED=42 cargo test --test simulation      # replay one simulation seed
 cargo +nightly fuzz run mms_association -- -max_total_time=60
 cargo test --test regressions                 # every input a fuzzer once crashed on

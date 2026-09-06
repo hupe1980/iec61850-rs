@@ -106,6 +106,29 @@ pub enum DecodeReason {
     NotProcessBusFrame,
 }
 
+/// The ISO 9506-2 name of a `DataAccessError` code ✅ (`mms.asn`).
+///
+/// A bare number is the most common thing a user of an IEC 61850 client is left holding, and
+/// `3` versus `10` is the difference between "you may not" and "it is not there" — two
+/// completely different next steps. Naming it costs a table.
+pub const fn data_access_reason(code: i64) -> Option<&'static str> {
+    Some(match code {
+        0 => "object-invalidated",
+        1 => "hardware-fault",
+        2 => "temporarily-unavailable",
+        3 => "object-access-denied",
+        4 => "object-undefined",
+        5 => "invalid-address",
+        6 => "type-unsupported",
+        7 => "type-inconsistent",
+        8 => "object-attribute-inconsistent",
+        9 => "object-access-unsupported",
+        10 => "object-non-existent",
+        11 => "object-value-invalid",
+        _ => return None,
+    })
+}
+
 /// `Result` with the crate's [`Error`].
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -127,7 +150,10 @@ impl fmt::Display for Error {
             Error::Scl(msg) => write!(f, "SCL: {msg}"),
             Error::Io(msg) => write!(f, "transport: {msg}"),
             Error::Service { class, code } => write!(f, "MMS service error: class {class}, code {code}"),
-            Error::DataAccess(code) => write!(f, "MMS data access error {code}"),
+            Error::DataAccess(code) => match data_access_reason(*code) {
+                Some(name) => write!(f, "MMS data access error {code} ({name})"),
+                None => write!(f, "MMS data access error {code}"),
+            },
             Error::Rejected { invoke_id, reason_tag, code } => match invoke_id {
                 Some(id) => write!(f, "the peer rejected invoke {id}: reason {reason_tag}/{code}"),
                 None => write!(f, "the peer rejected the PDU: reason {reason_tag}/{code}"),

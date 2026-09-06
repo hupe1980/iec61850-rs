@@ -1,6 +1,6 @@
 +++
 title = "MMS"
-description = "The IEC 61850 station bus in Rust: the six OSI layers under MMS, the association state machine over them in both roles, and a blocking client that browses, reads, writes, receives decoded reports, operates controllable objects, pulls files, reads logs and edits setting groups."
+description = "The IEC 61850 station bus in Rust: the six OSI layers under MMS, the association state machine over them in both roles, and a blocking client that browses, reads, writes, receives decoded reports, operates controllable objects, pulls files, reads logs, edits setting groups and reconnects on a backoff you state."
 weight = 45
 
 [extra]
@@ -187,6 +187,7 @@ implementation — and blocking needs no runtime, no executor choice and no depe
 use iec61850_rs::{Fc, client::Client};
 
 let mut c = Client::connect("10.0.0.5:102")?;      // all six layers, one call
+println!("{:?}", c.status(false)?);                 // is it healthy? no model needed
 println!("{:?}", c.identify()?);
 
 for ld in c.server_directory()? {                   // GetServerDirectory
@@ -201,11 +202,11 @@ for ld in c.server_directory()? {                   // GetServerDirectory
 let w = c.read("IED1LD0/MMXU1.TotW.mag.f", Fc::MX)?;                 // one value
 let both = c.read_many(&[("IED1LD0/MMXU1.TotW.mag.f", Fc::MX),
                          ("IED1LD0/PTRC1.Tr.general", Fc::ST)])?;    // one round trip
-c.write("IED1LD0/GGIO1.SPCSO1.stVal", Fc::ST, &Value::Boolean(true))?;
+c.write("IED1LD0/CSWI1.Pos.ctlModel", Fc::CF, &Value::Integer(1))?;   // a setting, not a status
 c.release()?;
 ```
 
-Five things worth knowing:
+Six things worth knowing:
 
 - **`GetNameList` is paged.** A server answering `moreFollows` is asked again with
   `continueAfter`; ignoring the flag shows a fraction of a real IED's model.
@@ -219,6 +220,12 @@ Five things worth knowing:
 - **The server can tell you what a variable is.** `variable_type` is
   `GetVariableAccessAttributes`: one round trip that answers with the recursive shape, so a
   caller does not have to guess a structure's component order from memory.
+- **A `Write` is not a way to set a status.** IEC 61850-7-2 §5.7 makes `ST` and `MX` read-only
+  over ACSI: they are what the *process* reports. A conforming server answers
+  `object-access-denied`, and this crate's does — a breaker changes position through the
+  control model (`Oper`), not through a write. Settings (`SP`, `SE`), configuration (`CF`),
+  substitutions (`SV`), descriptions (`DC`), blocking (`BL`) and the control blocks are the
+  writable ones.
 
 ```rust
 let oper = c.variable_type("IED1LD0/CSWI1.Pos.Oper", Fc::CO)?;
@@ -229,6 +236,24 @@ assert_eq!(oper.component_names(), ["ctlVal", "origin", "ctlNum", "T", "Test", "
 c.create_data_set("IED1LD0/LLN0$dsTemp", &[("IED1LD0/PTRC1.Tr.general", Fc::ST)])?;
 c.delete_data_set("IED1LD0/LLN0$dsTemp")?;
 ```
+
+## Is it there?
+
+`Status` names nothing — no logical device, no data set, no attribute — which is what makes it
+useful: an answer proves all six layers are alive, and a TCP connection that has lost its peer
+looks open until something is written to it.
+
+```rust
+let s = c.status(false)?;                   // `true` asks the server to re-derive, not cache
+println!("healthy: {}", s.is_healthy());    // state-changes-allowed + operational
+
+for capability in c.capabilities()? {       // free-form strings; the vendor decides
+    println!("{capability}");
+}
+```
+
+`Client::is_alive` is that round trip, so a supervision loop can call it between reports without
+knowing anything about the device.
 
 ## Reports
 
@@ -247,6 +272,13 @@ RptID, OptFlds, [SqNum], [TimeOfEntry], [DatSet], [BufOvfl], [EntryID], [ConfRev
 Nothing on the wire separates the three sections — no tags, no lengths, no names. A decoder
 that has not read `OptFlds` cannot tell a timestamp from a breaker position, which is why the
 flags are a type here and not a hint.
+
+**A member is a member.** The inclusion bit string is as long as the data set's *member* list —
+the list `data_set_members` returns — and a member that names a data object (`CSWI1$ST$Pos`,
+with no attribute after it) is **one** bit and **one** value, carried as the structure it is.
+It is not three bits for `stVal`, `q` and `t`; a client that indexed the bit string against the
+directory would then read every value at the wrong place, and nothing on the wire says which of
+the two readings was meant.
 
 ```rust
 use iec61850_rs::client::{RcbSettings, TrgOps};
@@ -277,11 +309,11 @@ Field order is IEC 61850-8-1 **Table 40**, the flag numbering **Table 38**.
 
 ### Segments are joined before you see a report
 
-A report larger than the negotiated MMS PDU is split. Each segment carries the same `RptID`
-and `SqNum`, its own `SubSeqNum`, and an inclusion bit string naming only the members *that
-segment* carries — and nothing else distinguishes one from a whole report. A client that
-ignores segmentation therefore sees two reports with a hole in each, and no sign that either
-is half of something.
+A report larger than the negotiated MMS PDU is split, by this crate's server as well as by
+anyone else's. Each segment carries the same `RptID` and `SqNum`, its own `SubSeqNum`, and an
+inclusion bit string naming only the members *that segment* carries — and nothing else
+distinguishes one from a whole report. A client that ignores segmentation therefore sees two
+reports with a hole in each, and no sign that either is half of something.
 
 `next_report` returns whole reports only. Behind it a `ReportAssembler` keys segments on
 `(RptID, SqNum)`, ORs the inclusion bit strings and concatenates the entries in index order.
@@ -290,6 +322,66 @@ abandons the run** instead of guessing past the gap, because a report that decod
 member's value at another member's index is worse than no report at all; and the assembler is
 **bounded**, so a server that starts segmented reports and never finishes them cannot grow a
 client's memory. `Client::report_assembler_stats` counts both.
+
+If you write a decoder of your own: segments set the `segmentation` bit in the `OptFlds` they
+publish, whatever the control block is configured with, because that flag is the only thing
+saying the two values after `ConfRev` are a segment number and a "more follows" flag rather than
+the inclusion bit string. The bit belongs to the report, not to the configuration.
+
+### When the link drops
+
+```rust
+use iec61850_rs::client::Backoff;
+
+if !c.is_alive() {                          // one `Status` round trip, all six layers
+    c.reconnect(&Backoff::default())?;      // 500 ms doubling to 30 s, for ever
+    // Nothing is restored behind your back: the control block, the selection and the file
+    // handle belonged to the association that ended. Re-enable what you had — and for a
+    // buffered block, say where you got to and the server replays the rest.
+    c.enable_rcb("IED1LD0/LLN0$BR$brcb01", Fc::BR,
+                 &RcbSettings::new().with_useful_fields().resume_after(last_entry_id))?;
+}
+```
+
+## Arrays
+
+An array is the one place the MMS namespace **stops**. `MHAI1$MX$HA$phsAHar` is a named
+variable; its sixteen harmonics are not, because MMS gives an array's elements no names. So the
+IEC 61850 reference for the third one's magnitude —
+
+```rust
+let f = c.read("IED1LD0/MHAI1.HA.phsAHar(2).cVal.mag.f", Fc::MX)?;
+```
+
+— is that one name plus a *selection* carried beside it as an ISO 9506 `alternateAccess`. The
+client builds it from the reference, so there is nothing extra to call: an index in parentheses
+works at any depth.
+
+```rust
+let whole   = c.read("IED1LD0/MHAI1.HA.phsAHar",              Fc::MX)?; // all sixteen
+let element = c.read("IED1LD0/MHAI1.HA.phsAHar(2)",           Fc::MX)?; // one CMV
+let cval    = c.read("IED1LD0/MHAI1.HA.phsAHar(2).cVal",      Fc::MX)?; // one component of it
+```
+
+`GetVariableAccessAttributes` is where the length is published, so a client can ask how many
+elements there are before it indexes one:
+
+```rust
+use iec61850_rs::proto::mms::typespec::TypeSpec;
+
+let spec = c.variable_type("IED1LD0/MHAI1$MX$HA", Fc::MX)?;
+if let Some(TypeSpec::Array { elements, .. }) = spec.component("phsAHar") {
+    println!("{elements} harmonics");
+}
+```
+
+On the server side the array comes from the file — see
+[Server](@/docs/server.md#arrays).
+
+**A selection the server cannot serve is refused, not approximated:** an index past the end of
+an array, an index on something that is not one, or a selection naming a *range* or *all*
+elements. Answering any of them with the whole array would be a different answer to a different
+question, with nothing on the wire to say so.
 
 ## Controls
 
@@ -309,13 +401,21 @@ use iec61850_rs::client::{Check, ControlModel, OriginCategory};
 use iec61850_rs::proto::data::Dbpos;
 
 c.control("IED1LD0/CSWI1.Pos")
-    .model(c.read_control_model("IED1LD0/CSWI1.Pos")?)   // or take it from the SCD
     .origin(OriginCategory::StationControl, "hmi-1")
     .check(Check { synchro: true, interlock: true })
     .execute(&Value::dbpos(Dbpos::On))?;
 ```
 
-Two things about the wire are easy to get wrong.
+**The control model is not guessed.** A caller that does not say gets the server's own
+`CF$…$ctlModel`, read once before the first command — one round trip, and it is the only
+source that cannot be out of date. Say it with `.model(ControlModel::SboEnhanced)` when you
+already know (from the SCD, or from `read_control_model`) and the round trip goes away.
+
+Getting it wrong is the classic silent failure, and it does not look like one: an object
+engineered for select-before-operate answers an unselected `Oper` with
+`AddCause::ObjectNotSelected` and no state change, which reads exactly like a broken object.
+
+Two more things about the wire are easy to get wrong.
 
 `Check` is a **two-bit** bit string whose bit 0 is the synchrocheck and bit 1 the interlock
 check — the reverse of the order prose usually lists them in. Swapping them asks a substation
@@ -379,6 +479,14 @@ let next = c.query_log_after_entry("IED1LD0/LLN0$GeneralLog", &id, at)?;
 redundancy: an `EntryID` is not ordered across a server restart on its own, and the pair is
 what lets a reconnecting client pick up without a gap and without duplicates.
 
+Two places where the field is narrower than the ASN.1, and both are handled for you.
+`QueryLogByTime` has to carry **both** bounds — ISO 9506 makes the upper one optional and
+devices answer a half-open range with `invalid-argument` before they look at the log, so a
+`None` above is sent as the largest time the field can hold. And the buffer cursor has two
+spellings: IEC 61850-7-2 calls it `OldEnt`/`NewEnt`, libiec61850 publishes `OldEntr`/`NewEntr`,
+and `read_lcb` asks for both — otherwise `lcb.oldest()`, which is the resume point, is empty
+against half the devices in the field.
+
 ## Setting groups
 
 All six ACSI setting-group services are reads and writes of the `SGCB` under `SP`; there is no
@@ -429,7 +537,12 @@ match c.read("IED1LD0/MMXU1.TotW.mag.f", Fc::MX) {
 ```
 
 A reject **answers** the request it names, so it comes back at once rather than after the
-request timeout.
+request timeout. So does an MMS `Cancel`: `Association::cancel` asks the peer to withdraw a
+request that is still outstanding, a `cancel-Response` releases it because no answer is coming,
+and a `cancel-Error` leaves it standing. This server answers every incoming cancel with a
+`cancel-Error` — every service it offers is answered in the turn it arrives, so there is never
+anything left to withdraw — and it *does* answer, which is the whole point: a peer that gets
+neither a response nor an error waits out its full timeout for something that was never sent.
 
 ## How it is checked
 
@@ -440,7 +553,8 @@ everything on this page is the client half, and the **server** — the same asso
 other role, with the SCL file as its namespace — is [its own page](@/docs/server.md).
 [Verification](@/docs/verification.md) has the detail.
 
-## Not implemented yet
+## Not included
 
-Service tracking. `ObtainFile` and `SetFile`. Reconnection with backoff. TLS underneath
-(IEC 62351-3). The async adapter.
+`ObtainFile` and `SetFile`. Unsolicited `Status`. TLS underneath (IEC 62351-3). The async
+adapter. (Service tracking is a *server* feature and is on [its own page](@/docs/server.md#service-tracking);
+a client reads a tracking object like any other data object, or has one reported to it.)

@@ -1,0 +1,92 @@
+<?xml version="1.0"?>
+<!--
+  A file whose data sets are made of FCDs — members that name a data *object* rather than one
+  attribute, which is how most engineering tools write them and which the rest of the fixtures
+  happen not to use.
+
+  It is here because that is the shape of data set the report mapping is granular in: an FCD
+  member is one inclusion bit, one value and one ReasonCode (IEC 61850-8-1 §17.2.2), and a
+  server that reported its attributes one by one would hand a client an inclusion bit string
+  longer than the data-set directory the same server answers with.
+
+  `dsWide` exists for the other half: twelve FCDs of an eight-attribute type are far more than
+  a small negotiated PDU holds, which is the case a report has to be *segmented* for.
+-->
+<SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">
+  <Header id="fcd"/>
+  <IED name="IED1"><AccessPoint name="P1"><Server><LDevice inst="LD0">
+    <LN0 lnClass="LLN0" inst="" lnType="LLN0_T">
+      <DataSet name="dsPos">
+        <FCDA ldInst="LD0" lnClass="CSWI" lnInst="1" doName="Pos" fc="ST"/>
+        <FCDA ldInst="LD0" lnClass="PTRC" lnInst="1" doName="Tr" fc="ST"/>
+      </DataSet>
+      <DataSet name="dsWide">
+        <FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" doName="A1" fc="MX"/>
+        <FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" doName="A2" fc="MX"/>
+        <FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" doName="A3" fc="MX"/>
+        <FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" doName="A4" fc="MX"/>
+        <FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" doName="A5" fc="MX"/>
+        <FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" doName="A6" fc="MX"/>
+        <FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" doName="A7" fc="MX"/>
+        <FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" doName="A8" fc="MX"/>
+        <FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" doName="A9" fc="MX"/>
+        <FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" doName="A10" fc="MX"/>
+        <FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" doName="A11" fc="MX"/>
+        <FCDA ldInst="LD0" lnClass="MMXU" lnInst="1" doName="A12" fc="MX"/>
+      </DataSet>
+      <ReportControl name="urcb" datSet="dsPos" confRev="1" indexed="false" bufTime="0">
+        <TrgOps dchg="true" qchg="true" gi="true"/>
+        <OptFields seqNum="true" timeStamp="true" dataSet="true" reasonCode="true" configRef="true"/>
+      </ReportControl>
+      <ReportControl name="wide" datSet="dsWide" confRev="1" indexed="false" bufTime="0">
+        <TrgOps dchg="true" qchg="true" gi="true"/>
+        <OptFields seqNum="true" timeStamp="true" dataSet="true" reasonCode="true" configRef="true" dataRef="true"/>
+      </ReportControl>
+      <Log name="GeneralLog"/>
+      <LogControl name="lcb01" datSet="dsPos" logName="GeneralLog"><TrgOps dchg="true"/></LogControl>
+    </LN0>
+    <LN lnClass="PTRC" inst="1" prefix="" lnType="PTRC_T"/>
+    <LN lnClass="CSWI" inst="1" prefix="" lnType="CSWI_T"/>
+    <LN lnClass="MMXU" inst="1" prefix="" lnType="MMXU_T"/>
+  </LDevice></Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="Mod" type="INC_T"/></LNodeType>
+    <LNodeType id="PTRC_T" lnClass="PTRC"><DO name="Tr" type="ACT_T"/></LNodeType>
+    <LNodeType id="CSWI_T" lnClass="CSWI"><DO name="Pos" type="DPS_T"/></LNodeType>
+    <LNodeType id="MMXU_T" lnClass="MMXU">
+      <DO name="A1" type="WYE_T"/><DO name="A2" type="WYE_T"/><DO name="A3" type="WYE_T"/>
+      <DO name="A4" type="WYE_T"/><DO name="A5" type="WYE_T"/><DO name="A6" type="WYE_T"/>
+      <DO name="A7" type="WYE_T"/><DO name="A8" type="WYE_T"/><DO name="A9" type="WYE_T"/>
+      <DO name="A10" type="WYE_T"/><DO name="A11" type="WYE_T"/><DO name="A12" type="WYE_T"/>
+    </LNodeType>
+    <DOType id="INC_T" cdc="INC">
+      <DA name="stVal" fc="ST" bType="Enum" type="Mod_E"/>
+      <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+    </DOType>
+    <DOType id="ACT_T" cdc="ACT">
+      <DA name="general" fc="ST" bType="BOOLEAN"/>
+      <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+    </DOType>
+    <DOType id="DPS_T" cdc="DPS">
+      <DA name="stVal" fc="ST" bType="Dbpos"/>
+      <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+    </DOType>
+    <!-- Eight attributes per member, so twelve members are well past a 600-octet PDU. -->
+    <DOType id="WYE_T" cdc="WYE">
+      <DA name="phsA" fc="MX" bType="Struct" type="CMV_T"/>
+      <DA name="phsB" fc="MX" bType="Struct" type="CMV_T"/>
+      <DA name="phsC" fc="MX" bType="Struct" type="CMV_T"/>
+      <DA name="q" fc="MX" bType="Quality"/>
+      <DA name="t" fc="MX" bType="Timestamp"/>
+    </DOType>
+    <DAType id="CMV_T">
+      <BDA name="mag" bType="Struct" type="AnalogueValue_T"/>
+      <BDA name="ang" bType="Struct" type="AnalogueValue_T"/>
+    </DAType>
+    <DAType id="AnalogueValue_T"><BDA name="f" bType="FLOAT32"/></DAType>
+    <EnumType id="Mod_E"><EnumVal ord="1">on</EnumVal></EnumType>
+  </DataTypeTemplates>
+</SCL>

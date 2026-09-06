@@ -23,7 +23,9 @@
 //! same state machine; blocking needs no runtime and no dependency at all.
 //!
 //! One association per client. Reports and command terminations that arrive while a request is
-//! outstanding are kept, not dropped.
+//! outstanding are kept, not dropped. [`Client::is_alive`] is a `Status` round trip and
+//! [`Client::reconnect`] opens a new association on a [`Backoff`] the caller states, restoring
+//! nothing the old one held.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -53,9 +55,70 @@ use crate::proto::data::{DataView, Typed, Value};
 use crate::proto::mms::association::{Association, AssociationConfig, AssociationEvent, CloseReason, PORT};
 use crate::proto::mms::control::ControlRequest;
 use crate::proto::mms::{
-    AccessResult, ConfirmedRequest, ConfirmedResponse, Mms, ObjectName, ObjectScope, ServiceError, Unconfirmed, VariableAccess, VariableSpecification,
-    delete_scope, object_class,
+    AccessResult, AlternateAccess, ConfirmedRequest, ConfirmedResponse, Mms, ObjectName, ObjectScope, ServiceError, Unconfirmed, VariableAccess,
+    VariableSpecification, delete_scope, object_class,
 };
+
+/// How long to wait between reconnection attempts, and how many to make.
+///
+/// A substation link drops for reasons that clear on their own — a switch reboot, a
+/// redundancy switchover, a maintenance window — and a client that gives up on the first
+/// refusal needs a human. One that retries without waiting turns a busy server into a
+/// refused-connection storm, which is why the delay grows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Backoff {
+    /// Wait before the first retry.
+    pub first: Duration,
+    /// The longest wait, whatever the factor would make it.
+    pub max: Duration,
+    /// What the wait is multiplied by after each failure.
+    pub factor: u32,
+    /// How many attempts to make in total; `0` means keep trying.
+    pub attempts: usize,
+}
+
+impl Default for Backoff {
+    /// 500 ms doubling to 30 s, for ever — the shape a SCADA gateway wants, because a link
+    /// that has been down for an hour is still a link worth trying.
+    fn default() -> Backoff {
+        Backoff { first: Duration::from_millis(500), max: Duration::from_secs(30), factor: 2, attempts: 0 }
+    }
+}
+
+impl Backoff {
+    /// A policy that gives up after `attempts` tries.
+    #[must_use]
+    pub const fn bounded(mut self, attempts: usize) -> Backoff {
+        self.attempts = attempts;
+        self
+    }
+
+    /// The wait before attempt `n` (zero-based), saturating at [`Backoff::max`].
+    pub fn delay(&self, n: u32) -> Duration {
+        let scale = u64::from(self.factor.max(1)).checked_pow(n).unwrap_or(u64::MAX);
+        Duration::from_nanos(u64::try_from(self.first.as_nanos()).unwrap_or(u64::MAX).saturating_mul(scale)).min(self.max)
+    }
+}
+
+/// What a server says about its own health (`Status`).
+///
+/// The two numbers are ISO 9506's, not IEC 61850's — see
+/// [`vmd_logical`](crate::proto::mms::vmd_logical) and
+/// [`vmd_physical`](crate::proto::mms::vmd_physical) for what each value means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServerStatus {
+    /// `vmdLogicalStatus` — whether the server will accept requests that change its state.
+    pub logical: i64,
+    /// `vmdPhysicalStatus` — whether the device behind it is working.
+    pub physical: i64,
+}
+
+impl ServerStatus {
+    /// True when the server is operational and taking state changes.
+    pub const fn is_healthy(self) -> bool {
+        self.logical == crate::proto::mms::vmd_logical::STATE_CHANGES_ALLOWED && self.physical == crate::proto::mms::vmd_physical::OPERATIONAL
+    }
+}
 
 /// What a server says it is (`Identify`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,6 +275,10 @@ pub struct Client {
     /// How long a confirmed request may go unanswered, from the configuration this client
     /// was built with — not from the default, which is what a `&self` helper would have read.
     request_timeout: Duration,
+    /// Where this client dialled and with what, so it can dial again. `None` for a client
+    /// built from a socket somebody else opened ([`Client::from_stream`]) — there is nothing
+    /// to reconnect *to* when the transport was handed in.
+    origin: Option<(String, ClientConfig)>,
 }
 
 impl Client {
@@ -240,12 +307,73 @@ impl Client {
             epoch: StdInstant::now(),
             rx: alloc_buffer(),
             request_timeout: request_timeout(&cfg.association),
+            origin: Some((String::from(addr), cfg.clone())),
         };
         let now = c.now();
         c.assoc.start(now)?;
         c.flush()?;
         c.pump_while(|a| !a.is_established(), Duration::from_millis(cfg.association.connect_timeout_ms))?;
         Ok(c)
+    }
+
+    /// Connect, retrying on the given policy.
+    ///
+    /// The first attempt is immediate; each failure waits [`Backoff::delay`] and tries again.
+    /// The error returned is the **last** one, because that is the one that describes the
+    /// state the link is in now.
+    pub fn connect_retrying(addr: &str, cfg: &ClientConfig, backoff: &Backoff) -> Result<Client> {
+        let mut n = 0u32;
+        loop {
+            match Client::connect_with(addr, cfg) {
+                Ok(c) => return Ok(c),
+                Err(e) => {
+                    if backoff.attempts != 0 && usize::try_from(n).unwrap_or(usize::MAX).saturating_add(1) >= backoff.attempts {
+                        return Err(e);
+                    }
+                    std::thread::sleep(backoff.delay(n));
+                    n = n.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// Open the association again after it dropped, on the same address and configuration.
+    ///
+    /// What is **not** restored is deliberate: report control blocks, selections and file
+    /// handles all belong to the association that ended, and a client that silently
+    /// re-enabled them would be claiming a subscription the server does not know it has. A
+    /// buffered control block is the exception the standard already provides for — re-enable
+    /// it with the `EntryID` of the last report seen and the server replays what was missed
+    /// ([`Client::enable_rcb`] with [`RcbSettings::resume_after`]).
+    ///
+    /// Fails for a client built from a socket somebody else opened: there is nothing to dial.
+    pub fn reconnect(&mut self, backoff: &Backoff) -> Result<()> {
+        let (addr, cfg) = self.origin.clone().ok_or(Error::InvalidValue("this client was built from a socket, so it has nowhere to reconnect to"))?;
+        let fresh = Client::connect_retrying(&addr, &cfg, backoff)?;
+        // Everything that described the old association goes with it; the queues are the
+        // point — an unsolicited report from a dead association is not news about the new one.
+        self.stream = fresh.stream;
+        self.assoc = fresh.assoc;
+        self.limits = fresh.limits;
+        self.request_timeout = fresh.request_timeout;
+        // The new association's deadlines were set against the new client's origin, so the
+        // origin has to come with it. Keeping the old one would put every timer this
+        // handshake set in the past.
+        self.epoch = fresh.epoch;
+        self.unsolicited.clear();
+        self.assembler = ReportAssembler::new(8);
+        self.ctl_num = 0;
+        Ok(())
+    }
+
+    /// Whether the association is still answering, by the cheapest question there is.
+    ///
+    /// A TCP connection that has lost its peer looks open until something is written to it,
+    /// so "is the socket up" is not the same question as "is the server there". A `Status`
+    /// round trip is: it needs no name, no model and no data set, and it exercises all six
+    /// layers. This is what a supervision loop calls between reports.
+    pub fn is_alive(&mut self) -> bool {
+        self.assoc.is_established() && self.status(false).is_ok()
     }
 
     /// Take a connected socket that is already carrying MMS — a TLS stream's plaintext side,
@@ -264,6 +392,8 @@ impl Client {
             epoch: StdInstant::now(),
             rx: alloc_buffer(),
             request_timeout: request_timeout(&cfg.association),
+            // A socket somebody else opened cannot be opened again by this client.
+            origin: None,
         };
         let now = c.now();
         c.assoc.start(now)?;
@@ -297,7 +427,11 @@ impl Client {
     /// guess, and the answer can be cached for the life of the association.
     pub fn read_control_model(&mut self, reference: &str) -> Result<ControlModel> {
         let parsed = ObjectReference::parse(reference)?;
-        let (domain, item) = parsed.to_mms(Fc::CF);
+        // `to_mms_under`, not `to_mms`: the caller usually holds the object as
+        // `LN$CO$DO` — the controllable object — and `ctlModel` lives under `CF`. Keeping
+        // the reference's own constraint asks for a `CO$…$ctlModel` no server has, and the
+        // read fails silently into "assume direct control".
+        let (domain, item) = parsed.to_mms_under(Fc::CF);
         let full = format!("{domain}/{item}$ctlModel");
         let v = self.read(&full, Fc::CF)?;
         let code = v.as_i64().or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok())).ok_or(Error::InvalidValue("ctlModel is not an integer"))?;
@@ -322,6 +456,47 @@ impl Client {
                 Ok(Identity { vendor: String::from(vendor), model: String::from(model), revision: String::from(revision) })
             }
             _ => Err(Error::InvalidValue("not an Identify response")),
+        }
+    }
+
+    /// `Status` — is the server healthy, and will it accept state changes?
+    ///
+    /// This is the cheapest question there is and the one a SCADA client asks first and last:
+    /// it needs no name, no model and no data set, so an answer proves the whole six-layer
+    /// association is alive. `extended_derivation` asks the server to re-derive its status
+    /// rather than report a cached one.
+    pub fn status(&mut self, extended_derivation: bool) -> Result<ServerStatus> {
+        let pdu = self.call(&ConfirmedRequest::Status { extended_derivation })?;
+        match Mms::parse(&pdu, &self.limits)? {
+            Mms::ConfirmedResponse { service: ConfirmedResponse::Status { logical, physical, .. }, .. } => Ok(ServerStatus { logical, physical }),
+            _ => Err(Error::InvalidValue("not a Status response")),
+        }
+    }
+
+    /// `GetCapabilityList` — the free-form strings the server says describe what it can do.
+    ///
+    /// Paged like every other list here: `moreFollows` is followed until the server stops.
+    pub fn capabilities(&mut self) -> Result<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        loop {
+            let after = out.last().cloned();
+            let pdu = self.call(&ConfirmedRequest::GetCapabilityList { continue_after: after.as_deref() })?;
+            let (page, more) = match Mms::parse(&pdu, &self.limits)? {
+                Mms::ConfirmedResponse { service: ConfirmedResponse::GetCapabilityList { capabilities, more_follows }, .. } => {
+                    (capabilities.iter().map(|c| String::from(*c)).collect::<Vec<_>>(), more_follows)
+                }
+                _ => return Err(Error::InvalidValue("not a GetCapabilityList response")),
+            };
+            let empty = page.is_empty();
+            out.extend(page);
+            // A server that says `moreFollows` and then sends nothing would loop for ever;
+            // an empty page ends the walk whatever the flag claims.
+            if !more || empty {
+                return Ok(out);
+            }
+            if out.len() > self.limits.max_dataset_members {
+                return Err(Error::LimitExceeded { limit: "max_dataset_members", value: out.len() });
+            }
         }
     }
 
@@ -356,10 +531,16 @@ impl Client {
         match Mms::parse(&pdu, &self.limits)? {
             Mms::ConfirmedResponse { service: ConfirmedResponse::GetNamedVariableListAttributes { variables, .. }, .. } => Ok(variables
                 .iter()
-                .filter_map(|v| match v {
-                    VariableSpecification::Name(ObjectName::DomainSpecific { domain, item }) => Some(format!("{domain}/{item}")),
-                    VariableSpecification::Name(ObjectName::VmdSpecific(n) | ObjectName::AaSpecific(n)) => Some(String::from(*n)),
-                    VariableSpecification::Other(_) => None,
+                // A member may name **one element** of an array, which SCL writes as
+                // `FCDA ix="7"` and ISO 9506 carries as an `alternateAccess`. The reference
+                // this returns carries it in IEC 61850's own syntax — `…$phsAHar(7)$cVal` —
+                // so a member that selects an element does not read as the whole array.
+                .filter_map(|v| {
+                    let selected = v.access().map(ToString::to_string).unwrap_or_default();
+                    match v.name()? {
+                        ObjectName::DomainSpecific { domain, item } => Some(format!("{domain}/{item}{selected}")),
+                        ObjectName::VmdSpecific(n) | ObjectName::AaSpecific(n) => Some(format!("{n}{selected}")),
+                    }
                 })
                 .collect()),
             _ => Err(Error::InvalidValue("not a GetNamedVariableListAttributes response")),
@@ -371,23 +552,16 @@ impl Client {
     /// `reference` is either form — `IED1LD0/MMXU1.TotW.mag.f` with `fc`, or
     /// `IED1LD0/MMXU1$MX$TotW$mag$f`, which carries its own.
     pub fn read(&mut self, reference: &str, fc: Fc) -> Result<Value> {
-        let parsed = ObjectReference::parse(reference)?;
-        let (domain, item) = parsed.to_mms(fc);
-        let access = VariableAccess::ListOfVariable(vec![VariableSpecification::Name(ObjectName::DomainSpecific { domain, item: &item })]);
+        let addressed = Addressed::of(reference, fc)?;
+        let access = VariableAccess::ListOfVariable(vec![addressed.spec()]);
         let mut values = self.read_access(&access)?;
         if values.len() == 1 { Ok(values.remove(0)) } else { Err(Error::InvalidValue("server returned the wrong number of values")) }
     }
 
     /// Read several references in one `Read` — one round trip instead of *n*.
     pub fn read_many(&mut self, references: &[(&str, Fc)]) -> Result<Vec<Value>> {
-        let mut items = Vec::with_capacity(references.len());
-        for (reference, fc) in references {
-            let parsed = ObjectReference::parse(reference)?;
-            let (domain, item) = parsed.to_mms(*fc);
-            items.push((String::from(domain), item));
-        }
-        let access =
-            VariableAccess::ListOfVariable(items.iter().map(|(d, i)| VariableSpecification::Name(ObjectName::DomainSpecific { domain: d, item: i })).collect());
+        let items = Addressed::all(references)?;
+        let access = VariableAccess::ListOfVariable(items.iter().map(Addressed::spec).collect());
         self.read_access(&access)
     }
 
@@ -397,14 +571,8 @@ impl Client {
     /// reference does not spoil the rest — which is exactly what reading a control block
     /// needs, since Edition 1 servers have no `ResvTms` and no `Owner`.
     pub fn read_many_results(&mut self, references: &[(&str, Fc)]) -> Result<Vec<Result<Value>>> {
-        let mut items = Vec::with_capacity(references.len());
-        for (reference, fc) in references {
-            let parsed = ObjectReference::parse(reference)?;
-            let (domain, item) = parsed.to_mms(*fc);
-            items.push((String::from(domain), item));
-        }
-        let access =
-            VariableAccess::ListOfVariable(items.iter().map(|(d, i)| VariableSpecification::Name(ObjectName::DomainSpecific { domain: d, item: i })).collect());
+        let items = Addressed::all(references)?;
+        let access = VariableAccess::ListOfVariable(items.iter().map(Addressed::spec).collect());
         self.read_access_results(&access)
     }
 
@@ -415,11 +583,10 @@ impl Client {
 
     /// Write one data attribute.
     pub fn write(&mut self, reference: &str, fc: Fc, value: &Value) -> Result<()> {
-        let parsed = ObjectReference::parse(reference)?;
-        let (domain, item) = parsed.to_mms(fc);
+        let addressed = Addressed::of(reference, fc)?;
         let encoded = Value::encode_all(std::slice::from_ref(value))?;
         let element = crate::ber::Cursor::new(&encoded).next_required()?;
-        let access = VariableAccess::ListOfVariable(vec![VariableSpecification::Name(ObjectName::DomainSpecific { domain, item: &item })]);
+        let access = VariableAccess::ListOfVariable(vec![addressed.spec()]);
         let pdu = self.call(&ConfirmedRequest::Write { access, values: vec![element] })?;
         match Mms::parse(&pdu, &self.limits)? {
             Mms::ConfirmedResponse { service: ConfirmedResponse::Write(results), .. } => match results.first() {
@@ -614,17 +781,21 @@ impl Client {
     }
 
     /// Write several references in one `Write`, keeping the per-value failures.
+    ///
+    /// Every reference must be in **MMS form** and carry its own functional constraint. The
+    /// callers are the control-block and setting-group helpers, which build the names
+    /// themselves, so there is no caller-supplied `fc` to fall back on — and a default would
+    /// be silently wrong now that the constraint decides whether a write is allowed at all:
+    /// a dotted reference defaulted to `ST` is a write a conforming server refuses.
     pub(crate) fn write_many(&mut self, writes: &[(String, Value)]) -> Result<Vec<Result<()>>> {
         let mut encoded = Vec::with_capacity(writes.len());
         let mut items = Vec::with_capacity(writes.len());
         for (reference, value) in writes {
-            let parsed = ObjectReference::parse(reference)?;
-            let (domain, item) = parsed.to_mms(Fc::ST);
-            items.push((String::from(domain), item));
+            let fc = ObjectReference::parse(reference)?.fc.ok_or(Error::InvalidReference("a write needs a functional constraint"))?;
+            items.push(Addressed::of(reference, fc)?);
             encoded.push(Value::encode_all(core::slice::from_ref(value))?);
         }
-        let access =
-            VariableAccess::ListOfVariable(items.iter().map(|(d, i)| VariableSpecification::Name(ObjectName::DomainSpecific { domain: d, item: i })).collect());
+        let access = VariableAccess::ListOfVariable(items.iter().map(Addressed::spec).collect());
         let mut elements = Vec::with_capacity(encoded.len());
         for bytes in &encoded {
             elements.push(crate::ber::Cursor::new(bytes).next_required()?);
@@ -696,7 +867,17 @@ impl Client {
                 // One that names no request cannot be attributed, but it is still the peer
                 // telling us it could not read what we sent — and it will not answer.
                 AssociationEvent::Rejected { invoke_id: None, reject } => return Err(rejected(&reject)),
+                // The peer withdrew the request this call is waiting on. Nothing else is
+                // coming, so failing now beats waiting out the request timeout — the reject
+                // rule (D35) applied to the other PDU that ends a call without answering it.
+                AssociationEvent::Cancelled { invoke_id: id } if id == invoke_id => {
+                    return Err(Error::Io(String::from("the peer cancelled the request")));
+                }
                 AssociationEvent::Unconfirmed { pdu } => self.keep_unsolicited(&pdu),
+                // An answer that did not decode is still the end of this call. Failing with
+                // the decode error names what actually happened; waiting for the request
+                // timeout reports "the server did not reply" about a server that did.
+                AssociationEvent::Malformed { invoke_id: Some(id), error } if id == invoke_id => return Err(error),
                 AssociationEvent::Refused { layer, code } => {
                     return Err(Error::Io(format!("association refused at {layer}: {code:?}")));
                 }
@@ -708,7 +889,12 @@ impl Client {
                 | AssociationEvent::Timeout { .. }
                 | AssociationEvent::Rejected { .. }
                 | AssociationEvent::Request { .. }
-                | AssociationEvent::Malformed(_)
+                | AssociationEvent::Malformed { .. }
+                // A blocking client cancels nothing — every call here is answered before the
+                // caller gets control back — so a cancel either way concerns a request no
+                // call is waiting on. The association has already released or kept the slot.
+                | AssociationEvent::Cancelled { .. }
+                | AssociationEvent::CancelRefused { .. }
                 | AssociationEvent::Established(_) => {}
             }
         }
@@ -763,7 +949,12 @@ impl Client {
                 | AssociationEvent::Response { .. }
                 | AssociationEvent::Timeout { .. }
                 | AssociationEvent::Request { .. }
-                | AssociationEvent::Malformed(_)
+                | AssociationEvent::Malformed { .. }
+                // A blocking client cancels nothing — every call here is answered before the
+                // caller gets control back — so a cancel either way concerns a request no
+                // call is waiting on. The association has already released or kept the slot.
+                | AssociationEvent::Cancelled { .. }
+                | AssociationEvent::CancelRefused { .. }
                 | AssociationEvent::Established(_) => {}
             }
         }
@@ -835,11 +1026,36 @@ fn object_name(name: &ObjectName<'_>) -> String {
     }
 }
 
-fn specification_name(spec: &VariableSpecification<'_>) -> String {
-    match spec {
-        VariableSpecification::Name(n) => object_name(n),
-        VariableSpecification::Other(_) => String::new(),
+/// One reference, resolved into what a `Read` or a `Write` has to carry for it.
+///
+/// A reference is a name and, sometimes, a part of it: `MHAI1.HA.phsAHar(2).cVal.mag.f` names
+/// the variable `MHAI1$MX$HA$phsAHar` and selects one element and three components inside it.
+/// Every service that takes references goes through here, so a caller cannot ask for an array
+/// element in one place and read the whole array in another.
+struct Addressed<'r> {
+    domain: String,
+    item: String,
+    access: AlternateAccess<'r>,
+}
+
+impl<'r> Addressed<'r> {
+    fn of(reference: &'r str, fc: Fc) -> Result<Addressed<'r>> {
+        let parsed = ObjectReference::parse(reference)?;
+        let (domain, item) = parsed.to_mms(fc);
+        Ok(Addressed { domain: String::from(domain), item, access: AlternateAccess::new(parsed.selection()) })
     }
+
+    fn all(references: &[(&'r str, Fc)]) -> Result<Vec<Addressed<'r>>> {
+        references.iter().map(|(reference, fc)| Addressed::of(reference, *fc)).collect()
+    }
+
+    fn spec(&self) -> VariableSpecification<'_> {
+        VariableSpecification::of(ObjectName::DomainSpecific { domain: &self.domain, item: &self.item }, self.access.clone())
+    }
+}
+
+fn specification_name(spec: &VariableSpecification<'_>) -> String {
+    spec.name().map(object_name).unwrap_or_default()
 }
 
 /// Recognise a `CommandTermination` (IEC 61850-8-1 §20.9).

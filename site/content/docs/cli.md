@@ -188,6 +188,18 @@ $ ied sim valid2003.scd
 IED1 on 127.0.0.1:102 — Edition 1 — logical device(s) IED1CircuitBreaker_CB1, IED1Disconnectors
 ```
 
+A file that engineers **service tracking** says so in the banner, because otherwise those
+objects are four more names in a browse:
+
+```bash
+$ ied sim tracking.icd
+IED1 on 127.0.0.1:102 — Edition 2.1 — logical device(s) IED1LD0
+  service tracking: IED1LD0/LLN0$SR$GenTrk, IED1LD0/LLN0$SR$UrcbTrk, IED1LD0/LLN0$SR$BrcbTrk,
+                    IED1LD0/LLN0$SR$SgcbTrk, IED1LD0/LLN0$SR$SpcTrk, IED1LD0/LLN0$SR$CtlTrk,
+                    IED1LD0/LLN0$SR$LocbTrk, IED1LD0/LLN0$SR$LogTrk
+serving; ^C to stop
+```
+
 It is a real server: browse it, enable a report control block on it, operate its breaker,
 activate a setting group. That is also how the `ied mms` subcommands are tested in CI — one
 binary talking to itself over a real association, with no device and no network interface.
@@ -195,7 +207,7 @@ binary talking to itself over a real association, with no device and no network 
 ```bash
 $ ied sim relay.icd --port 10102 &
 $ ied mms browse 127.0.0.1:10102
-$ ied mms control 127.0.0.1:10102 IED1LD0/CSWI1.Pos true --model direct
+$ ied mms control 127.0.0.1:10102 IED1LD0/CSWI1.Pos true
 ```
 
 ## Talk to a live server
@@ -204,6 +216,13 @@ The `mms` client subcommands open a real association — all six OSI layers, the
 and the MMS `Initiate` — and then ask it something.
 
 ```bash
+$ ied mms status 10.0.0.5
+logical   state-changes-allowed (0)
+physical  operational (0)
+healthy   true
+capabilities
+  IEC 61850-8-1:2011+AMD1:2020
+
 $ ied mms identify 10.0.0.5
 vendor    AREVA T&D Corporation
 model     e-terracomm
@@ -223,8 +242,11 @@ IED1LD0
 $ ied mms read 10.0.0.5 IED1LD0/MMXU1.TotW.mag.f --fc MX
 IED1LD0/MMXU1.TotW.mag.f = 1234.5
 
-$ ied mms write 10.0.0.5 IED1LD0/GGIO1.SPCSO1.stVal true --type bool
-IED1LD0/GGIO1.SPCSO1.stVal <- true
+$ ied mms read 10.0.0.5 'IED1LD0/MHAI1.HA.phsAHar(2).cVal.mag.f' --fc MX   # one array element
+IED1LD0/MHAI1.HA.phsAHar(2).cVal.mag.f = 12.5
+
+$ ied mms write 10.0.0.5 IED1LD0/PTOC1.StrVal.setMag.f 1.20 --type float --fc SP
+IED1LD0/PTOC1.StrVal.setMag.f <- 1.2
 
 $ ied mms rcb 10.0.0.5 IED1LD0/LLN0.urcb01
 IED1LD0/LLN0$RP$urcb01
@@ -233,7 +255,7 @@ IED1LD0/LLN0$RP$urcb01
   RptEna     false
   DatSet     IED1LD0/LLN0$dsTrip
   ConfRev    3
-  OptFlds    SqNum, TimeOfEntry, DatSet, ReasonCode, ConfRev
+  OptFlds    SqNum, TimeOfEntry, ReasonCode, DatSet, ConfRev
   TrgOps     triggers: data change, quality change, GI
   BufTm      0 ms
   IntgPd     0 ms
@@ -244,13 +266,17 @@ $ ied mms report 10.0.0.5 --rcb IED1LD0/LLN0.urcb01 --gi --seconds 60
 enabled IED1LD0/LLN0$RP$urcb01 — data set IED1LD0/LLN0$dsTrip, triggers: data change, quality change, GI
 general interrogation requested
 listening for 60 s
-report 1 IED1LD0/LLN0$RP$urcb01 sq=1 t=2023-11-14T22:13:20.000Z dataSet=IED1LD0/LLN0$dsTrip confRev=3 — 2 of 2 members
+report 1 IED1LD0/LLN0$RP$urcb01 sq=0 t=2023-11-14T22:13:20.000Z dataSet=IED1LD0/LLN0$dsTrip confRev=3 — 2 of 2 members
     [0] = true  (general interrogation)
     [1] = Quality { validity: Good, .. }  (general interrogation)
 
-$ ied mms control 10.0.0.5 IED1LD0/CSWI1.Pos true --model sbo-enhanced --interlock
+$ ied mms control 10.0.0.5 IED1LD0/CSWI1.Pos true --interlock
 IED1LD0/CSWI1.Pos <- true (command termination + for IED1LD0/CSWI1$CO$Pos$Oper)
 ```
+
+The control model is **not** guessed: with neither `--model` nor `--scd`, the server's own
+`ctlModel` is read first, so a select-before-operate object gets its select. Give `--model` or
+`--scd` to save the round trip.
 
 ```bash
 $ ied mms type 10.0.0.5 IED1LD0/CSWI1.Pos.Oper --fc CO
@@ -280,7 +306,7 @@ IED1LD0/LLN0$LG$lcb01  enabled
   TrgOps  triggers: data change, quality change, GI
   oldest  2023-11-14T22:13:20.000Z
   newest  2023-11-14T22:14:20.000Z
-2023-11-14T22:13:20.000Z 0000000000000001
+2023-11-14T22:13:20.000Z 0000000000000001  ReasonCode(data_change)
     IED1LD0/PTRC1$ST$Tr$general = true
 2023-11-14T22:14:20.000Z 0000000000000002  power up
 2 entr(y|ies)
@@ -297,7 +323,8 @@ IED1LD0/LLN0$SP$SGCB
 `mms type` is `GetVariableAccessAttributes` — the shape a write has to match, read from the
 device rather than remembered. `mms get` writes to a file, or to standard output when no
 destination is given, and `--max-size` bounds what it will hold. `mms log` prints the entries
-oldest first and follows `moreFollows` to the end; `--lcb` also reads the log control block,
+oldest first and follows `moreFollows` to the end, with the **reason** each was made for beside
+its `EntryID` when the log control block records one; `--lcb` also reads the log control block,
 which is where a log's own start time comes from. `mms sg` prints the setting group control
 block, and `--activate`/`--edit` are the two things you do to one; with no reference it finds
 the `SGCB` in the server's first logical device.
@@ -324,7 +351,11 @@ $ ied mms browse - --scd bay.scd --ied IED1
 ```
 
 The host may omit the port; 102 is the default. A reference is either the dotted ACSI form
-with `--fc`, or the MMS `LN$FC$DO$DA` form, which carries its own. `--password` sends the
+with `--fc`, or the MMS `LN$FC$DO$DA` form, which carries its own. A read defaults to `ST`;
+`write` has no default and insists on `--fc`, because the constraint decides whether the write
+is allowed at all — `ST` and `MX` are what the process reports, and a conforming server refuses
+a client's write to them (IEC 61850-7-2 §5.7). Settings are `SP` or `SE`, configuration `CF`,
+descriptions `DC`, controls `CO`. `--password` sends the
 IEC 61850-8-1 ACSE password; `--local-tsel` and `--remote-tsel` set the OSI transport
 selectors when a device wants something other than `0001`.
 
@@ -354,12 +385,20 @@ $ ied scl show substation.scd IED1
 IED IED1 (ACME Relay, config 1.0)
   LD IED1LD0 (inst LD0)
     LN LLN0 [LLN0_T] 2 data objects
+      DO Mod [INC]
+      DO Beh [INS]
       DataSet dsTrip (2 members)
         IED1LD0/PTRC1$ST$Tr$general
         IED1LD0/PTRC1$ST$Tr$q
       GSEControl gcbTrip confRev=3 01-0C-CD-01-00-05 appid=0x0005 vlan=1
+      SampledValueControl msvMU multicast smvID=MU01 smpRate=80 nofASDU=1 01-0C-CD-04-00-01 appid=0x4000
       ReportControl brcb01 buffered=true confRev=2 bufTime=50ms
 ```
+
+The bracketed name beside each data object is its **common data class** — `DPC` is a
+controllable double point, `MV` a measurand, `BTS` a buffered-report *tracker*. It is the first
+thing anyone reading an unfamiliar file wants next to the name, and it is what the server uses
+to find the service-tracking objects.
 
 `scl validate` loads every IED and reports what the file gets wrong. Not what the XML schema
 already catches — what it happily accepts:
@@ -379,7 +418,11 @@ bay.scd: SCL 2007B4, 3 IED(s)
 | `AppidOutOfRange` / `MacOutOfRange` | Outside the range the protocol reserves |
 | `DuplicateStream` | Two control blocks on one (MAC, APPID): on the wire that is **one** stream, and every subscriber to either receives both |
 | `DuplicateAppid` | One APPID on two addresses — legal, and almost always a copy-and-paste (warning) |
-| `MissingDataSet` | A control block naming a data set that does not exist, or none at all |
+| `MissingDataSet` | A control block naming a data set that does not exist, or none at all — a report and log control block is checked as strictly as a publisher |
+| `MissingLog` | A `LogControl` whose `logName` names no `Log`: every entry it makes is dropped |
+| `ReportTriggers` | An `intgPd` with no integrity trigger, a trigger with no period, or no `TrgOps` at all (warning) |
+| `IndexedReportControl` | `RptEnabled max` above one on a block that is not `indexed`: there is one instance whatever the number says, so the file promises clients the device cannot serve (warning) |
+| `DuplicateTypeMember` | A type template declares a member name twice — two `DA`s in one `DOType`, two `DO`s in one `LNodeType`. The schema forbids it; the loader is a fast read path and does not check against the XSD, and a server would publish two variables of one name |
 | `UnresolvedFcda` | A data-set member that does not resolve against the IED's own types |
 | `ObjectReferenceTooLong` | Longer than the edition allows (`--edition 1` is stricter than `2.1`) |
 | `RetransmissionTimes` | `MinTime` at or above `MaxTime`, or absent (warning) |
@@ -415,6 +458,9 @@ IED2 subscribes to 1 GOOSE and 1 sampled-value stream(s)
   MU01 from IED1 (IED1LD0/LLN0.msvcb01)
     01-0C-CD-04-00-01 appid=0x4001 confRev=1 rate=4000/s 2 channels/8 octets per ASDU
     <- TCTR1.AmpSv.instMag.i
+supervision:
+  IED2LD0/LGOS1 (LGOS) -> IED1LD0/LLN0$GO$gcbTrip
+  IED2LD0/LSVS1 (LSVS) -> nothing engineered
 ```
 
 Each `Inputs/ExtRef` is resolved against the publisher's own control block and
@@ -426,6 +472,11 @@ publishes it. Bindings that resolve to nothing (a publisher the
 file does not hold, a control block with no address) are listed as `unresolved` and the
 command exits non-zero, because a dangling binding is a commissioning finding rather than a
 detail.
+
+The `supervision:` section is the other half of the same question: which `LGOS` or `LSVS`
+watches which control block, read from the file's `GoCBRef`/`SvCBRef`. A node that names
+nothing, or names a control block this IED does not subscribe to (`[not subscribed]`), sits at
+`St = false` for ever without saying why.
 
 Takes `--freq` for the same reason `mu` does: `smpRate` counts samples per cycle.
 
@@ -443,6 +494,6 @@ tshark -r /tmp/s.pcap -Y sv                          # and have Wireshark judge 
 This is what runs in CI on every push. If the encoder and the decoder ever disagree, or if
 Wireshark stops accepting what we emit, it fails there rather than in a substation.
 
-## Not implemented yet
+## Not included
 
 Live capture from an interface, and COMTRADE replay in `ied mu`.

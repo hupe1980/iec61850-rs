@@ -29,11 +29,11 @@ let w = c.read("IED1LD0/MMXU1.TotW.mag.f", Fc::MX)?;   // one round trip, typed 
 # structured data from this one source, so the two cannot drift apart.
 [[extra.faq]]
 q = "Is there an IEC 61850 library for Rust?"
-a = "This is one. It implements the process bus — GOOSE and Sampled Values — and the MMS station bus on both sides: the whole OSI stack, the association state machine over it, and above that a client and a server that browse, read, write, report, control, transfer files, read logs and edit setting groups. It is tested against real substation captures and against itself over a socket. It is pre-1.0 and has not been through a conformance laboratory. libiec61850 (C, GPLv3 or commercial) is the mature alternative if you need a certified stack today and its licence suits you."
+a = "This is one. It implements the process bus — GOOSE and Sampled Values — and the MMS station bus on both sides: the whole OSI stack, the association state machine over it, and above that a client and a server that browse, read, write, report, control, transfer files, read logs and edit setting groups. It is tested against real substation captures, against Wireshark, and against libiec61850's own client and server in CI. It is pre-1.0 and has not been through a conformance laboratory. libiec61850 (C, GPLv3 or commercial) is the mature alternative if you need a certified stack today and its licence suits you."
 
 [[extra.faq]]
 q = "Which parts of IEC 61850 does it cover?"
-a = "GOOSE (IEC 61850-8-1), Sampled Values (IEC 61850-9-2 with the 9-2LE guideline and IEC 61869-9), the MMS station bus with its whole OSI stack — TPKT, COTP, session, presentation, ACSE — and the ACSI services above it in both directions: browse, read, write, report control blocks, all four control models, file services, logs, setting groups and type discovery. SCL (IEC 61850-6) loads an IED model, resolves what an IED subscribes to, and configures the server. Edition 2.1 semantics throughout, including the Edition 2 simulation bit and the IEC 62351-6 replay-protection state machine."
+a = "GOOSE (IEC 61850-8-1), Sampled Values (IEC 61850-9-2 with the 9-2LE guideline and IEC 61869-9), the MMS station bus with its whole OSI stack — TPKT, COTP, session, presentation, ACSE — and the ACSI services above it in both directions: browse, read, write, report control blocks, all four control models, file services, logs, setting groups, LGOS/LSVS subscription supervision, IEC 61850-7-2 service tracking and type discovery. SCL (IEC 61850-6) loads an IED model, resolves what an IED subscribes to, and configures the server. Edition 2.1 semantics throughout, including the Edition 2 simulation bit and the IEC 62351-6 replay-protection state machine."
 
 [[extra.faq]]
 q = "Can I run an IEC 61850 server or IED simulator with it?"
@@ -69,10 +69,10 @@ OSI that IEC 61850-8-1 inherited whole.
 
 The mature implementations are C ([libiec61850][lib], GPLv3 or a commercial licence) and
 Java ([IEC61850bean][bean], MMS only). Both are good; neither is a permissively licensed,
-memory-safe core you can put in a merging unit, a WebAssembly analyser, or a bare-metal
-IED. libiec61850's own changelog is the argument: stack overflows, out-of-bounds reads and
-writes, double frees, integer overflows in the BER decoder — the class of defect a
-bounded, fuzzed, `unsafe`-free decoder does not have.
+memory-safe core you can put in a merging unit, a WebAssembly analyser or a bare-metal IED.
+Nor one without the memory-safety defect class — stack overflows, out-of-bounds accesses,
+double frees, integer overflows in a BER decoder — that a bounded, fuzzed, `unsafe`-free
+decoder cannot have.
 
 `iec61850-rs` is that core. `#![forbid(unsafe_code)]` across the library, a `no_std` build
 for microcontrollers, and MIT or Apache-2.0.
@@ -114,6 +114,13 @@ not prove either is right, and <a href="@/docs/verification.md">Verification</a>
 marker or an expert error fails the build — and so does a field that does not dissect back to
 the value we put in, which is the half that finds things. An implementation that only agrees
 with itself has proved nothing.</p>
+</div>
+<div class="card">
+<h3>And libiec61850 is the second opinion</h3>
+<p>A dissector says whether a PDU is well formed. Only a peer says whether it is the PDU that
+was expected, in the order it was expected. CI builds libiec61850 and runs its client against
+this server — browse, type discovery, all four control models, array elements, reporting — and
+this client against its server, logs included.</p>
 </div>
 <div class="card">
 <h3>Replay protection is not optional</h3>
@@ -172,8 +179,7 @@ let mu     = model.sv_publisher_config("IED1LD0/LLN0.msvcb01", src, 50)?;
 
 A sampled-value subscription carries the publisher's **channel layout** with it, so samples
 arrive decoded — for any engineered data set, not only 9-2LE's fixed four currents and four
-voltages. And because the server browses out of the same file, it cannot drift from its own
-SCD.
+voltages. The server browses out of the same file, so it cannot drift from its own SCD.
 
 </div>
 </section>
@@ -193,16 +199,14 @@ subscriber.on_timeout(now);
 let deadline = subscriber.next_timeout();
 ```
 
-That is what lets the same code run under a tokio task, on a bare-metal timer, or inside a
-deterministic simulation with no I/O at all. It is also why the GOOSE publisher can hand out
-a slice of a buffer it reuses, and why the sampled-value publisher can encode a frame **once**
-and then patch only the sample counter and the samples — 2400 frames a second with no
-encoding and no allocation in the steady state. The clock fields a merging unit advertises
-(<code>smpSynch</code>, <code>refrTm</code>, <code>gmIdentity</code>) are patched in place
-too, so following a PTP grandmaster costs one memcpy rather than a re-encode.
+The same code then runs under a tokio task, on a bare-metal timer, or inside a deterministic
+simulation with no I/O at all. It is also why the sampled-value publisher can encode a frame
+**once** and patch only the counter, the samples and the clock fields
+(<code>smpSynch</code>, <code>refrTm</code>, <code>gmIdentity</code>) — 2400 frames a second
+with no encoding and no allocation in the steady state.
 
 The station bus works the same way: the server's whole service layer is a function from a
-request to an answer, tested with no socket, no client and no byte on a wire.
+request to an answer, tested with no socket and no byte on a wire.
 
 </div>
 </section>
@@ -229,14 +233,13 @@ ied scl validate relay.icd                           # the engineering errors th
 ied scl subs bay.scd IED2                            # every ExtRef resolved to its publisher
 ```
 
-That choice is what makes the tool testable: `ied mu` generates a stream, `ied sv monitor`
-reads it back, `ied sim` serves a file and `ied mms browse` browses it — all in one CI job, on
-every push, with no device.
+That is what makes the tool testable: `ied mu` generates a stream, `ied sv monitor` reads it
+back, `ied sim` serves a file and `ied mms browse` browses it — all in one CI job, on every
+push, with no device.
 
-`goose sniff` and `sv monitor` are not second implementations of the protocol: they run the
-library's own subscriber state machines, so what the tool says about a frame is what a
-subscribing IED would decide about it — replays named where they happen, and the delta
-features an intrusion-detection system wants in the summary.
+`goose sniff` and `sv monitor` are not second implementations: they drive the library's own
+subscriber state machines, so what the tool says about a frame is what a subscribing IED would
+decide about it.
 
 </div>
 </section>
@@ -248,34 +251,32 @@ features an intrusion-detection system wants in the summary.
 
 <div class="grid">
 <div class="card">
-<h3>Built today</h3>
+<h3>Built</h3>
 <p><strong>Process bus.</strong> GOOSE and Sampled Values: codecs, publishers, subscribers,
 the 9-2LE and IEC 61869-9 profiles and any other engineered data set.</p>
 <p><strong>Station bus, both ends.</strong> All six OSI layers, the association for both
 roles, and above it a client and a server with no async runtime and no dependency: browse,
-read, write, reporting, all four control models, files, logs, setting groups, type discovery
-and data-set create/delete.</p>
+read, write, reporting with server-side segmentation, all four control models, files, logs,
+setting groups, type discovery, data-set create/delete and IEC 61850-7-2 service tracking — and
+a client that reconnects on a backoff you state.</p>
 <p><strong>Engineering.</strong> SCL loading from ICD, CID and SCD, subscription resolution,
 and the engineering checks the XML schema permits. A BER codec, the wire types, pcap, and the
 <code>ied</code> command line.</p>
 </div>
 <div class="card">
-<h3>Not built</h3>
-<p>Raw-socket adapters — the process bus encodes and decodes, but something else has to put
-the frames on the wire.</p>
-<p>TLS (IEC 62351-3) and the IEC 62351-6 authentication extension. Routable GOOSE/SV
-(IEC TR 61850-90-5). Service tracking. A durable log store. An async client.</p>
-</div>
-<div class="card">
-<h3>Not planned</h3>
-<p>The XMPP mapping of IEC 61850-8-2, Edition 1 GSSE, and a graphical SCL editor —
-<a href="https://github.com/openscd/open-scd">OpenSCD</a> already is one.</p>
+<h3>Not included</h3>
+<p>Raw-socket adapters: the process bus encodes and decodes, but something else puts the
+frames on the wire. TLS (IEC 62351-3) and the IEC 62351-6 authentication extension. Routable
+GOOSE/SV (IEC TR 61850-90-5). A durable <code>LogStore</code> backend. An async client.</p>
+<p>Out of scope entirely: the XMPP mapping of IEC 61850-8-2, Edition 1 GSSE, and a graphical
+SCL editor — <a href="https://github.com/openscd/open-scd">OpenSCD</a> already is one.</p>
 </div>
 </div>
 
-<p class="sub">Five runnable examples ship with the crate — a GOOSE publisher driving a
+<p class="sub">Six runnable examples ship with the crate — a GOOSE publisher driving a
 subscriber, a merging unit, an MMS client against an MMS server in one process, a server built
-from an SCL file, and an SCD as the configuration. Each needs no device and no network.</p>
+from an SCL file, an SCD as the configuration, and a subscription supervised by an
+<code>LGOS</code>. Each needs no device and no network.</p>
 
 <p class="sub">The API is pre-1.0 and will change. Nothing here has been through a
 conformance laboratory; see <a href="@/docs/verification.md">Verification</a> for exactly

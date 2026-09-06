@@ -1,6 +1,6 @@
 +++
 title = "Verification"
-description = "What is proven about iec61850-rs: vendor captures re-encoded byte for byte, Wireshark as an external oracle, adversarial simulation — and what is not proven."
+description = "What is proven about iec61850-rs: vendor captures re-encoded byte for byte, Wireshark and libiec61850 as external oracles, adversarial simulation — and what is not proven."
 weight = 70
 +++
 
@@ -12,9 +12,14 @@ Three kinds of evidence count here, in descending order:
 1. **A verdict from a tool this project did not write.** Wireshark's dissectors; one day, a
    laboratory's test set.
 2. **Agreement with an implementation that does not share our method.** A vendor IED's own
-   frames, captured off a real bus.
+   frames, captured off a real bus; libiec61850's client and server, driven against this
+   stack in CI.
 3. **Our own tests.** Useful, but a suite that only compares this crate with itself proves
    consistency, not correctness.
+
+The first two do not overlap, and the gap between them is where most of the defects found so
+far have lived. A dissector says whether a PDU is **well-formed**. Only a peer says whether it
+is the PDU that was expected, with the arguments and in the order that were expected.
 
 ## Vendor captures, re-encoded exactly
 
@@ -94,7 +99,7 @@ Be clear about what that is worth. It proves the two halves agree about the **ma
 the names the server publishes are the names the client builds, that `OptFlds` means the same
 thing on both sides, that an `AddCause` survives the round trip. It does **not** prove either
 half is right: two implementations by one author sharing one codec agree by construction. Only
-interop against another stack, or a conformance laboratory, moves that. What it does buy is
+the interop section below, or a conformance laboratory, moves that. What it does buy is
 that a change to either half which breaks the other fails immediately — which is what makes the
 mapping safe to refactor.
 
@@ -105,8 +110,37 @@ The build fails on any malformed marker or expert error, and the decoded field v
 the ones we put in.
 
 That includes checks we did not write: Wireshark flags a frame whose header simulation bit
-disagrees with the PDU's own field, and it knows the GOOSE and Sampled Values ASN.1 modules
-independently of us.
+disagrees with the PDU's own field, and it knows the GOOSE, Sampled Values, ACSE and MMS
+ASN.1 modules independently of us.
+
+### The station bus, too
+
+Client against server is a strong test of *sequencing* and no test at all of *encoding*,
+because both ends share one codec. So the station bus has an oracle of its own.
+
+A recording proxy sits in front of a real server; a real client runs one association through
+every service the server answers — associate, browse,
+read, write, type discovery, data-set create and delete, a report control block with a report
+and a general interrogation, a control, a log control block and a log query, setting groups,
+files, release — and the byte stream is written out as a TCP capture and handed to `tshark`.
+The whole stack has to be there (`tpkt`, `cotp`, `ses`, `pres`, `acse`, `mms`) or the
+dissector never reached MMS, and the assertions are Wireshark's own field names — so
+"it dissects" cannot quietly mean "it dissects as something else".
+
+It found three malformed PDUs, all invisible for the same reason: the only decoder that had
+ever read them was ours.
+
+| What | Why it was wrong |
+|---|---|
+| `AARE` had no `result-source-diagnostic` | The field is **mandatory** beside `result`, so every association this server accepted was answered with a malformed ACSE PDU |
+| `JournalEntry` had no `originatingApplication` | Also mandatory; every log entry the server sent was malformed |
+| `FileDirectory`'s `listOfDirectoryEntry` was implicitly tagged | It is the one field of the file services that is not, so the entries belong inside an inner `SEQUENCE`. Our encoder and our decoder agreed perfectly and no third party could read either |
+
+It is now where a new encoding goes *first*. A second oracle test runs a deliberately small
+client — a 900-octet PDU — against a twelve-member data set, so the server has to split its
+report into segments, and every member of that data set is a data *object* rather than one
+attribute, so each is carried as the structure it is. Both shapes would otherwise be read only
+by this crate's own client, which is the case the whole page exists to distrust.
 
 **"No malformed marker" is the weak half of the rule.** The strong half is that every field
 dissects back to the value we put in. A sampled-value publisher writes `smpCnt`, `confRev` and
@@ -129,6 +163,41 @@ The tests skip on a `tshark` older than that rather than believe it, and CI sets
 can quietly stop running is not one.
 
 [wireshark#19580]: https://gitlab.com/wireshark/wireshark/-/issues/19580
+
+## libiec61850, in both roles
+
+A dissector reads octets. It does not know that a client is unhappy with the *order* a server
+answers in, that a service argument the ASN.1 permits is one no device accepts, or that a name
+is spelt differently in the field. For that there has to be a second stack, running in **both**
+directions.
+
+`tests/interop.rs` builds [libiec61850](https://github.com/mz-automation/libiec61850) (C,
+GPLv3/commercial) in a CI job and runs:
+
+| Direction | What runs | What it proves |
+|---|---|---|
+| their client → this server | `mms_utility` | `Identify`, `GetNameList` over the flattened sorted namespace, a structured `Read`, and the type discovery under it |
+| their client → this server | `client_example_control` | all four control models including both selects, and one `CommandTermination+` per enhanced-security command — checked against the switchgear having moved, not only against the printout |
+| their client → this server | `client_example1` | enable a report control block in one write, then a general interrogation and integrity reports, with the reason codes their decoder reads back |
+| this client → their server | `server_example_basic_io` | associate, `Status`, both directories, `Read`, `GetVariableAccessAttributes`, data sets, reporting, a control, orderly release |
+| this client → their server | `server_example_logging` | the log control block including its buffer cursor, and both log queries |
+| both directions | `mms_utility -y <index>` and their harmonics model | an **array element** read as one element and not as the whole array — at four depths, which is what puts both `alternateAccess` encodings on the wire |
+
+The models served are **libiec61850's own engineering files**, read out of its tree rather
+than copied here: they are under a different licence, and they are documents this project did
+not write. (Loading one of them found an error in it — a `LogControl` naming a `Log` the file
+does not declare — which is the same evidence running the other way.) The GPL binaries are
+executed as an external oracle and never linked.
+
+It has bite, and the shape of what it catches is the argument for it: a rule about the *peer*
+rather than about the octets. A type specification's `floating-point` was encoded with the
+wrong tags and dissected clean, because Wireshark's MMS module does not model that field at
+all. A request for one array element was answered with the whole array — successfully, with
+nothing on the wire to say the question had changed.
+
+`IEC61850_LIBIEC61850` points at a built checkout and the tests skip without it;
+`IEC61850_REQUIRE_INTEROP=1` turns that skip into a failure, which is what CI sets — the same
+rule the `tshark` gate follows, and for the same reason.
 
 ## Adversarial simulation
 
@@ -241,6 +310,13 @@ first; a real `DOType` puts it fourth. **One of seven `ExtRef`s in this corpus c
 `srcCBName`** — which is why subscription resolution has to follow the signal into the
 publisher's data sets rather than only read the finished binding.
 
+**A corpus is evidence only about the shapes it contains**, which is why the fixtures written
+here are checked against something that was not: the SCL schema, and Wireshark. A data set whose
+members are data *objects* rather than single attributes, a report too large for the negotiated
+PDU, a setting declared once and served under two functional constraints — each is a shape a
+suite written alongside the code will agree with itself about, and each is in the corpus for
+that reason.
+
 ## Panic-freedom by construction
 
 `#![forbid(unsafe_code)]` across the library, which cannot be opted out of anywhere inside
@@ -256,16 +332,20 @@ stream feeding an application that has stopped draining cannot exhaust memory.
 
 ## Other gates
 
-Every push runs: `clippy -D warnings`, `rustfmt`, rustdoc with warnings denied, a `no_std`
-build for `thumbv7em-none-eabihf`, a minimum-supported-Rust-version check, and a build of
-**every feature on its own** — `std`, `goose`, `sv`, `mms`, `scl`, `pcap` — and with none of
-them.
+Every push runs `clippy -D warnings`, `rustfmt`, a `no_std` build for
+`thumbv7em-none-eabihf`, a minimum-supported-Rust-version check, and a build and doctest of
+**every feature on its own** — `std`, `goose`, `sv`, `mms`, `scl`, `pcap`, `client`, `server`,
+`cli` — and with none of them.
 
 The per-feature build matters: a type in the wrong module compiles perfectly until the module
-it borrows from is switched off, and no full-feature CI run can notice. The no-feature build
-is in the matrix for the same reason, and it is what holds the crate to being `no_std` **+
-alloc** everywhere — there is no allocator-free configuration and no feature flag pretending
-otherwise.
+it borrows from is switched off, and no full-feature run can notice. The no-feature build is
+in the matrix for the same reason, and it is what holds the crate to being `no_std` **+
+alloc** everywhere.
+
+Documentation is built with `RUSTDOCFLAGS=-D warnings`, on the all-features build that
+docs.rs serves and a reader sees. Only there: a link from the crate root to a feature-gated
+module cannot resolve in a subset build, and deleting those links to make a subset green
+would trade real documentation for a green log.
 
 ## What this does **not** prove
 
@@ -274,13 +354,15 @@ procedures and UCA International Users Group accredited laboratories run them; t
 happened. A certificate says an independent party verified conformance, and this project
 cannot claim one.
 
-**No interoperability testing against another stack.** Nothing here has been run against
-libiec61850 or IEC61850bean, and that would be stronger evidence than any of the above: two
-implementations sharing a misconception is exactly what a self-check cannot rule out. The
-loopback test above is explicitly *not* that — a client and a server from the same source
-agreeing proves they are consistent, which is why the reference capture, `tshark` and the
-byte-identity assertions carry the correctness argument and the loopback carries the
-sequencing one.
+**Interoperability testing covers one stack, and only the station bus.** libiec61850 runs
+against both halves of this one in CI, which is the strongest evidence on this page — but it
+is *one* implementation with its own opinions, and agreeing with an opinion is not conformance.
+(One of those opinions is visible above: it spells a log control block's buffer cursor
+`OldEntr`/`NewEntr` where IEC 61850-7-2 spells it `OldEnt`/`NewEnt`. This client asks for both;
+this server publishes the standard's.) A second and third opinion — IEC61850bean in Java,
+csp0924's crates in Rust — are not wired up. Neither is the **process bus** half: libiec61850's
+GOOSE and SV publishers and subscribers need a raw-socket adapter this crate does not yet have,
+so everything on that bus is still capture files and a dissector.
 
 **Several rules are read from secondary sources.** The IEC standards are paywalled. Where a
 rule comes from a public preview, a Wireshark dissector, an open-source implementation or a

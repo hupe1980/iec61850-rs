@@ -31,7 +31,7 @@ These pages are the guide. The per-item API reference lives on
 
 | | |
 |---|---|
-| Protocols | GOOSE (IEC 61850-8-1), Sampled Values (IEC 61850-9-2, 9-2LE, IEC 61869-9), MMS with its OSI stack (TPKT, COTP, session, presentation, ACSE) and a **client and server** over it: browse, read, write, reporting, control, files, logs, setting groups |
+| Protocols | GOOSE (IEC 61850-8-1), Sampled Values (IEC 61850-9-2, 9-2LE, IEC 61869-9), MMS with its OSI stack (TPKT, COTP, session, presentation, ACSE) and a **client and server** over it: browse, read, write, reporting, control, files, logs, setting groups, LGOS/LSVS supervision |
 | Edition | 2.1 semantics, including the Edition 2 simulation bit |
 | Security | The IEC 62351-6 replay-protection state machine, always on |
 | Engineering | SCL (IEC 61850-6) schema versions 2003 through 2007B4, read-only: model loading, `Inputs/ExtRef` subscription resolution, and the engineering checks the schema does not make |
@@ -43,12 +43,15 @@ These pages are the guide. The per-item API reference lives on
 ## Status
 
 The process bus is built and tested. On the station bus **both halves** are: the association
-state machine over all six OSI layers, and above it a complete SCADA client — browse, read,
-write, report control blocks with decoded reports and reassembled segments, all four control
-models with `CommandTermination` and `AddCause`, file services, logs, setting groups, type
-discovery and data-set create/delete — and a complete server that does the other half of every
-one of those, straight from an SCL file (`ied sim relay.icd`). What is **not** implemented is
-service tracking, `ObtainFile`, TLS and the raw-socket adapters — so on the process bus the
-library still encodes and decodes what something else puts on the wire.
+state machine over all six OSI layers, and above it a SCADA client and a server that answers
+every service it asks for, straight from an SCL file (`ied sim relay.icd`).
+
+The station bus is checked against **libiec61850 in both roles** in CI — its client driving
+this server, and this client driving its server — which is the only oracle here that reads a
+*sequence* rather than octets.
+
+Not included: `ObtainFile`, TLS and the raw-socket adapters — so on the process bus the library
+encodes and decodes what something else puts on the wire, and the interop oracle stops at the
+station bus.
 [Verification](@/docs/verification.md) is explicit about the difference between what is tested
 and what is certified: nothing here has been through a conformance laboratory.

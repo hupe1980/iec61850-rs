@@ -28,7 +28,8 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant as StdInstant};
 
@@ -53,11 +54,28 @@ pub struct ServerConfig {
     /// How long a connection thread waits on the socket before it looks at its outbound
     /// queue. It bounds how late a report can be, not how fast a response is.
     pub poll_interval: Duration,
+    /// PDUs queued for one client before the server gives up on it.
+    ///
+    /// Reports and command terminations are produced by whichever thread committed the change
+    /// and drained by the connection thread, so a client that stops reading its socket makes
+    /// that queue grow — an unbounded one is a remote memory exhaustion with a protocol in
+    /// front of it, which is the defect the [`FileStore`](super::FileStore) trait was reshaped to
+    /// remove for one service at a time. When the queue fills, the **association is closed**: a buffered report control
+    /// block keeps its entries and the client resumes from its `EntryID` when it comes back,
+    /// which is precisely what `BR` is for, and dropping reports silently instead would leave
+    /// a SCADA client believing it had seen everything.
+    pub outbound_queue: usize,
 }
 
 impl Default for ServerConfig {
     fn default() -> ServerConfig {
-        ServerConfig { association: AssociationConfig::default(), acsi: AcsiConfig::default(), max_associations: 16, poll_interval: Duration::from_millis(20) }
+        ServerConfig {
+            association: AssociationConfig::default(),
+            acsi: AcsiConfig::default(),
+            max_associations: 16,
+            poll_interval: Duration::from_millis(20),
+            outbound_queue: 256,
+        }
     }
 }
 
@@ -66,9 +84,29 @@ impl Default for ServerConfig {
 struct Shared {
     acsi: Acsi,
     /// One outbound queue per open association, for the PDUs the server sends unasked —
-    /// reports and command terminations.
-    outbound: BTreeMap<AssocId, Sender<Vec<u8>>>,
+    /// reports and command terminations. Bounded; see [`ServerConfig::outbound_queue`].
+    outbound: BTreeMap<AssocId, Outbound>,
     next_assoc: AssocId,
+}
+
+/// One association's outbound queue, and the flag that says it overflowed.
+#[derive(Clone, Debug)]
+struct Outbound {
+    tx: SyncSender<Vec<u8>>,
+    /// Set when a PDU could not be queued. The connection thread reads it and closes, which
+    /// is the only honest answer: the client is not reading, and pretending it saw a report
+    /// it never received is worse than telling it the association is gone.
+    stalled: Arc<AtomicBool>,
+}
+
+impl Outbound {
+    /// Queue one PDU, or record that the client is not keeping up.
+    fn send(&self, pdu: Vec<u8>) {
+        match self.tx.try_send(pdu) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => self.stalled.store(true, Ordering::Relaxed),
+        }
+    }
 }
 
 /// Nanoseconds on a monotonic origin shared by every association of this process, so that a
@@ -152,6 +190,15 @@ impl Server {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_file_store(store);
     }
 
+    /// Keep the log entries in `store` instead of the default bounded in-memory one.
+    ///
+    /// The default is right for a simulator and wrong for a device that must survive a
+    /// restart; a durable store is a backend, not a redesign, because the trigger evaluation
+    /// and the two ACSI queries sit above the trait rather than inside it.
+    pub fn set_log_store(&mut self, store: Box<dyn super::LogStore>) {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_log_store(store);
+    }
+
     /// Replace the wall clock every absolute timestamp is read from.
     ///
     /// The default is [`SystemClock`](crate::common::SystemClock). A report's `TimeOfEntry`,
@@ -187,15 +234,19 @@ impl Server {
         }
         let id = guard.next_assoc;
         guard.next_assoc += 1;
-        let (tx, rx) = channel();
-        guard.outbound.insert(id, tx);
+        let (tx, rx) = sync_channel(cfg.outbound_queue.max(1));
+        let stalled = Arc::new(AtomicBool::new(false));
+        guard.outbound.insert(id, Outbound { tx, stalled: Arc::clone(&stalled) });
+        // What a report control block's `Owner` will say while this client holds one. The
+        // peer's address is what the transport knows and the ACSI layer cannot invent.
+        guard.acsi.on_association_opened(id, peer_identity(&stream));
         drop(guard);
 
         std::thread::spawn(move || {
-            let _ = serve(id, stream, &shared, &cfg, &rx);
+            let _ = serve(id, stream, &shared, &cfg, &rx, &stalled);
             let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
             guard.outbound.remove(&id);
-            guard.acsi.on_association_closed(id);
+            guard.acsi.on_association_closed(id, Instant(now_nanos()));
         });
         Ok(())
     }
@@ -229,6 +280,37 @@ impl ServerHandle {
         publish(&mut guard, Instant(now_nanos()));
         out
     }
+
+    /// Keep only the supervision writes that would actually *change* something, and give each
+    /// changed data object its `q` and `t`.
+    ///
+    /// One lock for the whole set. Two things are decided here and both matter for a call
+    /// that runs in a loop: an attribute the model does not declare is dropped rather than
+    /// failed, because the SCL file decides which supervision objects exist; and a value that
+    /// has not moved is dropped too, so a supervision poll is not a data change once a second
+    /// on every report control block watching the logical node.
+    fn supervision_writes(&self, candidates: Vec<(String, Value)>) -> Vec<(String, Value)> {
+        let guard = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        let ied = &guard.acsi.ied;
+        let now = guard.acsi.wall_clock();
+        let mut out = Vec::with_capacity(candidates.len() * 3);
+        for (reference, value) in candidates {
+            match ied.value(&reference) {
+                Some(current) if *current == value => {}
+                Some(_) => {
+                    for pair in super::supervision::quality_and_time(&reference, now) {
+                        if ied.value(&pair.0).is_some() {
+                            out.push(pair);
+                        }
+                    }
+                    out.push((reference, value));
+                }
+                // Not in the model: this logical node's type does not declare the object.
+                None => {}
+            }
+        }
+        out
+    }
 }
 
 /// A batch of model updates that becomes visible all at once.
@@ -250,6 +332,31 @@ impl Txn<'_> {
         self
     }
 
+    /// Stage the status of one subscription into its supervision logical node.
+    ///
+    /// `node` is the `LGOS` or `LSVS` — `IED1LD0/LGOS1`. This is how the numbers a GOOSE or
+    /// sampled-value subscriber already holds become something a SCADA client can read and a
+    /// report control block can carry ([`SubscriptionStatus`](super::SubscriptionStatus)).
+    ///
+    /// It is safe to call in a loop. Only the objects this IED's own `LGOS`/`LSVS` type
+    /// declares are written, and only when a value has actually changed — with `q` and `t`
+    /// beside it, `t` stamped at the change rather than at the poll.
+    ///
+    /// ```no_run
+    /// # // Gated: `supervise` is a `server` feature and the subscriber it takes is a `goose` one.
+    /// # #[cfg(feature = "goose")]
+    /// # mod example {
+    /// # use iec61850_rs::server::{ServerHandle, SubscriptionStatus};
+    /// # pub fn run(updates: &ServerHandle, sub: &iec61850_rs::proto::goose::Subscriber) {
+    /// updates.txn().supervise("IED1LD0/LGOS1", &SubscriptionStatus::from_goose(sub)).commit();
+    /// # }
+    /// # }
+    /// ```
+    pub fn supervise(&mut self, node: &str, status: &super::SubscriptionStatus) -> &mut Self {
+        self.writes.extend(self.handle.supervision_writes(status.writes(node)));
+        self
+    }
+
     /// Apply everything staged. The result is one entry per write, in order.
     pub fn commit(&mut self) -> Vec<core::result::Result<(), i64>> {
         let writes = core::mem::take(&mut self.writes);
@@ -260,18 +367,43 @@ impl Txn<'_> {
     }
 }
 
+/// The octets a report control block's `Owner` carries for this connection: the peer's IP
+/// address, four octets for IPv4 and sixteen for IPv6.
+///
+/// Empty when the socket will not say, which is honest — an `Owner` of no octets means "not
+/// held", and inventing an identity would be worse than admitting the transport was quiet.
+fn peer_identity(stream: &TcpStream) -> Vec<u8> {
+    match stream.peer_addr() {
+        Ok(SocketAddr::V4(a)) => a.ip().octets().to_vec(),
+        Ok(SocketAddr::V6(a)) => a.ip().octets().to_vec(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Turn whatever is dirty into reports and hand each to the association that asked for it.
 fn publish(shared: &mut Shared, now: Instant) {
-    let outbound: Vec<(AssocId, Sender<Vec<u8>>)> = shared.outbound.iter().map(|(id, tx)| (*id, tx.clone())).collect();
-    for (assoc, pdu) in shared.acsi.commit(now) {
-        if let Some((_, tx)) = outbound.iter().find(|(id, _)| *id == assoc) {
-            let _ = tx.send(pdu);
+    let due = shared.acsi.commit(now);
+    dispatch(shared, due);
+}
+
+/// Hand each PDU to the association it belongs to.
+fn dispatch(shared: &Shared, due: Vec<(AssocId, Vec<u8>)>) {
+    for (assoc, pdu) in due {
+        if let Some(out) = shared.outbound.get(&assoc) {
+            out.send(pdu);
         }
     }
 }
 
 /// One association, from the COTP connection request to the release.
-fn serve(id: AssocId, mut stream: TcpStream, shared: &Arc<Mutex<Shared>>, cfg: &ServerConfig, outbound: &Receiver<Vec<u8>>) -> Result<()> {
+fn serve(
+    id: AssocId,
+    mut stream: TcpStream,
+    shared: &Arc<Mutex<Shared>>,
+    cfg: &ServerConfig,
+    outbound: &Receiver<Vec<u8>>,
+    stalled: &AtomicBool,
+) -> Result<()> {
     stream.set_nodelay(true).map_err(|e| Error::Io(e.to_string()))?;
     stream.set_read_timeout(Some(cfg.poll_interval)).map_err(|e| Error::Io(e.to_string()))?;
     let mut assoc = Association::server(cfg.association.clone());
@@ -292,12 +424,7 @@ fn serve(id: AssocId, mut stream: TcpStream, shared: &Arc<Mutex<Shared>>, cfg: &
             // was in the socket read, and nothing else will notice.
             let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
             let due = guard.acsi.on_timeout(now);
-            let outbound: Vec<(AssocId, Sender<Vec<u8>>)> = guard.outbound.iter().map(|(id, tx)| (*id, tx.clone())).collect();
-            for (assoc, pdu) in due {
-                if let Some((_, tx)) = outbound.iter().find(|(id, _)| *id == assoc) {
-                    let _ = tx.send(pdu);
-                }
-            }
+            dispatch(&guard, due);
         }
 
         let mut requests: Vec<(i64, Vec<u8>)> = Vec::new();
@@ -306,6 +433,13 @@ fn serve(id: AssocId, mut stream: TcpStream, shared: &Arc<Mutex<Shared>>, cfg: &
             match event {
                 AssociationEvent::Request { invoke_id, pdu } => requests.push((invoke_id, pdu)),
                 AssociationEvent::Closed(_) => closed = true,
+                // What the peer agreed to accept sizes two things the ACSI layer would
+                // otherwise guess at: a `GetNameList` page and a report. ISO 9506 negotiates
+                // *down*, so the server's own configured size is an upper bound, not an
+                // agreement, and a report larger than this is segmented rather than dropped.
+                AssociationEvent::Established(n) => {
+                    shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_association_max_pdu(id, n.max_pdu);
+                }
                 // A response, a timeout or an undecodable PDU on a server association: none
                 // of them is a request, and none of them is a reason to drop the client.
                 _ => {}
@@ -350,6 +484,12 @@ fn serve(id: AssocId, mut stream: TcpStream, shared: &Arc<Mutex<Shared>>, cfg: &
         }
         let _ = stream.flush();
         if closed {
+            return Ok(());
+        }
+        // The client is not draining its socket and its queue has filled. Closing is what
+        // bounds the server's memory; a buffered control block keeps its entries, so the
+        // client resumes from its `EntryID` rather than losing them.
+        if stalled.load(Ordering::Relaxed) {
             return Ok(());
         }
     }

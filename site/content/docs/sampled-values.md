@@ -298,7 +298,7 @@ second — is refused rather than turned into a modulus of zero.
 `ied sv monitor <capture> --scd <file>` is the same thing from the command line: the file
 configures the streams, and every ASDU comes out as named channels.
 
-## Not implemented yet
+## Not included
 
 Unicast sampled values, the IEC 62351-6 authentication extension, and the §6.2.2 replay
 state machine (the subscriber tracks continuity, sync and staleness, which is its observable

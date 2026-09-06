@@ -178,6 +178,32 @@ model.gse_control("IED1LD0/LLN0$GO$gcbTrip")?;   // MMS form
 model.smv_control("IED1LD0/LLN0.msvcb01")?;
 ```
 
+## Arrays
+
+`count` on a `DA`, `BDA` or `SDO` makes it an array. The schema types it as a **union** of an
+unsigned integer and an attribute *name*, so both of these are legal and mean the same thing:
+
+```xml
+<SDO name="phsAHar" type="CMV_T" count="16"/>
+<SDO name="sqHar"   type="CMV_T" count="numHar"/>   <!-- a sibling whose Val holds the number -->
+```
+
+The loader resolves both to a number, which is what `DataAttribute::count` and
+`DataObject::count` carry. A `count` that names nothing, or one larger than the loader expands
+(`MAX_ARRAY`), is a diagnostic and the attribute loads as a scalar.
+
+A data set may name **one element** of an array with `FCDA/@ix`:
+
+```xml
+<FCDA ldInst="LD0" lnClass="MHAI" lnInst="1" doName="HA" daName="phsAHar.cVal" fc="MX" ix="1"/>
+```
+
+`ix` says *which element* and never *which component is the array* — only the type does — so
+the index is placed by walking the model until something has a `count`.
+`IedModel::fcda_reference` returns `IED1LD0/MHAI1$MX$HA$phsAHar(1)$cVal`, and `ied scl validate`
+reports an index past the end of its array or on something that is not one. Some tools write
+the index into `daName` as well; that is read too.
+
 ## Object references
 
 ```rust
@@ -324,10 +350,18 @@ assert!(report.is_ok());         // no findings of Severity::Error
 Every finding carries a stable `FindingCode` and a severity, so a pipeline can forbid a
 class of them rather than matching on prose. What it looks for — duplicate streams,
 unresolvable data-set members and bindings, out-of-range addresses, retransmission times,
-sampled-value rates, object references too long for the edition, and a `ctlModel` that
+sampled-value rates, object references too long for the edition, a report or log control block
+that writes nowhere, an unindexed block that asks for several instances, and a `ctlModel` that
 promises a service its own type does not declare — is tabulated in
 [Command line](@/docs/cli.md#inspect-and-validate-scl), which is the same checks with a
 printer in front of them.
+
+A few of them are things the schema **forbids** rather than permits, and they are here because
+the loader is a fast read path rather than a schema processor: it reads with `roxmltree` and
+validates nothing against `SCL.xsd`, so a file no validating parser would accept still loads.
+A `DOType` that declares `setMag` twice is the one that matters — `uniqueDAorSDOInDOType`
+forbids it, and a server that loaded it would publish two variables of one name and resolve
+every read to whichever came first.
 
 That last one is worth naming, because it is invisible until commissioning: a breaker
 engineered `sbo-with-enhanced-security` whose `DOType` declares no `SBOw` is schema-valid and
@@ -335,8 +369,7 @@ impossible to operate. The client selects, the server answers `object-non-existe
 nothing in `SCL.xsd` objects.
 
 
-## Not implemented yet
+## Not included
 
-Writing SCL back, editing round-trips, semantic validation against the IEC 61850-7-7
-namespace files, and generating a typed Rust model at build time. Today the loader is
-read-only.
+The loader is read-only: no writing SCL back, no editing round-trips, no semantic validation
+against the IEC 61850-7-7 namespace files, and no typed Rust model generated at build time.

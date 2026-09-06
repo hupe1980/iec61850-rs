@@ -54,6 +54,9 @@ pub enum BType {
     TrgOps,
     OptFlds,
     SvOptFlds,
+    LogOptFlds,
+    Octet6,
+    Octet16,
     /// A `bType` this crate does not know; kept verbatim.
     Other(String),
 }
@@ -96,6 +99,12 @@ impl BType {
             "TrgOps" => BType::TrgOps,
             "OptFlds" => BType::OptFlds,
             "SvOptFlds" => BType::SvOptFlds,
+            // Edition 2.1 additions to the SCL `bType` list ✅ (`SCL_Enums.xsd`). Without
+            // them a file that uses one gets `BType::Other`, which the server reads as a
+            // structure — an octet string modelled as a structure with no components.
+            "LogOptFlds" => BType::LogOptFlds,
+            "Octet6" => BType::Octet6,
+            "Octet16" => BType::Octet16,
             other => BType::Other(String::from(other)),
         }
     }
@@ -262,6 +271,14 @@ pub struct DataAttribute {
     /// active is a runtime question. A model that kept only one of them could not tell a
     /// server what group 2 is set to, which is the whole point of having groups.
     pub group_values: Vec<(u32, String)>,
+    /// `count` — the number of elements when this attribute is an **array**.
+    ///
+    /// SCL's `count` is a union of an unsigned integer and an attribute *name* ✅
+    /// (`tDACount`, `SCL_Enums.xsd`): a file may say `count="16"` or point at a sibling
+    /// holding the number, and the loader resolves both to a number here. `None` is a plain
+    /// scalar, which is nearly everything; `Some(n)` makes this an MMS `array [1]` of `n`
+    /// elements and every reference below it needs an index to reach a value.
+    pub count: Option<u32>,
 }
 
 /// A data object (DO, SDO).
@@ -277,6 +294,10 @@ pub struct DataObject {
     pub attributes: Vec<DataAttribute>,
     /// Sub data objects.
     pub sub_objects: Vec<DataObject>,
+    /// `count` on the `SDO` that named this one — the number of elements when it is an
+    /// **array** of sub data objects ✅ (`tSDOCount`). `None` for the ordinary case, and
+    /// always `None` for a top-level `DO`, which the schema gives no `count`.
+    pub count: Option<u32>,
 }
 
 /// One member of a data set (SCL `FCDA`).
@@ -296,6 +317,12 @@ pub struct Fcda {
     pub da_name: Option<String>,
     /// `fc`.
     pub fc: Fc,
+    /// `ix` — the array index this member selects ✅ (`tFCDA`, `SCL_IED.xsd`).
+    ///
+    /// A data set may name **one element** of an array rather than the whole of it, which is
+    /// what the attribute is for. On the wire it becomes an `alternateAccess`, and the index
+    /// applies to the last component of `da_name` that is an array.
+    pub ix: Option<u32>,
 }
 
 impl Fcda {
@@ -351,6 +378,32 @@ impl Fcda {
         }
         s
     }
+}
+
+/// The name of a reference component, without any array index it carries.
+fn named(part: &str) -> &str {
+    crate::common::split_index(part).0
+}
+
+/// One component of a data-set member, as the model sees it.
+///
+/// What [`IedModel::fcda_walk`] yields, and what the two questions asked of a member — does it
+/// resolve, and where does its `ix` belong — are both answered from.
+struct FcdaStep {
+    /// The MMS reference up to and including this component.
+    reference: String,
+    /// Its name, without any index.
+    name: String,
+    /// The array index written in the name, if the file wrote one there.
+    index: Option<u32>,
+    /// The number of elements its type declares, when it is an array.
+    count: Option<u32>,
+}
+
+/// Where a walk of a data-set member currently is: a data object, or an attribute under one.
+enum FcdaNode<'m> {
+    Object(&'m DataObject),
+    Attribute(&'m DataAttribute),
 }
 
 /// A data set.
@@ -678,6 +731,15 @@ pub enum DiagnosticCode {
     NestingTooDeep,
     /// A required attribute (`name`, `type`, `inst`, `lnType`) is missing; the element is skipped.
     MissingAttribute,
+    /// A `count` names a sibling attribute that does not exist or holds no number; the
+    /// attribute is loaded as a **scalar**. SCL types `count` as a union of an unsigned
+    /// integer and an attribute name ✅, and only the first form can be resolved without one.
+    UnresolvedArrayCount,
+    /// A `count` is larger than the loader expands ([`crate::scl::MAX_ARRAY`]); the attribute
+    /// is loaded as a **scalar**. The schema allows any `xs:unsignedInt`, and a server turns
+    /// each element into its own set of values — so the file would otherwise decide how much
+    /// memory the process takes.
+    ArrayTooLarge,
 }
 
 /// Something the SCL loader found wrong but could work around.
@@ -694,6 +756,56 @@ pub struct Diagnostic {
 impl core::fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{:?} at {}: {}", self.code, self.at, self.message)
+    }
+}
+
+/// A subscription supervision logical node, and the control block it was engineered to watch.
+///
+/// IEC 61850-7-4 gives every GOOSE subscription an `LGOS` and every sampled-value
+/// subscription an `LSVS` (TISSUE 1396/1401 🌐), and the *binding* between the two is in the
+/// file: the logical node's `GoCBRef`/`SvCBRef` setting names the publisher's control block.
+/// Reading it here is what lets an application wire a subscriber to its supervision node
+/// without typing either name a second time — the same rule the rest of the configuration
+/// follows (D17).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Supervision {
+    /// The logical node, as a reference: `IED2LD0/LGOS1`.
+    pub node: String,
+    /// `LGOS` for a GOOSE subscription, `LSVS` for a sampled-value one.
+    pub ln_class: String,
+    /// The control block it supervises, as the file engineered it — `IED1LD0/LLN0$GO$gcbTrip`.
+    /// `None` when the file declares the logical node and does not say what it watches, which
+    /// is a commissioning finding rather than an error.
+    pub control_block: Option<String>,
+}
+
+impl Supervision {
+    /// True for a GOOSE subscription supervision node.
+    pub fn is_goose(&self) -> bool {
+        self.ln_class == "LGOS"
+    }
+
+    /// Whether this node watches `control_block`, however either of them is spelt.
+    ///
+    /// A control block is named `IED1LD0/LLN0$GO$gcbTrip` in the MMS form a `gocbRef` carries
+    /// and `IED1LD0/LLN0.gcbTrip` in the dotted form SCL tooling prints, and files use both.
+    /// Comparing the strings would make the binding depend on which spelling an engineer's
+    /// tool happened to write, so what is compared is the logical device, the logical node
+    /// and the block's own name.
+    pub fn watches(&self, control_block: &str) -> bool {
+        self.control_block.as_deref().is_some_and(|mine| control_block_key(mine) == control_block_key(control_block))
+    }
+}
+
+/// A control-block reference as `(logical device, logical node, block name)`, whichever
+/// spelling it arrived in. An unparsable reference is its own trimmed text, so two of those
+/// still compare equal to each other and to nothing else.
+fn control_block_key(reference: &str) -> (String, String, String) {
+    match ObjectReference::parse(reference) {
+        // The functional constraint (`GO`, `MS`) is *where* the block lives, not part of its
+        // name, and the dotted spelling does not carry one — so it is dropped from the key.
+        Ok(r) => (String::from(r.ld), String::from(r.ln), r.path().last().unwrap_or_default().into()),
+        Err(_) => (String::new(), String::new(), String::from(reference.trim())),
     }
 }
 
@@ -905,7 +1017,115 @@ impl IedModel {
     /// how a report's `DataRef` ends up pointing at a logical device the value is not in.
     pub fn fcda_reference(&self, ld_name: &str, fcda: &Fcda) -> String {
         let resolved = self.logical_device_by_inst(&fcda.ld_inst).map_or(ld_name, |ld| ld.name.as_str());
-        fcda.mms_reference(resolved)
+        let base = fcda.mms_reference(resolved);
+        // `ix` selects **one element** of an array, and the attribute says only *which*
+        // element — never which component is the array. Only the type does, so the index is
+        // placed against the model rather than against the last name in the reference: a file
+        // that writes `daName="phsAHar(9).cVal" ix="9"` and one that writes `daName="phsAHar.cVal"
+        // ix="9"` mean the same member, and the second is the form the schema asks for ✅.
+        match fcda.ix {
+            Some(ix) if !base.contains('(') => self.place_index(ld_name, fcda, &base, ix).unwrap_or(base),
+            _ => base,
+        }
+    }
+
+    /// Put `ix` after the first component the model declares as an array.
+    ///
+    /// `None` when nothing on the path is one, in which case the reference is left alone and
+    /// the member simply does not resolve — which is the truth, and what `ied scl validate`
+    /// reports.
+    fn place_index(&self, ld_name: &str, fcda: &Fcda, base: &str, ix: u32) -> Option<String> {
+        let walk = self.fcda_walk(ld_name, fcda).ok()?;
+        let step = walk.iter().find(|s| s.count.is_some())?;
+        Some(alloc::format!("{}({ix}){}", step.reference, base.strip_prefix(step.reference.as_str())?))
+    }
+
+    /// Walk an `FCDA`'s components against the model.
+    ///
+    /// One walk for both questions asked of a data-set member — does it resolve, and where does
+    /// its `ix` belong — because two walks are two chances to disagree about what `daName`
+    /// means. And it means more than the schema says: `doName` is meant to carry the whole data
+    /// object path and `daName` to start at the first attribute, but libiec61850's own tool
+    /// writes a **sub data object** into `daName` 🌐, so each component is looked up as a sub
+    /// object first and as an attribute second. That is D50's rule — the loader reads what the
+    /// field writes, and the validator is where the finding goes.
+    ///
+    /// Yields one [`FcdaStep`] per component.
+    fn fcda_walk(&self, ld_name: &str, fcda: &Fcda) -> core::result::Result<Vec<FcdaStep>, String> {
+        let ld = self
+            .logical_device_by_inst(&fcda.ld_inst)
+            .or_else(|| self.logical_device(ld_name))
+            .ok_or_else(|| alloc::format!("no logical device `{}`", fcda.ld_inst))?;
+        let ln_name = fcda.ln_name();
+        let ln = ld.logical_nodes.iter().find(|ln| ln.name == ln_name).ok_or_else(|| alloc::format!("no logical node `{ln_name}`"))?;
+
+        let mut prefix = alloc::format!("{}/{}${}", ld.name, ln.name, fcda.fc.as_str());
+        let mut here: Option<FcdaNode<'_>> = None;
+        let mut out = Vec::new();
+        let parts = fcda.do_name.split('.').chain(fcda.da_name.as_deref().unwrap_or("").split('.')).filter(|p| !p.is_empty());
+        for part in parts {
+            let (name, index) = crate::common::split_index(part);
+            let next = match &here {
+                None => ln.data_objects.iter().find(|d| d.name == name).map(FcdaNode::Object),
+                Some(FcdaNode::Object(o)) => o
+                    .sub_objects
+                    .iter()
+                    .find(|s| s.name == name)
+                    .map(FcdaNode::Object)
+                    .or_else(|| o.attributes.iter().find(|a| a.name == name).map(FcdaNode::Attribute)),
+                Some(FcdaNode::Attribute(a)) => a.children.iter().find(|c| c.name == name).map(FcdaNode::Attribute),
+            };
+            let next = next.ok_or_else(|| alloc::format!("`{name}` is not declared here"))?;
+            let count = match &next {
+                FcdaNode::Object(o) => o.count,
+                FcdaNode::Attribute(a) => a.count,
+            };
+            prefix.push('$');
+            prefix.push_str(name);
+            out.push(FcdaStep { reference: prefix.clone(), name: String::from(name), index, count });
+            if let Some(i) = index {
+                let _ = core::fmt::Write::write_fmt(&mut prefix, format_args!("({i})"));
+            }
+            here = Some(next);
+        }
+        Ok(out)
+    }
+
+    /// Whether an `FCDA` names something this IED actually has, and whether its array indices
+    /// are inside their bounds.
+    ///
+    /// Not the same question as [`IedModel::fcda_attribute`], which asks for a **leaf
+    /// attribute** and is what a sampled-value width needs: a data-set member may name a data
+    /// object, a sub data object or one element of an array.
+    ///
+    /// `Err(reason)` says *why* it does not resolve, which is the difference between a misspelt
+    /// member and one whose index is past the end of its array.
+    pub fn fcda_resolves(&self, ld_name: &str, fcda: &Fcda) -> core::result::Result<(), String> {
+        let walk = self.fcda_walk(ld_name, fcda)?;
+        for FcdaStep { name, index, count, .. } in &walk {
+            // The index has to belong to an array and be inside it. A file that indexes a
+            // scalar, or that runs past the end, engineers a report member with no value —
+            // and a report that silently drops one member shifts every inclusion bit after it.
+            match (index, count) {
+                (Some(i), Some(n)) if i >= n => return Err(alloc::format!("index {i} is past the end of `{name}`, which has {n} elements")),
+                (Some(i), None) => return Err(alloc::format!("`{name}` is not an array, so `({i})` selects nothing")),
+                _ => {}
+            }
+        }
+        // `ix` without an index in the name is the schema's own form, and it needs an array
+        // somewhere on the path for the index to be placed against.
+        if let Some(ix) = fcda.ix {
+            if !walk.iter().any(|s| s.index.is_some()) {
+                match walk.iter().find(|s| s.count.is_some()) {
+                    Some(FcdaStep { name, count: Some(n), .. }) if ix >= *n => {
+                        return Err(alloc::format!("ix={ix} is past the end of `{name}`, which has {n} elements"));
+                    }
+                    Some(_) => {}
+                    None => return Err(alloc::format!("ix={ix} but nothing on this path is an array")),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolve an `FCDA` of a data set to the data attribute it names, if it names a leaf.
@@ -922,16 +1142,20 @@ impl IedModel {
         // Each first component is looked up before `find`, never inside its predicate: a
         // `next()` in there advances the iterator once per candidate it tries, so it matches
         // only when the thing it is looking for happens to be first.
+        // A component may carry an array index — a file may write `daName="phsAHar(9).cVal"`
+        // beside its `ix`, which is the same member spelt twice. The *name* is what resolves.
         let mut dos = fcda.do_name.split('.');
-        let first_do = dos.next()?;
+        let first_do = named(dos.next()?);
         let mut dobj = ln.data_objects.iter().find(|d| d.name == first_do)?;
         for part in dos {
+            let part = named(part);
             dobj = dobj.sub_objects.iter().find(|s| s.name == part)?;
         }
         let mut das = da.split('.');
-        let first_da = das.next()?;
+        let first_da = named(das.next()?);
         let mut attr = dobj.attributes.iter().find(|a| a.name == first_da)?;
         for part in das {
+            let part = named(part);
             attr = attr.children.iter().find(|c| c.name == part)?;
         }
         Some(attr)
@@ -1029,6 +1253,33 @@ impl IedModel {
         Ok(config)
     }
 
+    /// Every subscription supervision logical node this IED declares, in model order.
+    ///
+    /// The control block each watches comes from its `GoCBRef`/`SvCBRef` setting. `ORG` has
+    /// two attributes that can carry a reference — `setSrcRef` and `setSrcCB` — and the field
+    /// disagrees about which one a control-block reference belongs in, so both are read, in
+    /// that order 🌐.
+    pub fn supervision(&self) -> Vec<Supervision> {
+        let mut out = Vec::new();
+        for ld in &self.logical_devices {
+            for ln in &ld.logical_nodes {
+                let setting = match ln.class.as_str() {
+                    "LGOS" => "GoCBRef",
+                    "LSVS" => "SvCBRef",
+                    _ => continue,
+                };
+                let control_block = ln
+                    .data_objects
+                    .iter()
+                    .find(|o| o.name == setting)
+                    .and_then(|o| ["setSrcRef", "setSrcCB"].iter().find_map(|a| o.attributes.iter().find(|d| d.name == *a)?.value.clone()))
+                    .filter(|v| !v.is_empty());
+                out.push(Supervision { node: alloc::format!("{}/{}", ld.name, ln.name), ln_class: ln.class.clone(), control_block });
+            }
+        }
+        out
+    }
+
     /// Every `ExtRef` of this IED, with the logical node that declares it.
     pub fn ext_refs(&self) -> impl Iterator<Item = (&LogicalDevice, &LogicalNode, &ExtRef)> {
         self.logical_devices.iter().flat_map(|ld| ld.logical_nodes.iter().flat_map(move |ln| ln.inputs.iter().map(move |x| (ld, ln, x))))
@@ -1063,4 +1314,25 @@ fn parse_ctl_model(value: &str) -> Option<crate::common::ControlModel> {
         "sbo-with-enhanced-security" => ControlModel::SboEnhanced,
         other => ControlModel::from_code(other.parse().ok()?)?,
     })
+}
+
+#[cfg(test)]
+mod supervision_tests {
+    use super::*;
+
+    #[test]
+    fn a_supervision_node_matches_its_control_block_in_either_spelling() {
+        let lgos =
+            Supervision { node: String::from("IED2LD0/LGOS1"), ln_class: String::from("LGOS"), control_block: Some(String::from("IED1LD0/LLN0$GO$gcbTrip")) };
+        assert!(lgos.is_goose());
+        // The MMS form a `gocbRef` carries, and the dotted form SCL tooling prints: a binding
+        // that depended on which one an engineer's tool wrote would be no binding at all.
+        assert!(lgos.watches("IED1LD0/LLN0$GO$gcbTrip"));
+        assert!(lgos.watches("IED1LD0/LLN0.gcbTrip"));
+        assert!(!lgos.watches("IED1LD0/LLN0.gcbOther"));
+        assert!(!lgos.watches("IED3LD0/LLN0.gcbTrip"));
+        // A node the file says nothing about watches nothing, rather than everything.
+        let bare = Supervision { control_block: None, ..lgos };
+        assert!(!bare.watches("IED1LD0/LLN0$GO$gcbTrip"));
+    }
 }

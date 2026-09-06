@@ -45,7 +45,10 @@ pub struct Control<'c> {
     client: &'c mut Client,
     /// The controllable object, as `LD/LN$CO$DO`.
     base: String,
-    model: ControlModel,
+    /// The reference the caller wrote, kept for `ctlModel` discovery.
+    object: String,
+    /// The model the caller stated, or the one read off the server — `None` until either.
+    model: Option<ControlModel>,
     origin: Origin,
     check: Check,
     test: bool,
@@ -75,7 +78,8 @@ impl Client {
         Control {
             client: self,
             base,
-            model: ControlModel::DirectNormal,
+            object: String::from(reference),
+            model: None,
             origin: Origin::new(OriginCategory::RemoteControl, "iec61850-rs"),
             check: Check::NONE,
             test: false,
@@ -92,10 +96,14 @@ impl Control<'_> {
     ///
     /// Getting this wrong is the most common reason a control silently does nothing: an
     /// object engineered for select-before-operate answers an unselected `Oper` with
-    /// `AddCause::ObjectNotSelected` and no state change.
+    /// `AddCause::ObjectNotSelected` and no state change. **A caller that does not say is not
+    /// guessed at**: the model is read off the server's own `CF$…$ctlModel` before the first
+    /// command, which costs one round trip and is the only source that cannot be out of date.
+    /// State it here when it is known — from the SCD, or from a previous read — and the round
+    /// trip goes away.
     #[must_use]
     pub const fn model(mut self, model: ControlModel) -> Self {
-        self.model = model;
+        self.model = Some(model);
         self
     }
 
@@ -158,22 +166,23 @@ impl Control<'_> {
     /// `CommandTermination`; a negative one becomes an [`Error::ControlRejected`] carrying
     /// the `AddCause`, because "the write succeeded" is not what the caller asked.
     pub fn execute(&mut self, value: &Value) -> Result<Option<CommandTermination>> {
-        if matches!(self.model, ControlModel::StatusOnly) {
+        let model = self.resolved_model();
+        if matches!(model, ControlModel::StatusOnly) {
             // A status-only object has no `Oper` to write to. Saying so here costs no round
             // trip and names the actual problem, where the server's answer would be a bare
             // "object does not exist" against a reference that plainly does.
             return Err(Error::ControlRejected { add_cause: AddCause::NotSupported.to_code() });
         }
         let ctl_num = self.take_ctl_num();
-        if self.model.needs_select() {
-            if self.model.select_carries_value() {
+        if model.needs_select() {
+            if model.select_carries_value() {
                 self.write_control("SBOw", &self.request(value.clone(), ctl_num), false)?;
             } else if !self.select_inner()? {
                 return Err(Error::ControlRejected { add_cause: AddCause::SelectFailed.to_code() });
             }
         }
         self.write_control("Oper", &self.request(value.clone(), ctl_num), false)?;
-        if !self.model.enhanced_security() {
+        if !model.enhanced_security() {
             return Ok(None);
         }
         let timeout = self.timeout;
@@ -224,6 +233,21 @@ impl Control<'_> {
     /// The `ctlNum` this operation is using, once one has been taken.
     pub const fn current_ctl_num(&self) -> Option<u8> {
         self.ctl_num
+    }
+
+    /// The control model to act on: what the caller stated, or what the server says.
+    ///
+    /// Read once and remembered, so a `select` followed by an `operate` costs one lookup and
+    /// not two. A server that does not publish `ctlModel` at all — the attribute is optional
+    /// under `CF` — leaves `DirectNormal`, which is what this did unconditionally before and
+    /// is the only assumption left.
+    fn resolved_model(&mut self) -> ControlModel {
+        if let Some(m) = self.model {
+            return m;
+        }
+        let m = self.client.read_control_model(&self.object).unwrap_or(ControlModel::DirectNormal);
+        self.model = Some(m);
+        m
     }
 
     fn select_inner(&mut self) -> Result<bool> {

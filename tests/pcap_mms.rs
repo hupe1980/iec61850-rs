@@ -335,7 +335,7 @@ fn the_association_state_machine_follows_the_reference_capture() {
                         server_requests += 1;
                     }
                 }
-                AssociationEvent::Malformed(e) => panic!("the association could not decode a PDU the codec test accepts: {e}"),
+                AssociationEvent::Malformed { error, .. } => panic!("the association could not decode a PDU the codec test accepts: {error}"),
                 AssociationEvent::Closed(CloseReason::ProtocolError) => panic!("the state machine rejected real traffic"),
                 other => panic!("unexpected event {other:?}"),
             }

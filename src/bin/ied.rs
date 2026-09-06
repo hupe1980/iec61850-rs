@@ -46,6 +46,7 @@ COMMANDS:
     goose sniff <FILE.pcap>        Decode GOOSE and run the subscriber's verdict over it
     mms sniff <FILE.pcap>          Decode MMS over the OSI stack: association, services, values
     mms identify <HOST[:PORT]>     Associate with a server and print what it says it is
+    mms status <HOST[:PORT]>       Ask whether the server is healthy — the cheapest round trip there is
     mms browse <HOST[:PORT]>       Walk the server: logical devices, data, data sets
     mms read <HOST[:PORT]> <REF>   Read one data attribute
     mms write <HOST[:PORT]> <REF> <VALUE>
@@ -69,7 +70,10 @@ COMMANDS:
     sim <FILE.scd|.icd|.cid>       Serve the file's IEDs as real MMS servers
 
 `mms` client options (identify/browse/read/write/report):
-    --fc <ST|MX|CO|SP|...>  functional constraint for a dotted reference (default ST)
+    --fc <ST|MX|CO|SP|...>  functional constraint for a dotted reference. Reads default to
+                            ST; `mms write` requires it, because a conforming server refuses
+                            a write to ST and MX — those are what the process reports.
+                            Settings are SP/SE, configuration CF, description DC.
     --password <TEXT>       ACSE password (IEC 61850-8-1 authentication)
     --type <bool|int|uint|float|string>
                             how to encode the value of `mms write` (default bool)
@@ -147,6 +151,7 @@ fn main() -> ExitCode {
         ["goose", "sniff", file] => goose_sniff(file),
         ["mms", "sniff", file] => mms_sniff(file),
         ["mms", "identify", host, rest @ ..] => mms_identify(host, rest),
+        ["mms", "status", host, rest @ ..] => mms_status(host, rest),
         ["mms", "browse", host, rest @ ..] => mms_browse(host, rest),
         ["mms", "read", host, reference, rest @ ..] => mms_read(host, reference, rest),
         ["mms", "write", host, reference, value, rest @ ..] => mms_write(host, reference, value, rest),
@@ -479,6 +484,8 @@ fn describe_request(service: &iec61850_rs::proto::mms::ConfirmedRequest<'_>) -> 
     use iec61850_rs::proto::mms::{ConfirmedRequest, VariableAccess};
     match service {
         ConfirmedRequest::Identify => "identify".to_string(),
+        ConfirmedRequest::Status { extended_derivation } => format!("status{}", if *extended_derivation { " (extended derivation)" } else { "" }),
+        ConfirmedRequest::GetCapabilityList { .. } => String::from("getCapabilityList"),
         ConfirmedRequest::GetNameList { object_class, .. } => format!("getNameList class {object_class}"),
         ConfirmedRequest::Read { access, .. } => match access {
             VariableAccess::VariableListName(n) => format!("read {}", object_name(n)),
@@ -511,6 +518,10 @@ fn describe_response(service: &iec61850_rs::proto::mms::ConfirmedResponse<'_>) -
     use iec61850_rs::proto::mms::ConfirmedResponse;
     match service {
         ConfirmedResponse::Identify { vendor, model, revision } => format!("identify {vendor} {model} {revision}"),
+        ConfirmedResponse::Status { logical, physical, .. } => format!("status logical={logical} physical={physical}"),
+        ConfirmedResponse::GetCapabilityList { capabilities, more_follows } => {
+            format!("getCapabilityList {} capabilit(y|ies){}", capabilities.len(), if *more_follows { ", more follow" } else { "" })
+        }
         ConfirmedResponse::GetNameList { identifiers, more_follows } => {
             format!("getNameList {} name(s){}", identifiers.len(), if *more_follows { ", more follow" } else { "" })
         }
@@ -571,6 +582,9 @@ fn variable(s: &iec61850_rs::proto::mms::VariableSpecification<'_>, total: usize
     let more = if total > 1 { format!(" (+{} more)", total - 1) } else { String::new() };
     match s {
         VariableSpecification::Name(n) => format!("{}{more}", object_name(n)),
+        // A selection is shown in IEC 61850's own reference syntax, so a sniffed read of one
+        // array element does not print as a read of the whole array.
+        VariableSpecification::Element { name, access } => format!("{}{access}{more}", object_name(name)),
         VariableSpecification::Other(_) => format!("{total} variable(s)"),
     }
 }
@@ -690,7 +704,10 @@ fn mms_log(host: &str, log: &str, args: &[&str]) -> Result<(), String> {
         if let Some(text) = &e.annotation {
             println!("{} {id}  {text}", e.occurred);
         } else {
-            println!("{} {id}", e.occurred);
+            match e.reason {
+                Some(reason) => println!("{} {id}  {reason:?}", e.occurred),
+                None => println!("{} {id}", e.occurred),
+            }
             for (name, value) in &e.variables {
                 println!("    {name} = {}", show_value(value));
             }
@@ -782,7 +799,11 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
         .map_err(|e| format!("{name}: {e}"))?;
         let edition = ied.edition();
         let devices = ied.domain_names();
-        let port = o.port + n as u16;
+        // A file that engineers service tracking is unusual enough to be worth saying so:
+        // otherwise the objects are just four more names in a browse.
+        let trackers = iec61850_rs::server::Tracking::new(&ied).references();
+        // Runs out at 65535 rather than wrapping onto a port already in use.
+        let port = u16::try_from(n).ok().and_then(|n| o.port.checked_add(n)).ok_or_else(|| format!("{} IEDs do not fit above port {}", names.len(), o.port))?;
         let mut server = Server::bind(&format!("{}:{port}", o.bind), ied).map_err(|e| format!("{name}: {e}"))?;
         if let Some(dir) = &o.files {
             let store = DirectoryStore::new(dir);
@@ -790,6 +811,9 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
         }
         let addr = server.local_addr().map_err(|e| e.to_string())?;
         println!("{name} on {addr} — {} — logical device(s) {}", edition_name(edition), devices.join(", "));
+        if !trackers.is_empty() {
+            println!("  service tracking: {}", trackers.join(", "));
+        }
         servers.push(server);
     }
     if let Some(dir) = &o.files {
@@ -1146,6 +1170,8 @@ fn pcap_info(file: &str) -> Result<(), String> {
 /// The options every `mms` client subcommand shares.
 struct MmsOptions {
     fc: Fc,
+    /// Whether `--fc` was given. A read has a sensible default; a write does not.
+    fc_given: bool,
     password: Option<String>,
     value_type: String,
     timeout: Duration,
@@ -1157,7 +1183,8 @@ struct MmsOptions {
     data_set: Option<String>,
     intg_pd: Option<u32>,
     gi: bool,
-    model: ControlModel,
+    /// `None` means "ask the server" — see `Control::model`.
+    model: Option<ControlModel>,
     orcat: OriginCategory,
     scd: Option<String>,
     ied: Option<String>,
@@ -1176,6 +1203,7 @@ impl Default for MmsOptions {
     fn default() -> MmsOptions {
         MmsOptions {
             fc: Fc::ST,
+            fc_given: false,
             password: None,
             value_type: String::from("bool"),
             timeout: Duration::from_secs(30),
@@ -1187,7 +1215,7 @@ impl Default for MmsOptions {
             data_set: None,
             intg_pd: None,
             gi: false,
-            model: ControlModel::DirectNormal,
+            model: None,
             orcat: OriginCategory::RemoteControl,
             scd: None,
             ied: None,
@@ -1213,6 +1241,7 @@ fn mms_options(args: &[&str]) -> Result<MmsOptions, String> {
             "--fc" => {
                 let v = value()?;
                 o.fc = Fc::parse(&v.to_ascii_uppercase()).ok_or_else(|| format!("unknown functional constraint `{v}`"))?;
+                o.fc_given = true;
             }
             "--password" => o.password = Some(value()?.to_string()),
             "--type" => o.value_type = value()?.to_ascii_lowercase(),
@@ -1226,13 +1255,13 @@ fn mms_options(args: &[&str]) -> Result<MmsOptions, String> {
             "--intg-pd" => o.intg_pd = Some(value()?.parse().map_err(|_| "--intg-pd needs milliseconds".to_string())?),
             "--gi" => o.gi = true,
             "--model" => {
-                o.model = match value()? {
+                o.model = Some(match value()? {
                     "direct" | "direct-normal" | "1" => ControlModel::DirectNormal,
                     "sbo" | "sbo-normal" | "2" => ControlModel::SboNormal,
                     "direct-enhanced" | "3" => ControlModel::DirectEnhanced,
                     "sbo-enhanced" | "4" => ControlModel::SboEnhanced,
                     other => return Err(format!("unknown control model `{other}`; use direct, sbo, direct-enhanced or sbo-enhanced")),
-                }
+                });
             }
             "--orcat" => {
                 let v = value()?;
@@ -1316,6 +1345,49 @@ fn mms_identify(host: &str, args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+/// `Status` and `GetCapabilityList`: the two questions that need no model.
+///
+/// A `Status` answer proves all six layers are up without naming a single object, which is
+/// why a supervision loop asks it and why it is the first thing to reach for when a link is
+/// suspect.
+fn mms_status(host: &str, args: &[&str]) -> Result<(), String> {
+    use iec61850_rs::proto::mms::{vmd_logical, vmd_physical};
+    let o = mms_options(args)?;
+    let mut c = mms_connect(host, &o)?;
+    let s = c.status(false).map_err(|e| e.to_string())?;
+    let logical = match s.logical {
+        vmd_logical::STATE_CHANGES_ALLOWED => "state-changes-allowed",
+        vmd_logical::NO_STATE_CHANGES_ALLOWED => "no-state-changes-allowed",
+        vmd_logical::LIMITED_SERVICES_ALLOWED => "limited-services-allowed",
+        vmd_logical::SUPPORT_SERVICES_ALLOWED => "support-services-allowed",
+        _ => "unknown",
+    };
+    let physical = match s.physical {
+        vmd_physical::OPERATIONAL => "operational",
+        vmd_physical::PARTIALLY_OPERATIONAL => "partially-operational",
+        vmd_physical::INOPERABLE => "inoperable",
+        vmd_physical::NEEDS_COMMISSIONING => "needs-commissioning",
+        _ => "unknown",
+    };
+    println!("logical   {} ({})", logical, s.logical);
+    println!("physical  {} ({})", physical, s.physical);
+    println!("healthy   {}", s.is_healthy());
+    // A server that has not got the service says so with a reject rather than a value, and
+    // that is not a reason for this command to fail — the status is the answer asked for.
+    match c.capabilities() {
+        Ok(caps) if !caps.is_empty() => {
+            println!("capabilities");
+            for cap in caps {
+                println!("  {cap}");
+            }
+        }
+        Ok(_) => println!("capabilities (none)"),
+        Err(e) => println!("capabilities  unavailable ({e})"),
+    }
+    let _ = c.release();
+    Ok(())
+}
+
 fn mms_browse(host: &str, args: &[&str]) -> Result<(), String> {
     let o = mms_options(args)?;
     let mut c = mms_connect(host, &o)?;
@@ -1353,6 +1425,13 @@ fn mms_read(host: &str, reference: &str, args: &[&str]) -> Result<(), String> {
 
 fn mms_write(host: &str, reference: &str, literal: &str, args: &[&str]) -> Result<(), String> {
     let o = mms_options(args)?;
+    // There is no defensible default here. ST and MX are what the process reports and a
+    // conforming server refuses a write to them (IEC 61850-7-2 §5.7), so silently
+    // defaulting to ST would turn a missing flag into `object-access-denied` from the
+    // far end — an error about the server for a mistake in the command line.
+    if !o.fc_given {
+        return Err("a write needs --fc: settings are SP or SE, configuration CF, description DC, control CO.\n       ST and MX are what the process reports; a conforming server refuses a write to them.".to_string());
+    }
     let value = parse_value(&o.value_type, literal)?;
     let mut c = mms_connect(host, &o)?;
     c.write(reference, o.fc, &value).map_err(|e| format!("{reference}: {e}"))?;
@@ -1494,12 +1573,17 @@ fn mms_control(host: &str, reference: &str, literal: &str, args: &[&str]) -> Res
         let scl = scl::Scl::parse(&xml).map_err(|e| format!("{path}: {e}"))?;
         if let Some(m) = scl.model(Some(ied)).ok().and_then(|m| m.control_model(reference)) {
             println!("{reference}: control model {m:?}, from {path}");
-            model = m;
+            model = Some(m);
         }
     }
     let mut c = mms_connect(host, &o)?;
-    let outcome =
-        c.control(reference).model(model).origin(o.orcat, &o.orident).check(Check { synchro: o.synchro, interlock: o.interlock }).test(o.test).execute(&value);
+    // Neither `--model` nor `--scd`: the *server* is asked, because a sequence built on the
+    // wrong control model is refused with `ObjectNotSelected` and looks like a broken object.
+    let mut control = c.control(reference);
+    if let Some(m) = model {
+        control = control.model(m);
+    }
+    let outcome = control.origin(o.orcat, &o.orident).check(Check { synchro: o.synchro, interlock: o.interlock }).test(o.test).execute(&value);
     let _ = c.release();
     match outcome {
         Ok(None) => {
@@ -1697,6 +1781,12 @@ fn scl_show(file: &str, ied: Option<&str>) -> Result<(), String> {
         println!("  LD {} (inst {})", ld.name, ld.inst);
         for ln in &ld.logical_nodes {
             println!("    LN {} [{}] {} data objects", ln.name, ln.ln_type, ln.data_objects.len());
+            for object in &ln.data_objects {
+                // The common data class is what says *what kind of thing* an object is —
+                // `DPC` is a controllable double point, `MV` a measurand — and it is the
+                // first thing anyone reading an unfamiliar file wants beside the name.
+                println!("      DO {} [{}]", object.name, if object.cdc.is_empty() { "-" } else { object.cdc.as_str() });
+            }
             for ds in &ln.data_sets {
                 println!("      DataSet {} ({} members)", ds.name, ds.members.len());
                 for m in &ds.members {
@@ -1709,7 +1799,8 @@ fn scl_show(file: &str, ied: Option<&str>) -> Result<(), String> {
             }
             for s in &ln.smv_controls {
                 let addr = s.address.as_ref().map_or_else(|| "no address".to_string(), |a| format!("{} appid={:#06x}", a.mac, a.appid));
-                println!("      SampledValueControl {} smvID={} smpRate={} nofASDU={} {}", s.name, s.smv_id, s.smp_rate, s.nof_asdu, addr);
+                let kind = if s.multicast { "multicast" } else { "unicast" };
+                println!("      SampledValueControl {} {kind} smvID={} smpRate={} nofASDU={} {}", s.name, s.smv_id, s.smp_rate, s.nof_asdu, addr);
             }
             for r in &ln.report_controls {
                 println!("      ReportControl {} buffered={} confRev={} bufTime={}ms", r.name, r.buffered, r.conf_rev, r.buf_time_ms);
@@ -1825,6 +1916,23 @@ fn scl_subs(file: &str, ied: &str, args: &[&str]) -> Result<(), String> {
                 x.da_name.as_deref().map(|d| format!(".{d}")).unwrap_or_default()
             );
             println!("    <- {target}{}", x.int_addr.as_deref().map(|a| format!(" [{a}]")).unwrap_or_default());
+        }
+    }
+    // The other half of the same question: an `LGOS` naming nothing, or naming a control
+    // block this IED does not subscribe to, sits at `St = false` for ever without saying why.
+    let scl = scl::Scl::parse(&xml).map_err(|e| e.to_string())?;
+    let model = scl.model(Some(ied)).map_err(|e| e.to_string())?;
+    let nodes = model.supervision();
+    if !nodes.is_empty() {
+        println!("supervision:");
+        for n in &nodes {
+            match &n.control_block {
+                Some(cb) => {
+                    let watched = subs.goose.iter().chain(&subs.sv).any(|s| n.watches(&s.control_block));
+                    println!("  {} ({}) -> {cb}{}", n.node, n.ln_class, if watched { "" } else { "   [not subscribed]" });
+                }
+                None => println!("  {} ({}) -> nothing engineered", n.node, n.ln_class),
+            }
         }
     }
     if subs.unresolved.is_empty() {

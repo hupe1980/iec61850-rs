@@ -61,6 +61,25 @@ pub enum FindingCode {
     /// A controllable object's `ctlModel` promises a service its type does not declare —
     /// select-before-operate with no `SBOw`, or any control model at all with no `Oper`.
     ControlServicesMissing,
+    /// A `LogControl` names a `logName` no `Log` element defines, so its entries go nowhere.
+    MissingLog,
+    /// A report control block's engineering cannot produce a report: `intgPd` with no
+    /// integrity trigger, or an integrity trigger with no period.
+    ReportTriggers,
+    /// A type template declares the same member name twice — two `DA`s called `setMag` in one
+    /// `DOType`, two `DO`s called `Pos` in one `LNodeType`, two `BDA`s in one `DAType`.
+    ///
+    /// The schema forbids it ✅ (`uniqueDOInLNodeType`, `uniqueDAorSDOInDOType`,
+    /// `uniqueBDAInDAType`), so this is a file no validating parser would accept — and the
+    /// server, which does not validate against the XSD, would publish two variables of one
+    /// name in the MMS namespace and resolve every read of it to whichever came first.
+    DuplicateTypeMember,
+    /// An **unindexed** report control block with `RptEnabled max` above one.
+    ///
+    /// The instances of an indexed block are `urcb01`, `urcb02`, … — separate blocks so that
+    /// separate clients can each enable one. Without `indexed` there is one block whatever
+    /// `max` says, so the file promises a number of clients the device cannot serve.
+    IndexedReportControl,
 }
 
 /// One thing wrong with the file.
@@ -144,6 +163,7 @@ impl super::Scl<'_> {
             for d in &model.diagnostics {
                 report.findings.push(Finding { severity: Severity::Error, code: FindingCode::Loader(d.code), at: d.at.clone(), message: d.message.clone() });
             }
+            check_type_templates(model, &mut report);
             check_ied(model, nominal_hz, edition, &mut streams, &mut appids, &mut report);
         }
 
@@ -156,6 +176,56 @@ impl super::Scl<'_> {
             }
         }
         Ok(report)
+    }
+}
+
+/// Names a type template declares twice, and control blocks that promise instances they have
+/// not got.
+///
+/// Neither is reachable through the schema: `uniqueDAorSDOInDOType` and its siblings ✅ make a
+/// duplicate member invalid SCL. The loader does not validate against the XSD — it is a fast
+/// read path, not a schema processor — so the check lives here, where every other rule the
+/// schema *permits* but engineering forbids already lives.
+fn check_type_templates(model: &IedModel, report: &mut Report) {
+    for ld in &model.logical_devices {
+        for ln in &ld.logical_nodes {
+            let at = alloc::format!("{}/{}", ld.name, ln.name);
+            duplicates(ln.data_objects.iter().map(|d| d.name.as_str()), "DO", &at, report);
+            for object in &ln.data_objects {
+                check_object(object, &alloc::format!("{at}.{}", object.name), report);
+            }
+        }
+    }
+}
+
+fn check_object(object: &crate::model::DataObject, at: &str, report: &mut Report) {
+    // One namespace: a `DOType` holds `DA`s and `SDO`s together, and the schema's uniqueness
+    // selector is `./*` — every child, whichever kind.
+    duplicates(object.attributes.iter().map(|a| a.name.as_str()).chain(object.sub_objects.iter().map(|s| s.name.as_str())), "DA/SDO", at, report);
+    for a in &object.attributes {
+        check_attribute(a, &alloc::format!("{at}.{}", a.name), report);
+    }
+    for s in &object.sub_objects {
+        check_object(s, &alloc::format!("{at}.{}", s.name), report);
+    }
+}
+
+fn check_attribute(a: &crate::model::DataAttribute, at: &str, report: &mut Report) {
+    duplicates(a.children.iter().map(|c| c.name.as_str()), "BDA", at, report);
+    for c in &a.children {
+        check_attribute(c, &alloc::format!("{at}.{}", c.name), report);
+    }
+}
+
+fn duplicates<'a>(names: impl Iterator<Item = &'a str>, kind: &str, at: &str, report: &mut Report) {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut said: Vec<&str> = Vec::new();
+    for name in names {
+        if seen.contains(&name) && !said.contains(&name) {
+            said.push(name);
+            error(report, FindingCode::DuplicateTypeMember, at, alloc::format!("{kind} `{name}` is declared more than once"));
+        }
+        seen.push(name);
     }
 }
 
@@ -199,6 +269,22 @@ fn check_ied(
             }
 
             check_controls(model, ld, ln, report);
+
+            // The report and log control blocks get the same data-set check the publishers
+            // do. A `ReportControl` whose `datSet` names nothing reports nothing, and the
+            // schema is perfectly happy with it — which is the whole point of this module.
+            for rcb in &ln.report_controls {
+                let at = alloc::format!("{}/{}.{}", ld.name, ln.name, rcb.name);
+                check_reference_length(&at, edition, report);
+                check_data_set(model, ld, ln, rcb.dat_set.as_deref(), &at, report);
+                check_report_triggers(rcb, &at, report);
+            }
+            for lcb in &ln.log_controls {
+                let at = alloc::format!("{}/{}.{}", ld.name, ln.name, lcb.name);
+                check_reference_length(&at, edition, report);
+                check_data_set(model, ld, ln, lcb.dat_set.as_deref(), &at, report);
+                check_log_target(model, ld, lcb, &at, report);
+            }
 
             for cb in &ln.smv_controls {
                 let at = alloc::format!("{}/{}.{}", ld.name, ln.name, cb.name);
@@ -252,6 +338,48 @@ fn check_controls(model: &IedModel, ld: &crate::model::LogicalDevice, ln: &crate
                 alloc::format!("ctlModel is {ctl_model:?} but the type declares no {} under CO", missing.join(", ")),
             );
         }
+    }
+}
+
+/// A report control block whose triggers and period disagree.
+///
+/// `intgPd` without the integrity trigger is a period nothing consults, and the integrity
+/// trigger without a period is a scan that never runs — both are a block that was configured
+/// halfway, and both are silent at run time.
+fn check_report_triggers(rcb: &crate::model::ReportControl, at: &str, report: &mut Report) {
+    // `RptEnabled max` counts *instances*, and instances only exist when the block is
+    // indexed: an unindexed block is one block whatever the number says, and a report control
+    // block belongs to one client at a time. A file that asks for three and does not index
+    // them promises a number of simultaneous clients the device cannot serve.
+    if !rcb.indexed && rcb.max_instances > 1 {
+        warn(
+            report,
+            FindingCode::IndexedReportControl,
+            at,
+            alloc::format!("RptEnabled max is {} but the block is not indexed, so there is one instance", rcb.max_instances),
+        );
+    }
+    if rcb.trg_ops.integrity() && rcb.intg_pd_ms == 0 {
+        warn(report, FindingCode::ReportTriggers, at, String::from("the integrity trigger is set but intgPd is 0, so no integrity report is ever sent"));
+    }
+    if !rcb.trg_ops.integrity() && rcb.intg_pd_ms > 0 {
+        warn(report, FindingCode::ReportTriggers, at, alloc::format!("intgPd is {} ms but the integrity trigger is not set", rcb.intg_pd_ms));
+    }
+    if rcb.trg_ops.is_empty() {
+        warn(report, FindingCode::ReportTriggers, at, String::from("no TrgOps: only a general interrogation will ever produce a report"));
+    }
+}
+
+/// A log control block must write into a `Log` that exists.
+///
+/// `logName` is a free string in the schema and the `Log` element it names lives somewhere
+/// else — often in another logical device, through `ldInst`. A name that resolves to nothing
+/// is a log control block whose entries are dropped, silently, for the life of the device.
+fn check_log_target(model: &IedModel, ld: &crate::model::LogicalDevice, lcb: &crate::model::LogControl, at: &str, report: &mut Report) {
+    let target = lcb.log_ld_inst.as_deref().map_or(ld, |inst| model.logical_device_by_inst(inst).unwrap_or(ld));
+    let found = target.logical_nodes.iter().any(|ln| ln.logs.iter().any(|log| log.name == lcb.log_name));
+    if !found {
+        error(report, FindingCode::MissingLog, at, alloc::format!("logName `{}` names no Log in {}", lcb.log_name, target.name));
     }
 }
 
@@ -309,12 +437,15 @@ fn check_data_set(model: &IedModel, ld: &crate::model::LogicalDevice, ln: &crate
         error(report, FindingCode::MissingDataSet, at, alloc::format!("datSet `{name}` has no members"));
     }
     for m in &ds.members {
-        if m.da_name.is_some() && model.fcda_attribute(&ld.name, m).is_none() {
+        // The whole member, not just its leaf half: a data set may name a data object, a sub
+        // data object or one element of an array, and the reason it does not resolve — a
+        // misspelt name, or an index past the end of its array — is what an engineer needs.
+        if let Err(why) = model.fcda_resolves(&ld.name, m) {
             error(
                 report,
                 FindingCode::UnresolvedFcda,
                 at,
-                alloc::format!("datSet `{name}` member {} does not resolve in this IED", model.fcda_reference(&ld.name, m)),
+                alloc::format!("datSet `{name}` member {} does not resolve in this IED: {why}", model.fcda_reference(&ld.name, m)),
             );
         }
     }
@@ -530,6 +661,71 @@ mod tests {
         // The same file is inside Edition 2's longer limit.
         let r2 = validate(&file, 50, Edition::Ed2_1).unwrap();
         assert!(!codes(&r2, Severity::Error).contains(&FindingCode::ObjectReferenceTooLong), "{r2:#?}");
+    }
+
+    /// A report control block and a log control block get the same scrutiny the publishers do:
+    /// a `datSet` that names nothing reports nothing, and a `logName` that names nothing
+    /// silently drops every entry for the life of the device.
+    #[test]
+    fn a_report_or_log_control_block_that_writes_nowhere_is_a_finding() {
+        let cb = alloc::format!(
+            r#"{GOOD_CB}
+      <ReportControl name="urcb" datSet="dsNope" confRev="1" intgPd="1000"><TrgOps dchg="true"/></ReportControl>
+      <Log name="GeneralLog"/>
+      <LogControl name="lcb01" datSet="dsTrip" logName="NoSuchLog"><TrgOps dchg="true"/></LogControl>"#
+        );
+        let r = validate(&scl(GOOD_GSE, &cb), 50, Edition::Ed2_1).unwrap();
+        let errors = codes(&r, Severity::Error);
+        assert!(errors.contains(&FindingCode::MissingDataSet), "the report control block names no data set: {:#?}", r.findings);
+        assert!(errors.contains(&FindingCode::MissingLog), "the log control block writes into a log nobody defined: {:#?}", r.findings);
+        // `intgPd` without the integrity trigger is a period nothing consults.
+        assert!(codes(&r, Severity::Warning).contains(&FindingCode::ReportTriggers), "{:#?}", r.findings);
+
+        // The same two, engineered correctly, produce nothing.
+        let good = alloc::format!(
+            r#"{GOOD_CB}
+      <ReportControl name="urcb" datSet="dsTrip" confRev="1"><TrgOps dchg="true"/></ReportControl>
+      <Log name="GeneralLog"/>
+      <LogControl name="lcb01" datSet="dsTrip" logName="GeneralLog"><TrgOps dchg="true"/></LogControl>"#
+        );
+        let r = validate(&scl(GOOD_GSE, &good), 50, Edition::Ed2_1).unwrap();
+        assert!(r.findings.is_empty(), "{:#?}", r.findings);
+    }
+
+    /// The two engineering errors the *schema* would have caught, and which a fast read path
+    /// therefore has to catch instead.
+    #[test]
+    fn a_type_that_declares_a_member_twice_is_a_file_no_schema_would_accept() {
+        // Two `DA`s called `general` in one `DOType`: `uniqueDAorSDOInDOType` forbids it, and
+        // a server that loaded it would publish two variables of one name and resolve every
+        // read of it to whichever came first.
+        let file = scl(GOOD_GSE, GOOD_CB).replace(
+            r#"<DOType id="ACT_T" cdc="ACT"><DA name="general" fc="ST" bType="BOOLEAN"/></DOType>"#,
+            r#"<DOType id="ACT_T" cdc="ACT"><DA name="general" fc="ST" bType="BOOLEAN"/><DA name="general" fc="SP" bType="BOOLEAN"/></DOType>"#,
+        );
+        let r = validate(&file, 50, Edition::Ed2_1).unwrap();
+        let errors = codes(&r, Severity::Error);
+        assert!(errors.contains(&FindingCode::DuplicateTypeMember), "{:#?}", r.findings);
+        // Once, not once per occurrence: a duplicate is one finding about one name.
+        assert_eq!(r.findings.iter().filter(|f| f.code == FindingCode::DuplicateTypeMember).count(), 1);
+
+        // The same file with one declaration is clean.
+        assert!(validate(&scl(GOOD_GSE, GOOD_CB), 50, Edition::Ed2_1).unwrap().findings.is_empty());
+    }
+
+    #[test]
+    fn an_unindexed_block_that_asks_for_several_instances_gets_one() {
+        let cb = alloc::format!(
+            r#"{GOOD_CB}
+      <ReportControl name="urcb" datSet="dsTrip" confRev="1" indexed="false"><TrgOps dchg="true"/><RptEnabled max="3"/></ReportControl>"#
+        );
+        let r = validate(&scl(GOOD_GSE, &cb), 50, Edition::Ed2_1).unwrap();
+        assert!(codes(&r, Severity::Warning).contains(&FindingCode::IndexedReportControl), "{:#?}", r.findings);
+
+        // Indexed, the same `max` is three real blocks and there is nothing to say.
+        let indexed = cb.replace(r#"indexed="false""#, r#"indexed="true""#);
+        let r = validate(&scl(GOOD_GSE, &indexed), 50, Edition::Ed2_1).unwrap();
+        assert!(r.findings.is_empty(), "{:#?}", r.findings);
     }
 
     #[test]

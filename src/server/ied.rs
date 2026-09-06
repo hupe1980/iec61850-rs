@@ -52,19 +52,52 @@ pub struct Block {
     pub data_set: Option<String>,
 }
 
-/// A data set as the server holds it: its members expanded to the leaves they cover.
+/// One member of a data set: the reference the file names, and the leaves it covers.
+///
+/// A member is an **FCD** (a data object under a functional constraint, `CSWI1$ST$Pos`) or an
+/// **FCDA** (one attribute, `CSWI1$ST$Pos$stVal`). The distinction matters for exactly one
+/// reason: a member is the unit a report is granular in — one inclusion bit, one value and
+/// one `ReasonCode` — so an FCD is reported *whole*, as the structure it is, and never as its
+/// attributes one by one (IEC 61850-8-1 §17.2.2, TISSUE 361 🌐).
+///
+/// The leaves are still needed, because a *trigger* is a property of an attribute: a member is
+/// included when any leaf under it changed in a way the block's `TrgOps` asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataSetMember {
+    /// The member as the file names it: `IED1LD0/CSWI1$ST$Pos`.
+    pub reference: String,
+    /// Every leaf it covers, in namespace order. An FCDA covers itself.
+    pub leaves: Vec<String>,
+}
+
+/// A data set as the server holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServedDataSet {
     /// `IED1LD0/LLN0$dsTrip`.
     pub reference: String,
-    /// The members as the file names them, in order — a member may name a data object, in
-    /// which case it covers every attribute under it.
-    pub members: Vec<String>,
-    /// Every leaf the members cover, in member order. This is what a report's inclusion bit
-    /// string indexes into and what a trigger evaluation compares against.
-    pub leaves: Vec<String>,
+    /// The members as the file names them, in order. This is what `GetNamedVariableListAttributes`
+    /// answers, what a `Read` of the list returns one value each for, and what a report's
+    /// inclusion bit string indexes into — all three, deliberately, from one list.
+    pub members: Vec<DataSetMember>,
     /// True when a client created it and may delete it again.
     pub deletable: bool,
+}
+
+impl ServedDataSet {
+    /// The member references, in order.
+    pub fn references(&self) -> Vec<String> {
+        self.members.iter().map(|m| m.reference.clone()).collect()
+    }
+
+    /// How many members it has — the length of a report's inclusion bit string.
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Whether it has no members.
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
 }
 
 /// The IED a server serves.
@@ -199,8 +232,8 @@ impl Ied {
         if self.data_sets.contains_key(reference) {
             return Err(Error::InvalidValue("a data set of that name already exists"));
         }
-        let leaves = members.iter().flat_map(|m| self.leaves_of(m)).collect();
-        self.data_sets.insert(String::from(reference), ServedDataSet { reference: String::from(reference), members, leaves, deletable: true });
+        let members = members.into_iter().map(|m| DataSetMember { leaves: self.leaves_of(&m), reference: m }).collect();
+        self.data_sets.insert(String::from(reference), ServedDataSet { reference: String::from(reference), members, deletable: true });
         Ok(())
     }
 
@@ -221,6 +254,15 @@ impl Ied {
         self.values.get(reference)
     }
 
+    /// Read a full MMS reference (`IED1LD0/CSWI1$ST$Pos`) as a value.
+    ///
+    /// The same walk as [`Ied::read`], for the callers that hold one string rather than two —
+    /// a data-set member, a report's included member, a log entry.
+    pub fn read_reference(&self, reference: &str) -> Option<Value> {
+        let (domain, item) = reference.split_once('/')?;
+        self.read(domain, item)
+    }
+
     /// Read a reference as a value: a leaf directly, a structure assembled from its
     /// components in **model order**, which is the order every positional client reads them.
     pub fn read(&self, domain: &str, item: &str) -> Option<Value> {
@@ -238,6 +280,14 @@ impl Ied {
                     members.push(self.read_node(domain, &path, child)?);
                 }
                 Some(Value::Structure(members))
+            }
+            VarKind::Array(n) => {
+                let element = node.element()?;
+                let mut members = Vec::with_capacity(*n as usize);
+                for i in 0..*n {
+                    members.push(self.read_node(domain, &alloc::format!("{item}({i})"), element)?);
+                }
+                Some(Value::Array(members))
             }
         }
     }
@@ -316,6 +366,43 @@ impl Ied {
         self.model.attribute(&parsed)?.type_id.clone()
     }
 
+    /// The ordinal an enumeration name has at `reference`, according to **the file**.
+    ///
+    /// An `Enum` attribute names an SCL `EnumType`, and that type says which number each name
+    /// is. Service tracking needs exactly this: IEC 61850-7-2 gives the `serviceType` and
+    /// `errorCode` names ✅ and IEC 61850-8-1 gives the numbers, behind the paywall (R2), so
+    /// asking the file is the only way to answer without inventing one — and a file that has
+    /// answered must win, or the server and its own engineering document disagree.
+    pub fn enum_ordinal(&self, reference: &str, name: &str) -> Option<i64> {
+        let type_id = self.attribute_type_id(reference)?;
+        self.model.enum_type(&type_id)?.ord(name)
+    }
+
+    /// Whether a **client** may write `reference`, and the `DataAccessError` when it may not.
+    ///
+    /// Two rules, because there are two kinds of name. Inside a control block the answer is a
+    /// per-attribute table — `RptEna` is a client's to set and `SqNum` is the server's to
+    /// count — and everywhere else it is the functional constraint
+    /// ([`Fc::is_client_writable`]). Neither applies to the **application** behind the
+    /// server: it writes process data through [`Ied::write_leaf`], which is what a
+    /// [`Txn`](crate::server::Txn) does, and is the only path that may touch `ST` and `MX`.
+    pub fn client_write_allowed(&self, reference: &str) -> core::result::Result<(), i64> {
+        if let Some((block, attribute)) = reference.rsplit_once(tree::SEP) {
+            if let Some(b) = self.block(block) {
+                return if writable_block_attribute(b.kind, attribute) { Ok(()) } else { Err(DATA_ACCESS_DENIED) };
+            }
+        }
+        match self.node_at(reference) {
+            Some(node) => match node.fc {
+                Some(fc) if fc.is_client_writable() => Ok(()),
+                // A node with no functional constraint is a logical node, which is not a
+                // value at all.
+                _ => Err(DATA_ACCESS_DENIED),
+            },
+            None => Err(DATA_ACCESS_NON_EXISTENT),
+        }
+    }
+
     /// The tree node a full MMS reference denotes.
     pub fn node_at(&self, reference: &str) -> Option<&Variable> {
         let (domain, item) = reference.split_once('/')?;
@@ -335,8 +422,8 @@ impl Ied {
     /// Every leaf reference a data-set member covers, in namespace order.
     ///
     /// A member that names a data object (`IED1LD0/PTRC1$ST$Tr`) covers every attribute under
-    /// it, which is ordinary engineering and is why the inclusion bit string of a report is
-    /// not one bit per *member*.
+    /// it, which is ordinary engineering. The leaves are what a *trigger* is evaluated
+    /// against; the member is what is reported ([`DataSetMember`]).
     pub fn leaves_of(&self, reference: &str) -> Vec<String> {
         let Some((domain, item)) = reference.split_once('/') else { return Vec::new() };
         let Some(node) = self.domain(domain).and_then(|d| d.resolve(item)) else { return Vec::new() };
@@ -391,9 +478,15 @@ impl Ied {
             }
         }
         for (reference, ld_name, ds) in sets {
-            let members: Vec<String> = ds.members.iter().map(|m| self.model.fcda_reference(&ld_name, m)).collect();
-            let leaves = members.iter().flat_map(|m| self.leaves_of(m)).collect();
-            self.data_sets.insert(reference.clone(), ServedDataSet { reference, members, leaves, deletable: false });
+            let members: Vec<DataSetMember> = ds
+                .members
+                .iter()
+                .map(|m| {
+                    let reference = self.model.fcda_reference(&ld_name, m);
+                    DataSetMember { leaves: self.leaves_of(&reference), reference }
+                })
+                .collect();
+            self.data_sets.insert(reference.clone(), ServedDataSet { reference, members, deletable: false });
         }
     }
 
@@ -425,12 +518,50 @@ impl Ied {
                         writes.push((alloc::format!("{base}${attribute}"), value));
                     }
                 }
+                // The publisher control blocks are engineered in the file too, and a client
+                // that reads one should see what the file says rather than a block of zeros.
+                for gcb in &ln.gse_controls {
+                    let base = alloc::format!("{}/{}$GO${}", ld.name, ln.name, gcb.name);
+                    for (attribute, value) in gocb_defaults(gcb, &base, &ld.name, &ln.name) {
+                        writes.push((alloc::format!("{base}${attribute}"), value));
+                    }
+                }
+                for scb in &ln.smv_controls {
+                    let base = alloc::format!("{}/{}${}${}", ld.name, ln.name, svcb_fc(scb.multicast).as_str(), scb.name);
+                    for (attribute, value) in svcb_defaults(scb, &ld.name, &ln.name) {
+                        writes.push((alloc::format!("{base}${attribute}"), value));
+                    }
+                }
             }
         }
         for (reference, value) in writes {
             self.values.insert(reference, value);
         }
         self.dirty.clear();
+    }
+}
+
+/// Whether a client may write `attribute` of a control block of this kind.
+///
+/// The tables are IEC 61850-7-2's: what a client *configures* against what the server
+/// *counts*. `SqNum`, `ConfRev`, `TimeOfEntry`, `BufOvfl` and `Owner` are the server's own
+/// bookkeeping, and a client that could write them could make a report claim a sequence
+/// number it never sent. `EntryID` is the exception that proves the rule — it is writable,
+/// because writing it is how a client says where to resume (§17.2).
+pub fn writable_block_attribute(kind: BlockKind, attribute: &str) -> bool {
+    match kind {
+        // IEC 61850-7-2 Tables 25 (URCB) and 27 (BRCB).
+        BlockKind::Unbuffered | BlockKind::Buffered => {
+            matches!(attribute, "RptID" | "RptEna" | "Resv" | "ResvTms" | "DatSet" | "OptFlds" | "BufTm" | "TrgOps" | "IntgPd" | "GI" | "PurgeBuf" | "EntryID")
+        }
+        // Table 29 (LCB): the four `Old*`/`New*` attributes and `LogRef` are the log's state.
+        BlockKind::Log => matches!(attribute, "LogEna" | "DatSet" | "TrgOps" | "IntgPd"),
+        // §11: `NumOfSG` is the device's and `LActTm` records the last activation.
+        BlockKind::SettingGroup => matches!(attribute, "ActSG" | "EditSG" | "CnfEdit" | "ResvTms"),
+        // §18/§19: only the enable flag. Everything else describes a stream that is
+        // engineered in the SCL file, and changing it at runtime would make the file a lie.
+        BlockKind::Goose => attribute == "GoEna",
+        BlockKind::SampledValue => attribute == "SvEna",
     }
 }
 
@@ -442,6 +573,13 @@ pub const DATA_ACCESS_TYPE_INCONSISTENT: i64 = 7;
 pub const DATA_ACCESS_DENIED: i64 = 3;
 /// `object-value-invalid`.
 pub const DATA_ACCESS_VALUE_INVALID: i64 = 11;
+/// `object-access-unsupported` — the object exists and the *way* it was asked for does not.
+///
+/// What a selection this server cannot serve gets: an `alternateAccess` naming a range of
+/// array elements or all of them names several values where one `AccessResult` holds one.
+/// Answering with the whole array instead would be a different answer to a different
+/// question, with nothing on the wire to say the question had changed.
+pub const DATA_ACCESS_UNSUPPORTED: i64 = 9;
 
 fn or_bits(a: TrgOps, b: TrgOps) -> Vec<u8> {
     let (_, mut left) = a.to_bit_string();
@@ -465,6 +603,15 @@ fn collect_leaves(domain: &str, item: &str, node: &Variable, out: &mut Vec<Strin
                 collect_leaves(domain, &alloc::format!("{item}{}{}", tree::SEP, child.name), child, out);
             }
         }
+        // Every element of an array is its own set of leaves, under the index the reference
+        // syntax spells: one store, addressed the way a client writes it.
+        VarKind::Array(n) => {
+            if let Some(element) = node.element() {
+                for i in 0..n {
+                    collect_leaves(domain, &alloc::format!("{item}({i})"), element, out);
+                }
+            }
+        }
     }
 }
 
@@ -474,6 +621,13 @@ fn seed_node(domain: &str, item: &str, node: &Variable, out: &mut Vec<(String, V
         VarKind::Structure => {
             for child in &node.children {
                 seed_node(domain, &alloc::format!("{item}{}{}", tree::SEP, child.name), child, out);
+            }
+        }
+        VarKind::Array(n) => {
+            if let Some(element) = node.element() {
+                for i in 0..*n {
+                    seed_node(domain, &alloc::format!("{item}({i})"), element, out);
+                }
             }
         }
     }
@@ -548,10 +702,14 @@ pub fn default_value(btype: &BType) -> Value {
         BType::Dbpos | BType::Tcmd | BType::Check => Value::BitString { unused: 6, bytes: alloc::vec![0] },
         BType::TrgOps => TrgOps::NONE.to_value(),
         BType::OptFlds => OptFlds::NONE.to_value(),
-        BType::SvOptFlds => Value::BitString { unused: 5, bytes: alloc::vec![0] },
+        BType::SvOptFlds | BType::LogOptFlds => Value::BitString { unused: 0, bytes: alloc::vec![0] },
         BType::Timestamp => Value::UtcTime(UtcTime::default()),
         BType::EntryTime => Value::BinaryTime(EntryTime::default().to_octets().to_vec()),
         BType::Octet64 | BType::EntryID | BType::PhyComAddr => Value::OctetString(Vec::new()),
+        // Exactly six and exactly sixteen octets, so the default is the field's own width
+        // rather than an empty string a peer would read as a missing address.
+        BType::Octet6 => Value::OctetString(alloc::vec![0; 6]),
+        BType::Octet16 => Value::OctetString(alloc::vec![0; 16]),
         BType::Unicode255 => Value::MmsString(String::new()),
         BType::Struct | BType::Other(_) => Value::Structure(Vec::new()),
         _ => Value::VisibleString(String::new()),
@@ -571,12 +729,12 @@ pub fn accepts(btype: &BType, value: &Value) -> bool {
         }
         BType::Int8U | BType::Int16U | BType::Int24U | BType::Int32U => matches!(value, Value::Integer(_) | Value::Unsigned(_)),
         BType::Float32 | BType::Float64 => matches!(value, Value::Float32(_) | Value::Float64(_)),
-        BType::Quality | BType::Dbpos | BType::Tcmd | BType::Check | BType::TrgOps | BType::OptFlds | BType::SvOptFlds => {
+        BType::Quality | BType::Dbpos | BType::Tcmd | BType::Check | BType::TrgOps | BType::OptFlds | BType::SvOptFlds | BType::LogOptFlds => {
             matches!(value, Value::BitString { .. })
         }
         BType::Timestamp => matches!(value, Value::UtcTime(_)),
         BType::EntryTime => matches!(value, Value::BinaryTime(_)),
-        BType::Octet64 | BType::EntryID | BType::PhyComAddr => matches!(value, Value::OctetString(_)),
+        BType::Octet64 | BType::EntryID | BType::PhyComAddr | BType::Octet6 | BType::Octet16 => matches!(value, Value::OctetString(_)),
         BType::Unicode255 => matches!(value, Value::MmsString(_) | Value::VisibleString(_)),
         BType::Struct | BType::Other(_) => matches!(value, Value::Structure(_)),
         _ => matches!(value, Value::VisibleString(_) | Value::MmsString(_)),
@@ -647,28 +805,63 @@ pub fn sgcb_components() -> Vec<(&'static str, BType)> {
     ]
 }
 
-/// The components of a GOOSE control block (IEC 61850-8-1 Table 32).
-fn gocb_components() -> Vec<(&'static str, BType)> {
+/// The components of a GOOSE control block, in order.
+///
+/// Nine of them, and the last four are the ones a short version leaves out: `DstAddress` is
+/// the `PhyComAddr` structure the block publishes to, `MinTime`/`MaxTime` are the
+/// retransmission curve, and `FixedOffs` says whether the frames are fixed-length encoded.
+/// A client that reads the block **positionally** — and Edition 1 clients do — reads every
+/// field after a missing one at the wrong offset, so the set is the whole set 🌐
+/// (libiec61850 `mms_goose.c`, `createMmsGooseControlBlock`).
+fn gocb_components(fc: Fc) -> Vec<Variable> {
     alloc::vec![
-        ("GoEna", BType::Boolean),
-        ("GoID", BType::VisString129),
-        ("DatSet", BType::VisString129),
-        ("ConfRev", BType::Int32U),
-        ("NdsCom", BType::Boolean),
+        Variable::leaf("GoEna", Some(fc), BType::Boolean),
+        Variable::leaf("GoID", Some(fc), BType::VisString129),
+        Variable::leaf("DatSet", Some(fc), BType::VisString129),
+        Variable::leaf("ConfRev", Some(fc), BType::Int32U),
+        Variable::leaf("NdsCom", Some(fc), BType::Boolean),
+        tree::phy_com_addr("DstAddress", Some(fc)),
+        Variable::leaf("MinTime", Some(fc), BType::Int32U),
+        Variable::leaf("MaxTime", Some(fc), BType::Int32U),
+        Variable::leaf("FixedOffs", Some(fc), BType::Boolean),
     ]
 }
 
-/// The components of a sampled-value control block (IEC 61850-8-1 Table 35).
-fn msvcb_components() -> Vec<(&'static str, BType)> {
-    alloc::vec![
-        ("SvEna", BType::Boolean),
-        ("MsvID", BType::VisString129),
-        ("DatSet", BType::VisString129),
-        ("ConfRev", BType::Int32U),
-        ("SmpRate", BType::Int16U),
-        ("SmpMod", BType::Int8U),
-        ("NoASDU", BType::Int16U),
-    ]
+/// The components of a sampled-value control block, in order 🌐 (libiec61850 `mms_sv.c`,
+/// `createSVControlBlock`).
+///
+/// Two blocks, not one. IEC 61850-7-2 §12 gives a **multicast** stream an `MSVCB` under `MS`
+/// and a **unicast** one a `USVCB` under `US`, and the difference is not only the constraint:
+/// the identifier is `MsvID` in one and `UsvID` in the other, and `noASDU` — how many ASDUs
+/// one frame carries — is a multicast concept the unicast block does not have. SCL says which
+/// with `SampledValueControl/@multicast`, and a server that publishes every block as an
+/// `MSVCB` answers a client that asked for `UsvID` with `object-non-existent` while offering
+/// it a field its block cannot have.
+///
+/// `noASDU` is spelt with a small `n`, which is what the standard's attribute name is and
+/// what a client asks for by name.
+fn svcb_components(multicast: bool) -> Vec<Variable> {
+    let fc = svcb_fc(multicast);
+    let mut out = alloc::vec![
+        Variable::leaf("SvEna", Some(fc), BType::Boolean),
+        Variable::leaf(if multicast { "MsvID" } else { "UsvID" }, Some(fc), BType::VisString129),
+        Variable::leaf("DatSet", Some(fc), BType::VisString129),
+        Variable::leaf("ConfRev", Some(fc), BType::Int32U),
+        Variable::leaf("SmpRate", Some(fc), BType::Int32U),
+        Variable::leaf("OptFlds", Some(fc), BType::SvOptFlds),
+        // `smpMod` is an enumeration, which the 8-1 mapping makes an eight-bit INTEGER.
+        Variable::leaf("SmpMod", Some(fc), BType::Enum),
+        tree::phy_com_addr("DstAddress", Some(fc)),
+    ];
+    if multicast {
+        out.push(Variable::leaf("noASDU", Some(fc), BType::Int32U));
+    }
+    out
+}
+
+/// The functional constraint a sampled-value control block lives under.
+const fn svcb_fc(multicast: bool) -> Fc {
+    if multicast { Fc::MS } else { Fc::US }
 }
 
 fn rcb_defaults(rcb: &ReportControl, base: &str, data_set: Option<&str>, edition: Edition) -> Vec<(&'static str, Value)> {
@@ -708,6 +901,62 @@ fn rcb_defaults(rcb: &ReportControl, base: &str, data_set: Option<&str>, edition
     out
 }
 
+/// The engineered values of a GOOSE control block, from the `GSEControl` and the `GSE`
+/// address the `Communication` section gives it.
+///
+/// A block with no address in the file publishes nothing, and its `DstAddress` stays the
+/// zeros the tree seeded — which is the honest answer to "where does this go?" for a file
+/// that does not say.
+fn gocb_defaults(gcb: &crate::model::GseControl, base: &str, ld: &str, ln: &str) -> Vec<(String, Value)> {
+    let mut out = alloc::vec![
+        (String::from("GoEna"), Value::Boolean(false)),
+        // `GoID` defaults to the control block's own reference, exactly as a report control
+        // block's `RptID` does (IEC 61850-7-2 §18.2.1).
+        (String::from("GoID"), Value::VisibleString(gcb.go_id.clone().unwrap_or_else(|| String::from(base)))),
+        (String::from("DatSet"), Value::VisibleString(gcb.dat_set.as_ref().map_or_else(String::new, |d| alloc::format!("{ld}/{ln}${d}")))),
+        (String::from("ConfRev"), Value::Unsigned(u64::from(gcb.conf_rev))),
+        (String::from("NdsCom"), Value::Boolean(false)),
+        (String::from("FixedOffs"), Value::Boolean(gcb.fixed_offs)),
+    ];
+    if let Some(a) = &gcb.address {
+        out.push((String::from("DstAddress$Addr"), Value::OctetString(a.mac.0.to_vec())));
+        out.push((String::from("DstAddress$PRIORITY"), Value::Unsigned(u64::from(a.vlan_priority))));
+        out.push((String::from("DstAddress$VID"), Value::Unsigned(u64::from(a.vlan_id))));
+        out.push((String::from("DstAddress$APPID"), Value::Unsigned(u64::from(a.appid))));
+        out.push((String::from("MinTime"), Value::Unsigned(u64::from(a.min_time_ms.unwrap_or(0)))));
+        out.push((String::from("MaxTime"), Value::Unsigned(u64::from(a.max_time_ms.unwrap_or(0)))));
+    }
+    out
+}
+
+/// The engineered values of a sampled-value control block, from the `SampledValueControl` and
+/// its `SMV` address.
+fn svcb_defaults(scb: &crate::model::SmvControl, ld: &str, ln: &str) -> Vec<(String, Value)> {
+    let smp_mod = match scb.smp_mod.as_str() {
+        "SmpPerSec" => 1,
+        "SecPerSmp" => 2,
+        _ => 0,
+    };
+    let mut out = alloc::vec![
+        (String::from("SvEna"), Value::Boolean(false)),
+        (String::from(if scb.multicast { "MsvID" } else { "UsvID" }), Value::VisibleString(scb.smv_id.clone())),
+        (String::from("DatSet"), Value::VisibleString(scb.dat_set.as_ref().map_or_else(String::new, |d| alloc::format!("{ld}/{ln}${d}")))),
+        (String::from("ConfRev"), Value::Unsigned(u64::from(scb.conf_rev))),
+        (String::from("SmpRate"), Value::Unsigned(u64::from(scb.smp_rate))),
+        (String::from("SmpMod"), Value::Integer(smp_mod)),
+    ];
+    if scb.multicast {
+        out.push((String::from("noASDU"), Value::Unsigned(u64::from(scb.nof_asdu))));
+    }
+    if let Some(a) = &scb.address {
+        out.push((String::from("DstAddress$Addr"), Value::OctetString(a.mac.0.to_vec())));
+        out.push((String::from("DstAddress$PRIORITY"), Value::Unsigned(u64::from(a.vlan_priority))));
+        out.push((String::from("DstAddress$VID"), Value::Unsigned(u64::from(a.vlan_id))));
+        out.push((String::from("DstAddress$APPID"), Value::Unsigned(u64::from(a.appid))));
+    }
+    out
+}
+
 fn lcb_defaults(lcb: &crate::model::LogControl, log: &str, ld: &crate::model::LogicalDevice, ln: &LogicalNode) -> Vec<(&'static str, Value)> {
     let data_set = lcb.dat_set.as_ref().map_or_else(String::new, |d| alloc::format!("{}/{}${d}", ld.name, ln.name));
     alloc::vec![
@@ -734,11 +983,15 @@ fn sgcb_defaults(sg: crate::model::SettingControl) -> Vec<(&'static str, Value)>
     ]
 }
 
+/// A `(name, bType)` component list as the tree's leaves.
+fn leaves(fc: Fc, components: &[(&'static str, BType)]) -> Vec<Variable> {
+    components.iter().map(|(n, b)| Variable::leaf(*n, Some(fc), b.clone())).collect()
+}
+
 /// The control-block variables of one logical node, and the [`Block`] record for each.
 fn control_blocks(ld_name: &str, ln: &LogicalNode, edition: Edition, found: &mut Vec<Block>) -> Vec<(Fc, Variable)> {
     let mut out = Vec::new();
-    let mut add = |fc: Fc, name: String, kind: BlockKind, components: Vec<(&'static str, BType)>, data_set: Option<String>, out: &mut Vec<(Fc, Variable)>| {
-        let children = components.into_iter().map(|(n, b)| Variable::leaf(n, Some(fc), b)).collect();
+    let mut add = |fc: Fc, name: String, kind: BlockKind, children: Vec<Variable>, data_set: Option<String>, out: &mut Vec<(Fc, Variable)>| {
         found.push(Block {
             reference: alloc::format!("{ld_name}/{}${}${name}", ln.name, fc.as_str()),
             domain: String::from(ld_name),
@@ -755,23 +1008,23 @@ fn control_blocks(ld_name: &str, ln: &LogicalNode, edition: Edition, found: &mut
         let kind = if rcb.buffered { BlockKind::Buffered } else { BlockKind::Unbuffered };
         let data_set = rcb.dat_set.as_ref().map(|d| alloc::format!("{ld_name}/{}${d}", ln.name));
         for name in rcb.instance_names() {
-            add(fc, name, kind, rcb_components(rcb.buffered, edition), data_set.clone(), &mut out);
+            add(fc, name, kind, leaves(fc, &rcb_components(rcb.buffered, edition)), data_set.clone(), &mut out);
         }
     }
     for lcb in &ln.log_controls {
         let data_set = lcb.dat_set.as_ref().map(|d| alloc::format!("{ld_name}/{}${d}", ln.name));
-        add(Fc::LG, lcb.name.clone(), BlockKind::Log, lcb_components(), data_set, &mut out);
+        add(Fc::LG, lcb.name.clone(), BlockKind::Log, leaves(Fc::LG, &lcb_components()), data_set, &mut out);
     }
     for gcb in &ln.gse_controls {
         let data_set = gcb.dat_set.as_ref().map(|d| alloc::format!("{ld_name}/{}${d}", ln.name));
-        add(Fc::GO, gcb.name.clone(), BlockKind::Goose, gocb_components(), data_set, &mut out);
+        add(Fc::GO, gcb.name.clone(), BlockKind::Goose, gocb_components(Fc::GO), data_set, &mut out);
     }
     for scb in &ln.smv_controls {
         let data_set = scb.dat_set.as_ref().map(|d| alloc::format!("{ld_name}/{}${d}", ln.name));
-        add(Fc::MS, scb.name.clone(), BlockKind::SampledValue, msvcb_components(), data_set, &mut out);
+        add(svcb_fc(scb.multicast), scb.name.clone(), BlockKind::SampledValue, svcb_components(scb.multicast), data_set, &mut out);
     }
     if ln.setting_control.is_some() {
-        add(Fc::SP, String::from("SGCB"), BlockKind::SettingGroup, sgcb_components(), None, &mut out);
+        add(Fc::SP, String::from("SGCB"), BlockKind::SettingGroup, leaves(Fc::SP, &sgcb_components()), None, &mut out);
     }
     out
 }

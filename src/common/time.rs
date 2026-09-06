@@ -120,6 +120,13 @@ pub struct EntryTime {
 const MMS_EPOCH_DAYS: u64 = 5113;
 
 impl EntryTime {
+    /// The last moment a six-octet `EntryTime` can express: 2163-04-24, end of day.
+    ///
+    /// The field has no "no upper bound", and neither has the ACSI `QueryLogByTime`, whose
+    /// range is two times and not one. A caller that wants everything from a moment onward
+    /// asks for everything up to here.
+    pub const MAX: EntryTime = EntryTime { millis_of_day: 86_399_999, days_since_1984: u16::MAX };
+
     /// The six wire octets.
     pub const fn to_octets(self) -> [u8; 6] {
         let ms = self.millis_of_day.to_be_bytes();
