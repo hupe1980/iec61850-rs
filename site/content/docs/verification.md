@@ -108,6 +108,19 @@ That includes checks we did not write: Wireshark flags a frame whose header simu
 disagrees with the PDU's own field, and it knows the GOOSE and Sampled Values ASN.1 modules
 independently of us.
 
+**"No malformed marker" is the weak half of the rule.** The strong half is that every field
+dissects back to the value we put in. A sampled-value publisher writes `smpCnt`, `confRev` and
+`smpSynch` at fixed widths so a template patch cannot shift a length, but a BER INTEGER is
+*signed*: `smpSynch` is `0..254` and 5–254 name a local-area clock, so 200 in a single octet is
+**−56**, and a 96 kHz stream's `smpCnt` of 65 535 in two octets is **−1**. Both dissect with no
+malformed marker, and this crate's own reader reads both back correctly — only a third party's
+dissector says otherwise. So the fields widen by one octet when a value would go negative, and
+the oracle tests walk each field's *declared range* rather than the typical values.
+
+The general form: **a value both ends of this suite merely agree on is not evidence.** A
+report's `TimeOfEntry` is asserted against a clock the test pins, not against the other half of
+the crate.
+
 An oracle needs its own version floor. Wireshark up to 4.2.2 — which is what Ubuntu 24.04
 ships — asserts `recursion_depth <= 100` on a *legitimate* GOOSE message and marks it
 malformed ([wireshark#19580], fixed in 4.2.3), so an older dissector fails correct frames.
@@ -168,11 +181,13 @@ same thing. A report has no tags — which field the third value is depends enti
 `OptFlds` — so a fixed-point property is the only automatic way to catch one being read at the
 wrong offset.
 
-The fixed-point requirement earns its place. It found a `Confirmed-ErrorPDU` whose optional
-`modifierPosition` field was skipped *by position* rather than matched by tag — so a PDU whose
-service error happened to carry that tag decoded fine and then re-encoded into something that
-would not decode at all. No capture contains that PDU, and no hand-written test would have
-thought to build it.
+The fixed-point requirement earns its place. It has found three defects no capture contains: a
+`Confirmed-ErrorPDU` whose optional `modifierPosition` was skipped *by position* rather than
+matched by tag; a `reject-PDU` reason read from a **constructed** `[0]`, the tag that means
+`originalInvokeID`; and a confirmed request with a **negative `invokeID`**, which is
+`Unsigned32` and which the server's answer has to name. The last two are one lesson from
+opposite ends: a range the wire declares is a range the *decoder* has to enforce, because
+everything downstream is written assuming it holds.
 
 **A crashing input stops being an artifact once the bug is fixed.** `cargo fuzz` writes one to
 `fuzz/artifacts/<target>/crash-<hash>`: gitignored, hash-named, and gone the moment someone

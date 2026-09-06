@@ -100,10 +100,79 @@ The report engine is a state machine per control block, and most of it is rules 
 `GI` and the integrity period both report every member of the data set; what differs is the
 reason code each carries, and a client acts on the difference.
 
+A report leaves as an MMS `InformationReport` under the VMD-specific name **`RPT`** — every
+IEC 61850 report does, and what says which subscription it belongs to is the `RptID` inside it.
+So `rptID` in the SCD can be any string you like without breaking the encoding.
+
 One trap the server handles for you: SCL's `bufOvfl` attribute **defaults to true**, but
 `BufOvfl` and `EntryID` exist only on a buffered block. An ordinary `<OptFields/>` on an
 unbuffered one therefore asks for fields that block cannot have; the server clears them, and a
 client that reads `OptFlds` back sees what the block will actually send.
+
+## Editions
+
+An IED's edition is a property of the *server*, and the server reads it off its own file — the
+SCL schema version says which: `2003` is Edition 1, `2007A`/`2007B` up to release 3 is
+Edition 2, `2007B4` and later is Edition 2.1.
+
+It decides the report control block's attribute set. `ResvTms` and `Owner` arrived with
+Edition 2, so an Edition 1 file serves a block without them:
+
+```text
+Ed 2.1  RptID RptEna Resv DatSet ConfRev OptFlds BufTm SqNum TrgOps IntgPd GI Owner
+Ed 1    RptID RptEna Resv DatSet ConfRev OptFlds BufTm SqNum TrgOps IntgPd GI
+```
+
+That is not cosmetic: publishing `Owner` on an Edition 1 server claims a reservation service
+it does not have, and a client that reads the block positionally then reads every field after
+it at the wrong offset.
+
+```bash
+$ ied sim valid2003.scd
+IED1 on 127.0.0.1:102 — Edition 1 — logical device(s) IED1CircuitBreaker_CB1, IED1Disconnectors
+```
+
+`--edition 1|2|2.1` overrides the file, and `Ied::with_edition` does the same in code — for a
+device whose certificate says one thing and whose file says another.
+
+## Saying no
+
+There are two ways to refuse, and a client acts on the difference.
+
+A **service error** answers a service that ran and failed — the object does not exist, access
+was denied, the value was the wrong type. A **reject** answers a PDU there was no service in:
+an unrecognised service, an argument that did not decode, or octets that are not a request at
+all. The server sends `confirmed-requestPDU: unrecognized-service` for the first and
+`pdu-error: invalid-pdu` for the second, which is what libiec61850's server does and what
+ISO 9506 prescribes.
+
+The distinction tells a client whether asking again could ever work. A reject answers the
+request it names, so on the client side it arrives as `Error::Rejected` immediately rather
+than after the request timeout.
+
+## The clock
+
+Two different clocks run inside the server and they answer different questions.
+
+A **monotonic** instant drives every timer — a `BufTm` gathering window, an integrity period,
+a select-before-operate timeout, a request deadline. It carries no date, and it must not: its
+origin is arbitrary.
+
+An **absolute** time is what a report's `TimeOfEntry`, a log entry and an `SGCB`'s `LActTm`
+carry, and what a `QueryLogByTime` compares against. That comes from a `Clock`:
+
+```rust
+use iec61850_rs::common::{Clock, UtcTime};
+
+// The default is the system clock. Replace it to pin time in a test, or to report the
+// real time quality from a PTP- or SNTP-disciplined source.
+server.set_clock(Box::new(my_disciplined_clock));
+```
+
+Deriving the second from the first hides well: both halves of a test agree, because both read
+the same wrong number. It puts every `TimeOfEntry` at 1984-01-01 — the floor of the
+`BinaryTime` epoch — and makes `QueryLogByTime` match nothing. Only an assertion against a
+*pinned* clock catches it.
 
 ## Controls
 
@@ -122,6 +191,16 @@ server.on_control(Box::new(|event| match event.stage {
 Without a hook every command is accepted and applied to the object's `stVal` — which is what a
 simulator wants, and what makes `ied sim` a working IED. With one, the hook is where the device
 says *no*, and the `AddCause` it returns is what the client is told.
+
+**Time-activated operate** (`operTm`) is a fourth thing the state machine does. An `Oper`
+whose `operTm` is in the future is *armed* rather than run: the write succeeds, the command
+waits, and the `CommandTermination` arrives when it actually runs — which is what the client is
+waiting for anyway. The hook is asked again at that moment, not at acceptance, because an
+interlock that has closed in the meantime is precisely what a time-activated command is for.
+`Cancel` withdraws one, and so does the association ending: a command nobody is left to tell
+about must not run. The wait is computed once, at acceptance, from the difference between
+`operTm` and the wall clock — after that it is a monotonic deadline, because a wall clock that
+steps must not move a breaker.
 
 Three rules the server enforces, each a way a real substation refuses a command:
 
@@ -166,7 +245,24 @@ because a symlink inside the root defeats every textual check. A path that fails
 exist": telling a client which is which is how a filesystem gets mapped. The store is read-only
 unless you call `.writable()`.
 
-Implement `FileStore` yourself to serve records out of a database, a ring buffer or an archive.
+Files are read in **ranges**, never whole. `FileStore` is `info` plus
+`read_at(path, offset, len)`, so a `FileOpen` costs a path and two integers and a `FileRead`
+costs one chunk, whatever the record's size. A client picks both how many handles to open and
+which file each names, so a store that read the whole file into the handle would make the
+server's memory `handles × associations × file size` — on the one service that exists to move
+hundred-megabyte records. Opening a 4 MiB record allocates 518 octets, and the test suite holds
+it to that number.
+
+Implement `FileStore` yourself to serve records out of a database, a ring buffer or an archive:
+
+```rust
+impl FileStore for MyArchive {
+    fn list(&self, spec: Option<&str>) -> Vec<FileInfo> { … }
+    fn info(&self, path: &str) -> Option<FileInfo> { … }
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Option<Vec<u8>> { … }
+}
+```
+
 The default is `NoFiles`: an IED with no files should say so rather than expose a filesystem by
 accident.
 
@@ -177,6 +273,14 @@ the *same code* evaluates them, so a log and a report configured alike cannot di
 entry survives the client not being there. The control block tracks `OldEnt`/`NewEnt` so a
 client with no stored position knows where to start, and `OldEnt` moving is how one that has
 been away learns its resume point is gone.
+
+## Driving it yourself
+
+`Server::run` is an accept loop with a thread per association, and it handles the timers for
+you. If you drive `Acsi` directly — sans-IO, no socket — `next_timeout` is the one call to get
+right: it reports the earliest of a report's gathering window, an integrity period, a
+select-before-operate expiry and a time-activated command. An event loop that sleeps past any
+of them is a report that arrives late and a breaker that does not move.
 
 ## Layers
 
@@ -194,8 +298,8 @@ with no socket, no client and no byte on a wire:
 
 Service tracking. `ObtainFile`/`SetFile`. A durable log store — the current one is bounded and
 in memory, which is right for a simulator and wrong for a device that must survive a restart.
-Edition modes: `Edition` drives the object-reference limit but not yet the server's attribute
-sets. TLS underneath (IEC 62351-3). Wiring `GoEna` to an actual GOOSE publisher, which waits
+Edition: the attribute sets and the object-reference limit follow it, but the enumerations
+that grew between editions (`AddCause`) do not yet. TLS underneath (IEC 62351-3). Wiring `GoEna` to an actual GOOSE publisher, which waits
 for the raw-socket adapters.
 
 And the honest one: everything here is tested against **this crate's own client**

@@ -32,7 +32,7 @@ use core::result::Result;
 
 use super::acsi::AssocId;
 use super::ied::{DATA_ACCESS_DENIED, DATA_ACCESS_VALUE_INVALID, Ied};
-use crate::common::{Fc, Instant, TimeQuality, UtcTime};
+use crate::common::{Fc, Instant, Now, UtcTime};
 use crate::proto::data::Value;
 use crate::proto::mms::control::{AddCause, ControlError, ControlModel, ControlRequest, LastApplError};
 use crate::proto::mms::{AccessResult, Mms, ObjectName, Unconfirmed, VariableAccess, VariableSpecification};
@@ -93,9 +93,27 @@ pub struct Termination {
     pub pdu: Vec<u8>,
 }
 
+/// A command accepted now and due later — IEC 61850-7-2's *time-activated operate*.
+///
+/// `operTm` is an **absolute** time and the deadline is a **monotonic** one, so the wait is
+/// computed once, at acceptance, from the difference between `operTm` and the wall clock then
+/// (D33: the two are different questions and neither may be derived from the other). The
+/// command's own `wall` is kept so the status it eventually writes is stamped with the moment
+/// it was *asked for*, which is what an operator reconstructing a sequence needs.
+#[derive(Clone, Debug)]
+struct Timed {
+    assoc: AssocId,
+    object: String,
+    request: ControlRequest,
+    model: ControlModel,
+    due: Instant,
+}
+
 /// The control state machine over every controllable object of an [`Ied`].
 pub struct Controls {
     selections: BTreeMap<String, Selection>,
+    /// Commands accepted with an `operTm` in the future, in the order they fall due.
+    timed: Vec<Timed>,
     hook: Option<ControlHook>,
     sbo_timeout_ms: u64,
     pending: Vec<Termination>,
@@ -107,6 +125,7 @@ impl core::fmt::Debug for Controls {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Controls")
             .field("selections", &self.selections.len())
+            .field("timed", &self.timed.len())
             .field("hook", &self.hook.is_some())
             .field("sbo_timeout_ms", &self.sbo_timeout_ms)
             .field("pending", &self.pending.len())
@@ -116,7 +135,7 @@ impl core::fmt::Debug for Controls {
 
 impl Default for Controls {
     fn default() -> Controls {
-        Controls { selections: BTreeMap::new(), hook: None, sbo_timeout_ms: DEFAULT_SBO_TIMEOUT_MS, pending: Vec::new() }
+        Controls { selections: BTreeMap::new(), timed: Vec::new(), hook: None, sbo_timeout_ms: DEFAULT_SBO_TIMEOUT_MS, pending: Vec::new() }
     }
 }
 
@@ -146,11 +165,46 @@ impl Controls {
     /// mid-sequence does not leave a breaker reserved.
     pub fn on_association_closed(&mut self, assoc: AssocId) {
         self.selections.retain(|_, s| s.assoc != assoc);
+        // A command nobody is left to tell about is a command that must not run: an
+        // association that disappears between an `Oper` and its `operTm` takes its
+        // time-activated commands with it.
+        self.timed.retain(|t| t.assoc != assoc);
     }
 
-    /// Expire selections that were never operated.
-    pub fn on_timeout(&mut self, now: Instant) {
+    /// Expire selections that were never operated, and run the commands whose `operTm` has
+    /// arrived.
+    pub fn on_timeout(&mut self, ied: &mut Ied, now: Instant) {
         self.selections.retain(|_, s| now < s.expires);
+        if self.timed.iter().all(|t| now < t.due) {
+            return;
+        }
+        let (due, waiting): (Vec<Timed>, Vec<Timed>) = core::mem::take(&mut self.timed).into_iter().partition(|t| now >= t.due);
+        self.timed = waiting;
+        for t in due {
+            // The hook is asked **now**, not when the command was accepted: an interlock that
+            // has closed in the meantime is exactly what a time-activated operate is for.
+            if let Err(cause) = self.ask(&t.object, Stage::Operate, &t.request, t.model) {
+                let error = LastApplError {
+                    control_object: alloc::format!("{}$Oper", t.object),
+                    error: ControlError::Unknown,
+                    origin: t.request.origin.clone(),
+                    ctl_num: t.request.ctl_num,
+                    add_cause: cause,
+                };
+                self.pending.push(Termination { assoc: t.assoc, pdu: negative(&t.object, &t.request, &error) });
+                continue;
+            }
+            apply(ied, &t.object, &t.request, t.request.t);
+            if t.model.enhanced_security() {
+                self.pending.push(Termination { assoc: t.assoc, pdu: positive(&t.object, &t.request) });
+            }
+        }
+    }
+
+    /// When this layer next needs [`Controls::on_timeout`]: the earliest selection expiry or
+    /// time-activated command, whichever comes first.
+    pub fn next_timeout(&self) -> Option<Instant> {
+        self.selections.values().map(|s| s.expires).chain(self.timed.iter().map(|t| t.due)).min()
     }
 
     /// Whether `reference` is a control attribute this layer owns.
@@ -167,19 +221,19 @@ impl Controls {
     /// The answer is the object's own reference when the selection is granted, and an **empty
     /// string** when it is refused — which is the whole of IEC 61850-8-1's mapping for it, and
     /// is why a client cannot tell *why* a bare `SBO` was refused.
-    pub fn select(&mut self, assoc: AssocId, ied: &Ied, object: &str, now: Instant) -> Value {
+    pub fn select(&mut self, assoc: AssocId, ied: &Ied, object: &str, now: Now) -> Value {
         let model = model_of(ied, object);
         if model != Some(ControlModel::SboNormal) {
             return Value::VisibleString(String::new());
         }
-        if self.held_by_other(object, assoc, now) {
+        if self.held_by_other(object, assoc, now.mono) {
             return Value::VisibleString(String::new());
         }
-        let request = ControlRequest::new(Value::Boolean(false), 0, stamp(now));
+        let request = ControlRequest::new(Value::Boolean(false), 0, now.wall);
         if self.ask(object, Stage::Select, &request, ControlModel::SboNormal).is_err() {
             return Value::VisibleString(String::new());
         }
-        self.selections.insert(String::from(object), Selection { assoc, value: None, ctl_num: 0, expires: now.plus_millis(self.sbo_timeout_ms) });
+        self.selections.insert(String::from(object), Selection { assoc, value: None, ctl_num: 0, expires: now.mono.plus_millis(self.sbo_timeout_ms) });
         Value::VisibleString(String::from(object))
     }
 
@@ -189,17 +243,17 @@ impl Controls {
     /// *accepted* and then fails is not an error here: the write succeeds and the failure
     /// arrives as a negative [`CommandTermination`](crate::proto::mms::control::CommandTermination), which is the whole point of enhanced
     /// security and the case a thin server reports as success.
-    pub fn write(&mut self, assoc: AssocId, ied: &mut Ied, object: &str, attribute: &str, value: &Value, now: Instant) -> Result<(), i64> {
+    pub fn write(&mut self, assoc: AssocId, ied: &mut Ied, object: &str, attribute: &str, value: &Value, now: Now) -> Result<(), i64> {
         let Some(model) = model_of(ied, object) else { return Err(DATA_ACCESS_DENIED) };
         let Ok(request) = ControlRequest::from_value(value) else { return Err(DATA_ACCESS_VALUE_INVALID) };
-        self.on_timeout(now);
+        self.on_timeout(ied, now.mono);
 
         match attribute {
             "SBOw" => {
                 if model != ControlModel::SboEnhanced {
                     return self.refuse(assoc, object, &request, model, Stage::Select, AddCause::NotSupported);
                 }
-                if self.held_by_other(object, assoc, now) {
+                if self.held_by_other(object, assoc, now.mono) {
                     return self.refuse(assoc, object, &request, model, Stage::Select, AddCause::ObjectAlreadySelected);
                 }
                 if let Err(cause) = self.ask(object, Stage::Select, &request, model) {
@@ -207,7 +261,7 @@ impl Controls {
                 }
                 self.selections.insert(
                     String::from(object),
-                    Selection { assoc, value: Some(request.ctl_val.clone()), ctl_num: request.ctl_num, expires: now.plus_millis(self.sbo_timeout_ms) },
+                    Selection { assoc, value: Some(request.ctl_val.clone()), ctl_num: request.ctl_num, expires: now.mono.plus_millis(self.sbo_timeout_ms) },
                 );
                 Ok(())
             }
@@ -215,11 +269,17 @@ impl Controls {
                 if let Err(cause) = self.ask(object, Stage::Cancel, &request, model) {
                     return self.refuse(assoc, object, &request, model, Stage::Cancel, cause);
                 }
+                // `Cancel` withdraws a *pending time-activated command* as well as a
+                // selection — that is the only way to stop one, and a server that cannot is a
+                // server that has armed something it cannot disarm.
+                let had_timed = self.timed.iter().any(|t| t.object == object && t.assoc == assoc);
+                self.timed.retain(|t| !(t.object == object && t.assoc == assoc));
                 match self.selections.get(object) {
                     Some(s) if s.assoc == assoc => {
                         self.selections.remove(object);
                         Ok(())
                     }
+                    _ if had_timed => Ok(()),
                     // Cancelling a selection somebody else holds, or one that does not exist,
                     // is refused rather than silently doing nothing.
                     _ => self.refuse(assoc, object, &request, model, Stage::Cancel, AddCause::ObjectNotSelected),
@@ -230,7 +290,7 @@ impl Controls {
         }
     }
 
-    fn operate(&mut self, assoc: AssocId, ied: &mut Ied, object: &str, request: &ControlRequest, model: ControlModel, now: Instant) -> Result<(), i64> {
+    fn operate(&mut self, assoc: AssocId, ied: &mut Ied, object: &str, request: &ControlRequest, model: ControlModel, now: Now) -> Result<(), i64> {
         if model == ControlModel::StatusOnly {
             return self.refuse(assoc, object, request, model, Stage::Operate, AddCause::NotSupported);
         }
@@ -253,7 +313,23 @@ impl Controls {
             return self.refuse(assoc, object, request, model, Stage::Operate, cause);
         }
         self.selections.remove(object);
-        apply(ied, object, request, now);
+        // Time-activated operate (IEC 61850-7-2 §20): an `operTm` in the future arms the
+        // command rather than running it. The write still succeeds — what the client is
+        // waiting for is the termination, which arrives when the command actually runs.
+        if let Some(at) = request.oper_tm {
+            if let Some(wait) = at.to_unix_nanos().checked_sub(now.wall.to_unix_nanos()).filter(|w| *w > 0) {
+                self.timed.retain(|t| !(t.object == object && t.assoc == assoc));
+                self.timed.push(Timed {
+                    assoc,
+                    object: String::from(object),
+                    request: ControlRequest { t: now.wall, ..request.clone() },
+                    model,
+                    due: now.mono.plus_nanos(wait),
+                });
+                return Ok(());
+            }
+        }
+        apply(ied, object, request, now.wall);
         if model.enhanced_security() {
             // The write succeeded; the *command* is answered by the termination that follows.
             self.pending.push(Termination { assoc, pdu: positive(object, request) });
@@ -321,7 +397,7 @@ fn model_of(ied: &Ied, object: &str) -> Option<ControlModel> {
 /// [`ControlHook`] that drives the switchgear and lets the process report the position back.
 /// Writing the status here rather than in the hook is what makes `ied sim` a working IED with
 /// no code at all.
-fn apply(ied: &mut Ied, object: &str, request: &ControlRequest, now: Instant) {
+fn apply(ied: &mut Ied, object: &str, request: &ControlRequest, wall: UtcTime) {
     let Some((domain, item)) = object.split_once('/') else { return };
     let Some((ln, rest)) = item.split_once('$') else { return };
     let Some(path) = rest.strip_prefix("CO$") else { return };
@@ -330,12 +406,8 @@ fn apply(ied: &mut Ied, object: &str, request: &ControlRequest, now: Instant) {
     // `Dbpos` and reports one, an `SPC` a boolean — so the write goes through the same type
     // check every other write does and is simply dropped when it does not fit.
     let _ = ied.write_leaf(&status, request.ctl_val.clone());
-    let _ = ied.write_leaf(&alloc::format!("{domain}/{ln}$ST${path}$t"), Value::UtcTime(stamp(now)));
+    let _ = ied.write_leaf(&alloc::format!("{domain}/{ln}$ST${path}$t"), Value::UtcTime(wall));
     let _ = Fc::CO;
-}
-
-fn stamp(now: Instant) -> UtcTime {
-    UtcTime::from_unix_nanos(now.0, TimeQuality::UNSYNCHRONIZED)
 }
 
 /// A positive `CommandTermination`: an `InformationReport` naming only the object's `Oper`,

@@ -213,17 +213,17 @@ impl Engine {
     }
 
     /// Fold a batch of changes into every block that reports them, and emit what is due.
-    pub fn commit(&mut self, ied: &mut Ied, dirty: &BTreeMap<String, TrgOps>, now: Instant) -> Vec<Outgoing> {
+    pub fn commit(&mut self, ied: &mut Ied, dirty: &BTreeMap<String, TrgOps>, wall: EntryTime, now: Instant) -> Vec<Outgoing> {
         let references: Vec<String> = self.blocks.keys().cloned().collect();
         for reference in &references {
             self.gather(ied, reference, dirty, now);
         }
-        self.emit_due(ied, now)
+        self.emit_due(ied, wall, now)
     }
 
     /// Time passed: send whatever the gathering window or the integrity period has made due.
-    pub fn on_timeout(&mut self, ied: &mut Ied, now: Instant) -> Vec<Outgoing> {
-        self.emit_due(ied, now)
+    pub fn on_timeout(&mut self, ied: &mut Ied, wall: EntryTime, now: Instant) -> Vec<Outgoing> {
+        self.emit_due(ied, wall, now)
     }
 
     /// When the engine next needs [`Engine::on_timeout`].
@@ -278,7 +278,7 @@ impl Engine {
     }
 
     /// Emit every report whose window has closed or whose integrity period has elapsed.
-    fn emit_due(&mut self, ied: &mut Ied, now: Instant) -> Vec<Outgoing> {
+    fn emit_due(&mut self, ied: &mut Ied, wall: EntryTime, now: Instant) -> Vec<Outgoing> {
         let mut out = Vec::new();
         let references: Vec<String> = self.blocks.keys().cloned().collect();
         for reference in references {
@@ -286,13 +286,13 @@ impl Engine {
             // that one write produces exactly one report.
             let gi = ied.value(&alloc::format!("{reference}$GI")).and_then(bool_of).unwrap_or(false);
             if gi {
-                let _ = ied.write_leaf(&alloc::format!("{reference}$GI"), Value::Boolean(false));
-                if let Some(report) = self.build(ied, &reference, Trigger::GeneralInterrogation, now) {
+                let _ = ied.set_internal(&alloc::format!("{reference}$GI"), Value::Boolean(false));
+                if let Some(report) = self.build(ied, &reference, Trigger::GeneralInterrogation, wall) {
                     out.push(report);
                 }
             }
             if ied.value(&alloc::format!("{reference}$PurgeBuf")).and_then(bool_of).unwrap_or(false) {
-                let _ = ied.write_leaf(&alloc::format!("{reference}$PurgeBuf"), Value::Boolean(false));
+                let _ = ied.set_internal(&alloc::format!("{reference}$PurgeBuf"), Value::Boolean(false));
                 if let Some(rcb) = self.blocks.get_mut(&reference) {
                     rcb.buffer.clear();
                     rcb.overflowed = false;
@@ -307,12 +307,12 @@ impl Engine {
                 if let Some(rcb) = self.blocks.get_mut(&reference) {
                     rcb.integrity_due = (period > 0).then(|| now.plus_millis(u64::from(period)));
                 }
-                if let Some(report) = self.build(ied, &reference, Trigger::Integrity, now) {
+                if let Some(report) = self.build(ied, &reference, Trigger::Integrity, wall) {
                     out.push(report);
                 }
             }
             if due.is_some_and(|d| now >= d) {
-                if let Some(report) = self.build(ied, &reference, Trigger::Change, now) {
+                if let Some(report) = self.build(ied, &reference, Trigger::Change, wall) {
                     out.push(report);
                 }
             }
@@ -321,7 +321,7 @@ impl Engine {
     }
 
     /// Build one report, buffer it if nobody is listening, and encode it if somebody is.
-    fn build(&mut self, ied: &mut Ied, reference: &str, trigger: Trigger, now: Instant) -> Option<Outgoing> {
+    fn build(&mut self, ied: &mut Ied, reference: &str, trigger: Trigger, wall: EntryTime) -> Option<Outgoing> {
         let data_set = ied.value(&alloc::format!("{reference}$DatSet")).and_then(string_of)?;
         let ds = ied.data_set(&data_set)?.clone();
         let opt_flds = ied.value(&alloc::format!("{reference}$OptFlds")).and_then(OptFlds::from_value).unwrap_or(OptFlds::NONE);
@@ -344,7 +344,7 @@ impl Engine {
         }
 
         let values: BTreeMap<String, Value> = reasons.keys().filter_map(|l| ied.value(l).map(|v| (l.clone(), v.clone()))).collect();
-        let entry_time = EntryTime::from_unix_millis(now.0 / 1_000_000);
+        let entry_time = wall;
 
         let rcb = self.blocks.get_mut(reference)?;
         let entry_id = rcb.next_entry;
@@ -368,10 +368,10 @@ impl Engine {
         let seq_reference = alloc::format!("{reference}$SqNum");
         let seq = ied.value(&seq_reference).and_then(unsigned_of).unwrap_or(0);
         let next_seq = if buffered { u64::from(seq.wrapping_add(1)) % 0x1_0000 } else { u64::from(seq.wrapping_add(1)) % 0x100 };
-        let _ = ied.write_leaf(&seq_reference, Value::Unsigned(next_seq));
+        let _ = ied.set_internal(&seq_reference, Value::Unsigned(next_seq));
         if buffered {
-            let _ = ied.write_leaf(&alloc::format!("{reference}$EntryID"), Value::OctetString(entry_id.to_be_bytes().to_vec()));
-            let _ = ied.write_leaf(&alloc::format!("{reference}$TimeOfEntry"), Value::BinaryTime(entry_time.to_octets().to_vec()));
+            let _ = ied.set_internal(&alloc::format!("{reference}$EntryID"), Value::OctetString(entry_id.to_be_bytes().to_vec()));
+            let _ = ied.set_internal(&alloc::format!("{reference}$TimeOfEntry"), Value::BinaryTime(entry_time.to_octets().to_vec()));
         }
 
         let report = assemble(
@@ -382,10 +382,7 @@ impl Engine {
             &values,
             &ReportHeader { seq_num: next_seq as u32, entry_time, data_set: data_set.clone(), conf_rev, entry_id, buffered, overflowed },
         );
-        let pdu = encode(&report, &data_set).ok()?;
-        // The counters the report just published are part of the model, so a `commit` that
-        // was caused by a report does not itself trigger another one.
-        ied.take_dirty();
+        let pdu = encode(&report).ok()?;
         Some(Outgoing { assoc, pdu })
     }
 }
@@ -455,19 +452,27 @@ fn assemble(
     }
 }
 
+/// The `variableListName` every IEC 61850 report is reported under.
+///
+/// A report's `variableAccessSpecification` does **not** name the control block, the data set
+/// or the `RptID`: IEC 61850-8-1 maps every `InformationReport` carrying a report onto the
+/// VMD-specific name `RPT`, and libiec61850 writes exactly `a1 05 80 03 "RPT"` there
+/// (`reporting.c`, `BerEncoder_encodeStringWithTag(0x80, "RPT", …)`) 🌐. What tells a client
+/// *which* subscription a report belongs to is the `RptID` inside it, which is why `RptID` is
+/// writable — and why the name may not be derived from it: `rptID` is a plain SCL attribute,
+/// and a file that sets it to anything but a reference would yield an unparseable
+/// `domain-specific` name.
+pub const REPORT_LIST_NAME: &str = "RPT";
+
 /// A report as the `unconfirmed-PDU` that carries it.
-fn encode(report: &Report, data_set: &str) -> crate::common::Result<Vec<u8>> {
+fn encode(report: &Report) -> crate::common::Result<Vec<u8>> {
     let values = report.to_values()?;
     let encoded: Vec<Vec<u8>> = values.iter().map(|v| Value::encode_all(core::slice::from_ref(v))).collect::<crate::common::Result<_>>()?;
     let mut results = Vec::with_capacity(encoded.len());
     for bytes in &encoded {
         results.push(AccessResult::Success(crate::ber::Cursor::new(bytes).next_required()?));
     }
-    // The `variableAccessSpecification` of a report names the **control block**, not the data
-    // set: that is what tells a client which of its subscriptions the report belongs to.
-    let (domain, item) = report.rpt_id.split_once('/').unwrap_or(("", report.rpt_id.as_str()));
-    let _ = data_set;
-    Mms::Unconfirmed(Unconfirmed::InformationReport { access: VariableAccess::VariableListName(ObjectName::DomainSpecific { domain, item }), results }).to_vec()
+    Mms::Unconfirmed(Unconfirmed::InformationReport { access: VariableAccess::VariableListName(ObjectName::VmdSpecific(REPORT_LIST_NAME)), results }).to_vec()
 }
 
 impl Engine {
@@ -481,7 +486,7 @@ impl Engine {
     ///
     /// This is what a buffered control block is *for*: a client that lost its association gets
     /// the events it missed rather than a gap it cannot see.
-    pub fn drain_buffer(&mut self, ied: &mut Ied, reference: &str, after: Option<u64>, now: Instant) -> Vec<Outgoing> {
+    pub fn drain_buffer(&mut self, ied: &mut Ied, reference: &str, after: Option<u64>) -> Vec<Outgoing> {
         let Some(rcb) = self.blocks.get_mut(reference) else { return Vec::new() };
         let Some(assoc) = rcb.owner else { return Vec::new() };
         let start = match after {
@@ -492,7 +497,6 @@ impl Engine {
         rcb.buffer.clear();
         let overflowed = core::mem::take(&mut rcb.overflowed);
         let mut out = Vec::new();
-        let _ = now;
         for (n, entry) in pending.iter().enumerate() {
             let Some(report) = Engine::replay(ied, reference, assoc, entry, n == 0 && overflowed) else { continue };
             out.push(report);
@@ -509,9 +513,9 @@ impl Engine {
         let seq_reference = alloc::format!("{reference}$SqNum");
         let seq = ied.value(&seq_reference).and_then(unsigned_of).unwrap_or(0);
         let next_seq = u64::from(seq.wrapping_add(1)) % 0x1_0000;
-        let _ = ied.write_leaf(&seq_reference, Value::Unsigned(next_seq));
-        let _ = ied.write_leaf(&alloc::format!("{reference}$EntryID"), Value::OctetString(entry.entry_id.to_be_bytes().to_vec()));
-        let _ = ied.write_leaf(&alloc::format!("{reference}$TimeOfEntry"), Value::BinaryTime(entry.at.to_octets().to_vec()));
+        let _ = ied.set_internal(&seq_reference, Value::Unsigned(next_seq));
+        let _ = ied.set_internal(&alloc::format!("{reference}$EntryID"), Value::OctetString(entry.entry_id.to_be_bytes().to_vec()));
+        let _ = ied.set_internal(&alloc::format!("{reference}$TimeOfEntry"), Value::BinaryTime(entry.at.to_octets().to_vec()));
         let report = assemble(
             &rpt_id,
             opt_flds,
@@ -528,8 +532,7 @@ impl Engine {
                 overflowed,
             },
         );
-        let pdu = encode(&report, &data_set).ok()?;
-        ied.take_dirty();
+        let pdu = encode(&report).ok()?;
         Some(Outgoing { assoc, pdu })
     }
 }

@@ -232,8 +232,10 @@ c.delete_data_set("IED1LD0/LLN0$dsTemp")?;
 
 ## Reports
 
-A report is an `InformationReport` naming a report control block, and its `AccessResult`s are
-**not** a data set. They are a header whose fields are present or absent according to
+A report is an `InformationReport` under the VMD-specific `variableListName` **`RPT`** — not
+the control block, not the data set and not the `RptID`. IEC 61850-8-1 gives every report that
+one name; what says which subscription a report belongs to is the `RptID` *inside* it, which is
+why `RptID` is writable. Its `AccessResult`s are **not** a data set. They are a header whose fields are present or absent according to
 `OptFlds`, then an inclusion bit string, then the values of whichever members that bit string
 says are included:
 
@@ -398,6 +400,36 @@ c.select_active_setting_group("IED1LD0/LLN0$SP$SGCB", 2)?;   // put it into forc
 `edit_setting_group` refuses to confirm if **any** of the writes was rejected, and releases the
 reservation either way. Confirming a half-written protection group and then activating it is
 the failure this exists to prevent.
+
+## When a server says no
+
+Two different noes, and they mean different things.
+
+A **service error** is a service that ran and failed: `Error::Service { class, code }` for a
+service-level failure, `Error::DataAccess(code)` for one value of a read or a write. Asking
+again with a different object might work.
+
+A **reject** is the server saying there was no service to run — an unrecognised service, an
+argument it could not decode, or octets that were not a request at all. It arrives as
+`Error::Rejected { invoke_id, reason_tag, code }`, and `RejectReason::from_parts(tag, code)`
+names the pair (the same code means different things under different tags, which is why both
+travel together).
+
+```rust
+use iec61850_rs::proto::mms::reject::RejectReason;
+
+match c.read("IED1LD0/MMXU1.TotW.mag.f", Fc::MX) {
+    Err(Error::Rejected { reason_tag, code, .. }) => {
+        // e.g. "confirmed-request: unrecognized-service"
+        eprintln!("{}", RejectReason::from_parts(reason_tag, code));
+    }
+    Err(Error::DataAccess(code)) => eprintln!("that value: {code}"),
+    other => { other?; }
+}
+```
+
+A reject **answers** the request it names, so it comes back at once rather than after the
+request timeout.
 
 ## How it is checked
 

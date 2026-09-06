@@ -25,7 +25,7 @@ use core::result::Result;
 
 use super::acsi::AssocId;
 use super::ied::{BlockKind, DATA_ACCESS_DENIED, DATA_ACCESS_VALUE_INVALID, Ied};
-use crate::common::{EntryTime, Fc, Instant};
+use crate::common::{EntryTime, Fc};
 use crate::proto::data::Value;
 
 /// One logical device's setting groups.
@@ -102,7 +102,7 @@ impl SettingGroups {
     }
 
     /// A write to an `SGCB` attribute.
-    pub fn on_block_write(&mut self, assoc: AssocId, ied: &mut Ied, block: &str, attribute: &str, value: &Value, now: Instant) -> Result<(), i64> {
+    pub fn on_block_write(&mut self, assoc: AssocId, ied: &mut Ied, block: &str, attribute: &str, value: &Value, wall: EntryTime) -> Result<(), i64> {
         let Some(domain) = self.devices.iter().find(|g| g.block == block).map(|g| g.domain.clone()) else { return Ok(()) };
         match attribute {
             "ActSG" => {
@@ -111,8 +111,7 @@ impl SettingGroups {
                     return Err(DATA_ACCESS_VALUE_INVALID);
                 }
                 self.apply_group(ied, &domain, group);
-                let _ =
-                    ied.write_leaf(&alloc::format!("{block}$LActTm"), Value::BinaryTime(EntryTime::from_unix_millis(now.0 / 1_000_000).to_octets().to_vec()));
+                let _ = ied.set_internal(&alloc::format!("{block}$LActTm"), Value::BinaryTime(wall.to_octets().to_vec()));
                 Ok(())
             }
             "EditSG" => {

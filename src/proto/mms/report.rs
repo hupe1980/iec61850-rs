@@ -283,6 +283,7 @@ impl Report {
 pub struct ReportAssembler {
     partial: Vec<Pending>,
     capacity: usize,
+    max_entries: usize,
     stats: AssemblerStats,
 }
 
@@ -296,6 +297,13 @@ pub struct AssemblerStats {
     pub out_of_order: u64,
     /// Segment runs evicted because too many reports were in flight at once.
     pub evicted: u64,
+    /// Segment runs abandoned because one report grew past [`ReportAssembler::max_entries`].
+    ///
+    /// Bounding the *number* of runs is not the same as bounding the size of one: a peer that
+    /// keeps sending segments with `MoreSegmentsFollow` set and an advancing `SubSeqNum`
+    /// grows a single run without limit, which is the same defect one layer up from an
+    /// unbounded decoder.
+    pub oversized: u64,
 }
 
 #[derive(Debug)]
@@ -306,13 +314,30 @@ struct Pending {
 }
 
 impl ReportAssembler {
-    /// An assembler holding at most `capacity` partially-received reports at once.
+    /// An assembler holding at most `capacity` partially-received reports at once, each of at
+    /// most [`Limits::DEFAULT`]`.max_dataset_members` entries.
     ///
-    /// The bound is what stops a server that starts segmented reports and never finishes them
-    /// from growing a client's memory. One is enough for a single control block; a handful
-    /// covers a client subscribed to several at once.
+    /// **Two** bounds, because they stop different things. `capacity` stops a peer that starts
+    /// many segment runs and finishes none; `max_entries` stops one that keeps a *single* run
+    /// going for ever. A count of runs says nothing about the size of one, and the run is
+    /// where the memory actually is.
+    ///
+    /// One run is enough for a single control block; a handful covers a client subscribed to
+    /// several at once. The entry bound is the data set's member count, because a report has
+    /// one entry per included member and a data set larger than that is not one this stack
+    /// would have created.
     pub fn new(capacity: usize) -> ReportAssembler {
-        ReportAssembler { partial: Vec::new(), capacity: capacity.max(1), stats: AssemblerStats::default() }
+        ReportAssembler::with_max_entries(capacity, Limits::DEFAULT.max_dataset_members)
+    }
+
+    /// An assembler with an explicit entry bound, for a data set larger than the default.
+    pub fn with_max_entries(capacity: usize, max_entries: usize) -> ReportAssembler {
+        ReportAssembler { partial: Vec::new(), capacity: capacity.max(1), max_entries: max_entries.max(1), stats: AssemblerStats::default() }
+    }
+
+    /// The largest number of entries one reassembled report may reach.
+    pub const fn max_entries(&self) -> usize {
+        self.max_entries
     }
 
     /// The counters.
@@ -347,6 +372,15 @@ impl ReportAssembler {
                     // broken one, so it starts a run rather than being dropped with it.
                     return self.start(key, report, sub, more);
                 }
+                // A run that has grown past the bound is abandoned rather than merged into:
+                // half a report is worse than none, and an unbounded one is worse than both.
+                let max = self.max_entries;
+                let p = self.partial.get_mut(i)?;
+                if p.report.entries.len().saturating_add(report.entries.len()) > max {
+                    self.partial.swap_remove(i);
+                    self.stats.oversized = self.stats.oversized.saturating_add(1);
+                    return None;
+                }
                 let p = self.partial.get_mut(i)?;
                 merge(&mut p.report, report);
                 p.next_sub_seq = sub.saturating_add(1);
@@ -371,6 +405,18 @@ impl ReportAssembler {
         if !more {
             // A single segment that says nothing follows is a whole report already.
             return Some(report);
+        }
+        // A run begins at `SubSeqNum` 0. Beginning one anywhere else would mean rebuilding a
+        // report from the middle — the members before the joining point are simply missing,
+        // and nothing downstream could tell. It is also what stops a peer from restarting a
+        // run indefinitely after each one is abandoned.
+        if sub != 0 {
+            self.stats.out_of_order = self.stats.out_of_order.saturating_add(1);
+            return None;
+        }
+        if report.entries.len() > self.max_entries {
+            self.stats.oversized = self.stats.oversized.saturating_add(1);
+            return None;
         }
         if self.partial.len() >= self.capacity {
             self.partial.remove(0);
@@ -421,6 +467,37 @@ fn entry_time(v: &Value) -> Result<EntryTime> {
 
 #[cfg(test)]
 mod tests {
+    /// The assembler bounds the number of runs *and* the size of one. A peer that keeps a
+    /// single run going — `MoreSegmentsFollow` set for ever, `SubSeqNum` advancing — would
+    /// otherwise grow the client's memory without limit, which the run-count bound does not
+    /// cover.
+    #[test]
+    fn one_segment_run_cannot_grow_without_limit() {
+        let mut a = ReportAssembler::with_max_entries(4, 8);
+        assert_eq!(a.max_entries(), 8);
+
+        let mut fed = 0usize;
+        // Twenty segments of two entries each: far past the eight-entry bound.
+        for sub in 0..20u32 {
+            let base = (sub as usize) * 2;
+            assert_eq!(a.push(segment("flood", 7, sub, true, 64, &[base % 64, (base + 1) % 64])), None, "no whole report may escape");
+            fed += 2;
+        }
+        assert!(fed > a.max_entries());
+        assert_eq!(a.stats().oversized, 1, "the run is abandoned when it passes the bound");
+        assert_eq!(a.pending(), 0, "and nothing is held afterwards: a run restarts only at SubSeqNum 0");
+        assert_eq!(a.stats().reassembled, 0);
+    }
+
+    /// A single oversized segment is refused before it is ever stored.
+    #[test]
+    fn an_oversized_first_segment_is_not_stored() {
+        let mut a = ReportAssembler::with_max_entries(4, 2);
+        assert_eq!(a.push(segment("big", 1, 0, true, 64, &[0, 1, 2, 3])), None);
+        assert_eq!(a.pending(), 0);
+        assert_eq!(a.stats().oversized, 1);
+    }
+
     use super::*;
     use crate::common::{Quality, TimeQuality, UtcTime};
 
@@ -617,8 +694,15 @@ mod tests {
         let mut a = ReportAssembler::new(4);
         assert!(a.push(segment("u1", 7, 0, true, 4, &[0])).is_none());
         assert!(a.push(segment("u1", 7, 2, true, 4, &[2])).is_none(), "segment 1 never arrived");
-        assert_eq!(a.stats().out_of_order, 1);
-        assert_eq!(a.pending(), 1, "and the survivor starts a fresh run rather than being lost too");
+        // Both the broken run *and* the segment that broke it are dropped. Keeping the
+        // latter as the start of a fresh run is the very failure this test is named for:
+        // segment 2 is the middle of a report, so a run begun there is missing members 0 and
+        // 1 with nothing downstream able to tell. A run starts at `SubSeqNum` 0 or not at all.
+        assert_eq!(a.stats().out_of_order, 2);
+        assert_eq!(a.pending(), 0);
+        // A genuinely new report *does* start a run, because its first segment is numbered 0.
+        assert!(a.push(segment("u1", 8, 0, true, 4, &[0])).is_none());
+        assert_eq!(a.pending(), 1);
         // Two reports in flight at once are told apart by their `SqNum`.
         let mut b = ReportAssembler::new(4);
         assert!(b.push(segment("u1", 1, 0, true, 2, &[0])).is_none());

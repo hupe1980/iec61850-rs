@@ -1,7 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::ber::{Cursor, Encoder, Tag, universal};
+use crate::ber::{Cursor, Encoder, Tag, universal, unsigned_width};
 use crate::common::{DecodeReason, Error, Limits, Result, UtcTime};
 
 /// `savPdu [APPLICATION 0]`.
@@ -84,16 +84,30 @@ pub struct AsduView<'a> {
     pub at: AsduOffsets,
 }
 
+/// A patchable field: where its contents octets start, and how many there are.
+///
+/// The width matters as much as the offset. An unsigned field is written at whatever width
+/// keeps it a positive BER INTEGER for the whole range the stream can produce, so `smpCnt` is
+/// two octets on a 4 kHz stream and three on a 96 kHz one; a patcher that assumed two would
+/// write past a field on one and short of it on the other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Field {
+    /// Offset of the first contents octet.
+    pub at: usize,
+    /// Contents octets.
+    pub len: usize,
+}
+
 /// Offsets, from the start of the APDU, of the ASDU fields a publisher rewrites in place.
 ///
 /// They come from the decoder rather than from the encoder's own bookkeeping, so a template
-/// and the codec cannot disagree about where a field is.
+/// and the codec cannot disagree about where a field is or how wide it is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AsduOffsets {
-    /// First contents octet of `smpCnt` (two octets wide as this crate encodes it).
-    pub smp_cnt: usize,
-    /// The `smpSynch` contents octet, if the ASDU carries one.
-    pub smp_synch: Option<usize>,
+    /// `smpCnt`.
+    pub smp_cnt: Field,
+    /// `smpSynch`, if the ASDU carries one.
+    pub smp_synch: Option<Field>,
     /// First contents octet of `refrTm` (eight octets), if present.
     pub refr_tm: Option<usize>,
     /// First octet of the sample block.
@@ -143,8 +157,8 @@ impl<'a> AsduView<'a> {
             smp_mod,
             gm_identity: gm_tlv.map(|t| t.value),
             at: AsduOffsets {
-                smp_cnt: smp_cnt_tlv.value_offset,
-                smp_synch: smp_synch_tlv.map(|t| t.value_offset),
+                smp_cnt: Field { at: smp_cnt_tlv.value_offset, len: smp_cnt_tlv.value.len() },
+                smp_synch: smp_synch_tlv.map(|t| Field { at: t.value_offset, len: t.value.len() }),
                 refr_tm: refr_tm_tlv.map(|t| t.value_offset),
                 sample: sample_tlv.value_offset,
                 gm_identity: gm_tlv.map(|t| t.value_offset),
@@ -243,28 +257,39 @@ pub struct Asdu {
 }
 
 impl Asdu {
+    /// Contents octets `smpCnt` occupies for a stream whose count reaches `max_smp_cnt`.
+    ///
+    /// The publisher sizes its template with this so that every value the stream produces
+    /// fits the field it patches.
+    pub const fn smp_cnt_width(max_smp_cnt: u16) -> usize {
+        unsigned_width(max_smp_cnt as u64, 2)
+    }
+
     fn encode(&self, e: &mut Encoder) -> Result<()> {
         e.constructed(TAG_ASDU, |e| {
             e.visible_string(Tag::context(0), &self.sv_id)?;
             if let Some(d) = &self.dat_set {
                 e.visible_string(Tag::context(1), d)?;
             }
-            // Fixed two octets so a publisher can patch smpCnt in place (BER allows a
-            // leading zero octet for values with the top bit set; smpCnt < 32768 anyway).
-            e.unsigned_fixed(Tag::context(2), u64::from(self.smp_cnt), 2)?;
-            e.unsigned_fixed(Tag::context(3), u64::from(self.conf_rev), 4)?;
+            // The widths the vendor captures show — `82 02` for smpCnt, `83 04` for confRev,
+            // `85 01` for smpSynch, `86 02` for smpRate — widened by one octet only when the
+            // value would otherwise be a negative INTEGER. A publisher patches smpCnt and
+            // smpSynch in place, so the width has to be constant for the whole stream; that
+            // is why the template is encoded from the largest value the stream can produce.
+            e.unsigned_fixed_min(Tag::context(2), u64::from(self.smp_cnt), 2)?;
+            e.unsigned_fixed_min(Tag::context(3), u64::from(self.conf_rev), 4)?;
             if let Some(t) = self.refr_tm {
                 e.utc_time(Tag::context(4), t)?;
             }
             if let Some(s) = self.smp_synch {
-                e.unsigned_fixed(Tag::context(5), u64::from(s.to_u8()), 1)?;
+                e.unsigned_fixed_min(Tag::context(5), u64::from(s.to_u8()), 1)?;
             }
             if let Some(r) = self.smp_rate {
-                e.unsigned_fixed(Tag::context(6), u64::from(r), 2)?;
+                e.unsigned_fixed_min(Tag::context(6), u64::from(r), 2)?;
             }
             e.primitive(Tag::context(7), &self.sample)?;
             if let Some(m) = self.smp_mod {
-                e.unsigned_fixed(Tag::context(8), u64::from(m), 1)?;
+                e.unsigned_fixed_min(Tag::context(8), u64::from(m), 1)?;
             }
             if let Some(g) = &self.gm_identity {
                 e.primitive(Tag::context(9), g)?;
@@ -287,7 +312,7 @@ impl SavPdu {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut e = Encoder::with_capacity(32 + self.asdus.len() * 96);
         e.constructed(TAG_SAV_PDU, |e| {
-            e.unsigned_fixed(Tag::context(0), self.asdus.len() as u64, 1)?;
+            e.unsigned_fixed_min(Tag::context(0), self.asdus.len() as u64, 1)?;
             e.constructed(Tag::context_constructed(2), |e| {
                 for a in &self.asdus {
                     a.encode(e)?;

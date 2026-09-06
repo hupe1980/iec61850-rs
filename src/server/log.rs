@@ -14,7 +14,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::ied::{BlockKind, Ied};
-use crate::common::{EntryTime, Instant, ReasonCode, TrgOps};
+use crate::common::{EntryTime, ReasonCode, TrgOps};
 use crate::proto::data::Value;
 
 /// How many entries one log keeps before the oldest is dropped.
@@ -84,7 +84,7 @@ impl Logs {
     /// The trigger evaluation is the report engine's, deliberately: a client that configures
     /// a log and a report with the same `TrgOps` must get the same events in both, and two
     /// implementations of "did this change matter" is how they drift apart.
-    pub fn commit(&mut self, ied: &mut Ied, dirty: &BTreeMap<String, TrgOps>, now: Instant) {
+    pub fn commit(&mut self, ied: &mut Ied, dirty: &BTreeMap<String, TrgOps>, wall: EntryTime) {
         let controls = self.controls.clone();
         for (block, log_reference) in controls {
             if !ied.value(&alloc::format!("{block}$LogEna")).and_then(bool_of).unwrap_or(false) {
@@ -121,13 +121,12 @@ impl Logs {
                 continue;
             }
             let record_reason = ied.value(&alloc::format!("{block}$TrgOps")).is_some();
-            self.append(ied, &log_reference, values, record_reason.then_some(reason), now);
+            self.append(ied, &log_reference, values, record_reason.then_some(reason), wall);
         }
     }
 
     /// Append one entry and update the control blocks that point at this log.
-    fn append(&mut self, ied: &mut Ied, log_reference: &str, values: Vec<(String, Value)>, reason: Option<ReasonCode>, now: Instant) {
-        let occurred = EntryTime::from_unix_millis(now.0 / 1_000_000);
+    fn append(&mut self, ied: &mut Ied, log_reference: &str, values: Vec<(String, Value)>, reason: Option<ReasonCode>, occurred: EntryTime) {
         let Some(log) = self.journals.iter_mut().find(|l| l.reference == log_reference) else { return };
         let entry_id = log.next_id;
         log.next_id = log.next_id.wrapping_add(1);
@@ -141,10 +140,10 @@ impl Logs {
             if reference != log_reference {
                 continue;
             }
-            let _ = ied.write_leaf(&alloc::format!("{block}$OldEnt"), Value::OctetString(oldest.to_be_bytes().to_vec()));
-            let _ = ied.write_leaf(&alloc::format!("{block}$OldEntrTm"), Value::BinaryTime(oldest_at.to_octets().to_vec()));
-            let _ = ied.write_leaf(&alloc::format!("{block}$NewEnt"), Value::OctetString(entry_id.to_be_bytes().to_vec()));
-            let _ = ied.write_leaf(&alloc::format!("{block}$NewEntrTm"), Value::BinaryTime(occurred.to_octets().to_vec()));
+            let _ = ied.set_internal(&alloc::format!("{block}$OldEnt"), Value::OctetString(oldest.to_be_bytes().to_vec()));
+            let _ = ied.set_internal(&alloc::format!("{block}$OldEntrTm"), Value::BinaryTime(oldest_at.to_octets().to_vec()));
+            let _ = ied.set_internal(&alloc::format!("{block}$NewEnt"), Value::OctetString(entry_id.to_be_bytes().to_vec()));
+            let _ = ied.set_internal(&alloc::format!("{block}$NewEntrTm"), Value::BinaryTime(occurred.to_octets().to_vec()));
         }
     }
 

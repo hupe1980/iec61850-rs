@@ -174,8 +174,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The changelog entry for this version is the release note; `--generate-notes`
+          # appends the commit list under it. A version with no entry gets the commit list
+          # alone rather than failing the release.
+          awk -v v="${{ needs.guard.outputs.version }}" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
           gh release create "${{ needs.guard.outputs.tag }}" \
             --title "${{ needs.guard.outputs.tag }}" \
+            --notes-file notes.md \
             --generate-notes \
             --verify-tag \
             artifacts/*

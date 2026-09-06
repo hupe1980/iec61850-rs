@@ -9,6 +9,10 @@
 //! publisher patching its template, and a sampled-value subscriber receiving. The GOOSE
 //! *subscriber* deliberately allocates on a state change — it hands the application owned
 //! values — so it is measured rather than required to be free.
+//!
+//! One claim here is about **bytes** rather than calls: a file service that serves a record
+//! in chunks must cost the chunk, not the record. A count of allocations cannot tell a
+//! four-megabyte one from a one-kilobyte one, so the allocator totals the sizes as well.
 
 // The one place in this repository that opts into `unsafe`, and only to implement
 // `GlobalAlloc` by delegating every call to the system allocator. The library keeps
@@ -18,7 +22,6 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use iec61850_rs::common::{Instant, Quality, TimeQuality, UtcTime};
 use iec61850_rs::proto::data::Value;
@@ -33,19 +36,23 @@ use iec61850_rs::proto::sv::{
 
 /// Delegates to the system allocator and counts what the *measuring thread* asks for.
 ///
-/// The flag is thread-local and const-initialised, so the test harness's own threads — and
-/// the lazy initialisation of the flag itself — cannot land in the count.
+/// Everything is thread-local and const-initialised, so the test harness's own threads — and
+/// the lazy initialisation of the cells themselves — cannot land in the count. Thread-local
+/// *counters*, not just a thread-local flag: with a process-wide total, two `#[test]`s in
+/// this file measure each other, which is a constraint that quietly turns into a wrong number
+/// the day somebody adds the second test.
 struct Counting;
-
-static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static MEASURING: Cell<bool> = const { Cell::new(false) };
+    static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+    /// Octets requested, not just requests. Some claims are about how *much* was allocated.
+    static BYTES: Cell<u64> = const { Cell::new(0) };
 }
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count();
+        count(layout.size());
         // SAFETY: `layout` is forwarded unchanged to the system allocator.
         unsafe { System.alloc(layout) }
     }
@@ -56,18 +63,20 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        count();
+        count(new_size.saturating_sub(layout.size()));
         // SAFETY: all three arguments are forwarded unchanged to the system allocator.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
 
-fn count() {
+fn count(bytes: usize) {
     // `try_with` rather than `with`: during thread teardown the local is gone, and a panic
-    // inside the allocator would be considerably worse than a missed count.
+    // inside the allocator would be considerably worse than a missed count. `Cell::set`
+    // allocates nothing, so this cannot recurse.
     let _ = MEASURING.try_with(|m| {
         if m.get() {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            let _ = ALLOCATIONS.try_with(|c| c.set(c.get().saturating_add(1)));
+            let _ = BYTES.try_with(|c| c.set(c.get().saturating_add(bytes as u64)));
         }
     });
 }
@@ -77,11 +86,17 @@ static ALLOC: Counting = Counting;
 
 /// Run `f` with the allocation counter on, and return how many allocations it made.
 fn allocations(f: impl FnOnce()) -> u64 {
-    ALLOCATIONS.store(0, Ordering::Relaxed);
+    measure(f).0
+}
+
+/// Run `f` with the counter on, and return `(allocations, octets)`.
+fn measure(f: impl FnOnce()) -> (u64, u64) {
+    ALLOCATIONS.with(|c| c.set(0));
+    BYTES.with(|c| c.set(0));
     MEASURING.with(|m| m.set(true));
     f();
     MEASURING.with(|m| m.set(false));
-    ALLOCATIONS.load(Ordering::Relaxed)
+    (ALLOCATIONS.with(Cell::get), BYTES.with(Cell::get))
 }
 
 fn goose_header() -> FrameHeader {
@@ -109,8 +124,8 @@ fn sv_header() -> FrameHeader {
 }
 
 #[test]
-// One test rather than several: the counter is process-wide and the measuring flag is
-// per-thread, so two of these running in parallel would measure each other.
+// The counters are thread-local, so tests in this file may run in parallel without measuring
+// each other. This one stays a single function because its sections share warmed-up state.
 #[allow(clippy::too_many_lines)]
 fn the_steady_state_allocates_nothing() {
     // --- GOOSE publisher, retransmitting -------------------------------------------------
@@ -173,7 +188,7 @@ fn the_steady_state_allocates_nothing() {
 
     // --- Sampled-value publisher, patching its template ----------------------------------
     let mut mu = SvPublisher::new(SvConfig::new(sv_header(), "MU01", SvProfile::F4800S2I4U4).with_time_fields(true, true)).unwrap();
-    mu.set_smp_synch(SmpSynch::Global);
+    mu.set_smp_synch(SmpSynch::Global).unwrap();
     let sample = PhsMeas1 { currents: [1, 2, 3, 4], current_quality: [Quality::GOOD; 4], voltages: [5, 6, 7, 8], voltage_quality: [Quality::GOOD; 4] }.encode();
     mu.publish_repeating(Instant::ZERO, &sample).unwrap();
     mu.poll_transmit();
@@ -260,3 +275,90 @@ fn the_steady_state_allocates_nothing() {
     assert_eq!((stats.state_changes, stats.retransmissions, stats.expiries), (1, 100, 0), "{stats:?}");
     assert_eq!(n, 0, "a GOOSE retransmission must not allocate; only a state change may");
 }
+
+/// A file service costs the **chunk**, not the record.
+///
+/// `FileOpen` used to read the whole file into the handle, so a client that opened a 200 MB
+/// COMTRADE record five times on ten associations had made the server allocate ten gigabytes
+/// — remotely, and with no limit anywhere to stop it. The store now reads ranges, so an open
+/// costs a path and a read costs one chunk whatever the file's size.
+///
+/// This is a claim about octets rather than calls: a count of allocations cannot tell a
+/// four-megabyte one from a one-kilobyte one, which is exactly the difference at stake.
+#[test]
+#[cfg(all(feature = "server", feature = "std"))]
+fn opening_a_large_file_does_not_allocate_it() {
+    use iec61850_rs::common::Instant;
+    use iec61850_rs::proto::mms::ConfirmedRequest;
+    use iec61850_rs::proto::mms::file::FileNameBuf;
+    use iec61850_rs::server::{Acsi, Answer, DirectoryStore, Ied};
+
+    const RECORD: usize = 4 << 20; // 4 MiB — far above any buffer here.
+
+    let dir = std::env::temp_dir().join(format!("iec61850-bigfile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("rec.dat"), vec![0x5Au8; RECORD]).unwrap();
+
+    let mut acsi = Acsi::new(Ied::from_scl(MODEL, Some("IED1")).unwrap());
+    acsi.set_file_store(Box::new(DirectoryStore::new(&dir)));
+
+    // Warm every lazily-initialised path (the store's canonicalisation, the answer buffers)
+    // so the measurement is the file service and not the first call into it.
+    let path = FileNameBuf::from_path("rec.dat").unwrap();
+    let name = path.as_name();
+    let warm = acsi.request(1, Instant::ZERO, &ConfirmedRequest::FileOpen { name, position: 0 });
+    let Answer::FileOpen { frsm_id, size, .. } = warm else { panic!("not an open: {warm:?}") };
+    assert_eq!(size as usize, RECORD);
+    acsi.request(1, Instant::ZERO, &ConfirmedRequest::FileClose(frsm_id));
+
+    let chunk = acsi.config().file_chunk;
+    let mut frsm = 0;
+    let (_, open_bytes) = measure(|| {
+        let a = acsi.request(1, Instant::ZERO, &ConfirmedRequest::FileOpen { name, position: 0 });
+        if let Answer::FileOpen { frsm_id, .. } = a {
+            frsm = frsm_id;
+        }
+    });
+    let (_, read_bytes) = measure(|| {
+        acsi.request(1, Instant::ZERO, &ConfirmedRequest::FileRead(frsm));
+    });
+
+    // Generous ceilings — the point is the order of magnitude, not a golden number. Under
+    // the old behaviour `open_bytes` alone was the whole 4 MiB.
+    assert!(open_bytes < 64 * 1024, "an open must not allocate the file: {open_bytes} octets for a {RECORD}-octet record");
+    assert!(read_bytes < (chunk as u64) * 8, "a read must cost a chunk ({chunk}), not a file: {read_bytes} octets");
+
+    // …and it still delivers the record, in order and whole.
+    let mut total = 0usize;
+    loop {
+        match acsi.request(1, Instant::ZERO, &ConfirmedRequest::FileRead(frsm)) {
+            Answer::FileRead { data, more } => {
+                assert!(data.iter().all(|b| *b == 0x5A), "the octets are the file's");
+                total += data.len();
+                if !more {
+                    break;
+                }
+            }
+            other => panic!("not a read: {other:?}"),
+        }
+        assert!(total <= RECORD, "the reads must terminate");
+    }
+    assert_eq!(total, RECORD - chunk, "the warm read above already took the first chunk");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The smallest model that has a logical device, for the file-service test above.
+#[cfg(all(feature = "server", feature = "std"))]
+const MODEL: &str = r#"<?xml version="1.0"?>
+<SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">
+  <Header id="f"/>
+  <IED name="IED1"><AccessPoint name="P1"><Server><LDevice inst="LD0">
+    <LN0 lnClass="LLN0" inst="" lnType="LLN0_T"/>
+  </LDevice></Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="Mod" type="INC_T"/></LNodeType>
+    <DOType id="INC_T" cdc="INC"><DA name="stVal" fc="ST" bType="INT32"/></DOType>
+  </DataTypeTemplates>
+</SCL>"#;

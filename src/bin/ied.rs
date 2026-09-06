@@ -102,6 +102,8 @@ COMMANDS:
     --port <N>          first port; each further IED takes the next one (default 102)
     --files <DIR>       serve this directory through the MMS file services, read-only
     --writable          also allow `FileDelete` on that directory
+    --edition <1|2|2.1> serve as this edition, overriding the file's own schema version
+                        (Edition 1 has no ResvTms and no Owner on a report control block)
 
 `scl validate` options:
     --freq <50|60>      nominal frequency, to read smpRate (default 50)
@@ -750,6 +752,7 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
             "--port" => o.port = value()?.parse().map_err(|_| "--port needs a number".to_string())?,
             "--files" => o.files = Some(value()?.to_string()),
             "--writable" => o.writable = true,
+            "--edition" => o.edition = Some(parse_edition(value()?)?),
             other => return Err(format!("unknown option `{other}`")),
         }
     }
@@ -772,7 +775,12 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
         for d in &model.diagnostics {
             eprintln!("ied: {name}: {d}");
         }
-        let ied = Ied::new(model).map_err(|e| format!("{name}: {e}"))?;
+        let ied = match o.edition {
+            Some(e) => Ied::with_edition(model, e),
+            None => Ied::new(model),
+        }
+        .map_err(|e| format!("{name}: {e}"))?;
+        let edition = ied.edition();
         let devices = ied.domain_names();
         let port = o.port + n as u16;
         let mut server = Server::bind(&format!("{}:{port}", o.bind), ied).map_err(|e| format!("{name}: {e}"))?;
@@ -781,7 +789,7 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
             server.set_file_store(Box::new(if o.writable { store.writable() } else { store }));
         }
         let addr = server.local_addr().map_err(|e| e.to_string())?;
-        println!("{name} on {addr} — logical device(s) {}", devices.join(", "));
+        println!("{name} on {addr} — {} — logical device(s) {}", edition_name(edition), devices.join(", "));
         servers.push(server);
     }
     if let Some(dir) = &o.files {
@@ -810,13 +818,15 @@ struct SimOptions {
     port: u16,
     files: Option<String>,
     writable: bool,
+    /// `None` takes the edition from the file, which is where an IED's edition is declared.
+    edition: Option<Edition>,
 }
 
 impl Default for SimOptions {
     fn default() -> SimOptions {
         // Loopback and port 102: the standard port needs privileges, and a simulator that
         // binds every interface by default is a simulator someone finds on a substation LAN.
-        SimOptions { ied: None, bind: String::from("127.0.0.1"), port: 102, files: None, writable: false }
+        SimOptions { ied: None, bind: String::from("127.0.0.1"), port: 102, files: None, writable: false, edition: None }
     }
 }
 
@@ -1595,6 +1605,26 @@ fn show_value(v: &IedValue) -> String {
     }
 }
 
+/// `1`, `2` or `2.1` as an [`Edition`].
+fn parse_edition(value: &str) -> Result<Edition, String> {
+    match value {
+        "1" => Ok(Edition::Ed1),
+        "2" => Ok(Edition::Ed2),
+        "2.1" => Ok(Edition::Ed2_1),
+        other => Err(format!("unknown edition `{other}`; expected 1, 2 or 2.1")),
+    }
+}
+
+/// How an edition prints in the simulator's banner.
+fn edition_name(edition: Edition) -> &'static str {
+    match edition {
+        Edition::Ed1 => "Edition 1",
+        Edition::Ed2 => "Edition 2",
+        Edition::Ed2_1 => "Edition 2.1",
+        _ => "Edition ?",
+    }
+}
+
 fn scl_validate(file: &str, args: &[&str]) -> Result<(), String> {
     let mut freq = 50u32;
     let mut edition = Edition::Ed2_1;
@@ -1604,14 +1634,7 @@ fn scl_validate(file: &str, args: &[&str]) -> Result<(), String> {
         let mut value = || it.next().copied().ok_or_else(|| format!("{arg} needs a value"));
         match *arg {
             "--freq" => freq = value()?.parse().map_err(|_| "--freq needs a number".to_string())?,
-            "--edition" => {
-                edition = match value()? {
-                    "1" => Edition::Ed1,
-                    "2" => Edition::Ed2,
-                    "2.1" => Edition::Ed2_1,
-                    other => return Err(format!("unknown edition `{other}`; expected 1, 2 or 2.1")),
-                }
-            }
+            "--edition" => edition = parse_edition(value()?)?,
             "--strict" => warnings_are_errors = true,
             other => return Err(format!("unknown option `{other}`")),
         }
@@ -1827,7 +1850,7 @@ fn merging_unit(file: &str, args: &[&str]) -> Result<(), String> {
     };
     let mut publisher = Publisher::new(PublisherConfig::new(header, opt.sv_id.clone(), opt.profile).with_time_fields(opt.refr_tm, opt.gm.is_some()))
         .map_err(|e| e.to_string())?;
-    publisher.set_smp_synch(SmpSynch::Global);
+    publisher.set_smp_synch(SmpSynch::Global).map_err(|e| e.to_string())?;
     if let Some(id) = opt.gm {
         publisher.set_gm_identity(id);
     }

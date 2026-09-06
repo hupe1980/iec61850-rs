@@ -9,6 +9,7 @@ template = "index.html"
 # reviewable as content rather than as markup.
 hero_code = """
 ```rust
+use iec61850_rs::Fc;
 use iec61850_rs::client::Client;
 use iec61850_rs::server::{Ied, Server};
 
@@ -110,8 +111,9 @@ not prove either is right, and <a href="@/docs/verification.md">Verification</a>
 <div class="card">
 <h3>Wireshark is the judge</h3>
 <p>Frames the encoders emit are dissected by <code>tshark</code> on every push. A malformed
-marker or an expert error fails the build. An implementation that only agrees with itself
-has proved nothing.</p>
+marker or an expert error fails the build — and so does a field that does not dissect back to
+the value we put in, which is the half that finds things. An implementation that only agrees
+with itself has proved nothing.</p>
 </div>
 <div class="card">
 <h3>Replay protection is not optional</h3>
@@ -130,9 +132,10 @@ header S bit disagrees with its PDU flag is rejected either way.</p>
 <div class="card">
 <h3>Nothing grows without bound</h3>
 <p>Decoders enforce depth, member and length limits <em>before</em> allocating. Event queues
-are bounded and count what they drop, so a 4.8 kHz stream and an application that stops
-draining cannot exhaust memory. The server's file store is sandboxed by construction, not by
-a check a caller might forget.</p>
+and the report reassembler are bounded and count what they drop, so a 4.8 kHz stream and an
+application that stops draining cannot exhaust memory. Files are served in ranges, so an open
+handle costs a name rather than a hundred-megabyte record — and the store is sandboxed by
+construction, not by a check a caller might forget.</p>
 </div>
 <div class="card">
 <h3>Adversarial simulation, not just unit tests</h3>

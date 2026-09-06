@@ -7,7 +7,7 @@
 **client and server** for the station bus, panic-free decoders, sans-IO state machines, and
 encoders checked against real substation captures frame for frame.
 
-📖 **[Documentation and guide](https://hupe1980.github.io/iec61850-rs/)**
+📖 **[Documentation and guide](https://hupe1980.github.io/iec61850-rs/)** · 📋 **[Changelog](CHANGELOG.md)**
 
 > **Pre-release.** The process bus works and is tested; the MMS client associates, browses,
 > reads, writes, **receives decoded reports**, **operates controllable objects**, **pulls files
@@ -24,20 +24,20 @@ encoders checked against real substation captures frame for frame.
 |---|---|
 | **GOOSE** (IEC 61850-8-1) | Codec, publisher with the T1…T0 retransmission curve, subscriber with the IEC 62351-6 replay rule, Edition 2 simulation-bit semantics, and the delta features a substation IDS is built on |
 | **Sampled Values** (IEC 61850-9-2) | Codec, template-patching publisher for the 9-2LE and IEC 61869-9 profiles — `smpSynch`, `refrTm` and `gmIdentity` patched in place — multi-stream subscriber tracking continuity, sync, grandmaster, staleness and the Edition 2 simulation rule. **Any data set decodes**: the SCL file gives each ASDU channel a name, a type and an offset, so a merging unit that is not 9-2LE needs no special case |
-| **MMS** (IEC 61850-8-1) | The whole OSI stack under it — TPKT with a stream reader, COTP class 0 with TSDU reassembly, session, presentation, ACSE — the MMS PDUs, and the **association state machine** over all six: client *and* server roles, invoke tracking, TSDU segmentation, timeouts, orderly release, ACSE password. Values share their codec with GOOSE |
+| **MMS** (IEC 61850-8-1) | The whole OSI stack under it — TPKT with a stream reader, COTP class 0 with TSDU reassembly, session, presentation, ACSE — the MMS PDUs, and the **association state machine** over all six: client *and* server roles, invoke tracking, TSDU segmentation, timeouts, orderly release, ACSE password. A service that fails and a PDU that is *rejected* are different answers, decoded and emitted as such. Values share their codec with GOOSE |
 | **MMS client** | Blocking, no runtime, no dependency: connect (from the SCD if you like), `Identify`, browse the server with `moreFollows` paging, read one value or many or a whole data set, write, ask what *type* a variable is, create and delete data sets |
 | **Reporting** (IEC 61850-8-1 §17) | Read a report control block attribute by attribute, configure it, enable it with `RptEna` written last, ask for a general interrogation — and get reports **decoded**: `RptID`, `SqNum`, `TimeOfEntry`, `EntryID`, the inclusion bit string, and per member its index, reference, value and reason for inclusion. A report split across **segments** is joined before you see it, or not delivered at all |
-| **Files** (IEC 61850-8-1 §23) | List a server's files, pull one off it, delete one. The `frsmID` a `FileOpen` returns is given back even when a read fails partway — a leaked handle is a file left open in a relay. This is how a COMTRADE record gets off an IED |
+| **Files** (IEC 61850-8-1 §23) | List a server's files, pull one off it, delete one. The `frsmID` a `FileOpen` returns is given back even when a read fails partway — a leaked handle is a file left open in a relay. The server's store is read in **ranges**, so an open costs a name and a read costs a chunk however big the record is. This is how a COMTRADE record gets off an IED |
 | **Logs** (IEC 61850-7-2 §17) | Read a log control block, then `QueryLogByTime` or `QueryLogAfterEntry` — the second carries the `EntryID` *and* its time, so a reconnecting client resumes exactly where it stopped, without a gap and without duplicates |
 | **Setting groups** (IEC 61850-7-2 §11) | Read the `SGCB`, activate a group, or select ▸ write ▸ confirm ▸ release an edit in one call — which refuses to confirm if any write was rejected, because a half-written protection group must not be activated |
 | **Control** (IEC 61850-7-2 §20) | All four control models behind one `execute` — direct and select-before-operate, normal and enhanced security — with `origin`, `ctlNum`, `Check`, `Test`, time-activated operate and `Cancel`. A refused command comes back as its `AddCause`, not as success |
-| **Server** (IEC 61850-8-1) | An SCL file is the whole configuration — no generated model, no build step. It publishes the flattened, sorted namespace the 8-1 mapping requires, answers browse, read, write and type discovery from the model, runs a report engine (one client per block, `BufTm` gathering, `GI`, integrity, and a buffered block that replays what a disconnected client missed), enforces all four control models with an application hook, keeps a value per setting group, serves files from a **sandboxed** store and writes logs. `ied sim relay.icd` is a working IED |
+| **Server** (IEC 61850-8-1) | An SCL file is the whole configuration — no generated model, no build step. It publishes the flattened, sorted namespace the 8-1 mapping requires, answers browse, read, write and type discovery from the model, runs a report engine (one client per block, `BufTm` gathering, `GI`, integrity, and a buffered block that replays what a disconnected client missed), enforces all four control models with an application hook, keeps a value per setting group, serves files from a **sandboxed** store and writes logs. Timers run on a monotonic clock and `TimeOfEntry`, log times and `LActTm` on a pluggable wall clock — two different questions, never derived from one another. It takes its **edition** from the file's own schema version, so an Edition 1 file serves an Edition 1 report control block — no `ResvTms`, no `Owner`. `ied sim relay.icd` is a working IED |
 | **SCL** (IEC 61850-6) | Load an IED model from ICD/CID/SCD — data sets, control blocks, addresses — resolve what an IED subscribes to from its `Inputs/ExtRef`, and check the engineering errors the XML schema permits. Lenient by default with stable diagnostic codes; strict on request |
 | **`ied`** | Command line: `sim` (serve an SCD's IEDs), `mu`, `sv monitor` (`--scd` to name the channels), `goose sniff`, `mms sniff`, `mms identify/browse/read/write/rcb/report/control/type/files/get/log/sg` against a live server, `pcap info`, `scl validate`, `scl show`, `scl subs` |
 | Supporting | Panic-free BER codec, the IEC 61850 wire types, classic pcap reader and writer |
 
-**Not yet:** service tracking, `ObtainFile`, a durable log store, edition modes on the server,
-raw-socket adapters, the IEC 62351-6 authentication extension, routable GOOSE/SV
+**Not yet:** service tracking, `ObtainFile`, a durable log store, the edition-dependent
+enumerations, raw-socket adapters, the IEC 62351-6 authentication extension, routable GOOSE/SV
 (IEC TR 61850-90-5), TLS, and *emitting* fixed-length encoded GOOSE — decoding it works; the
 widths table that encoding needs is behind the IEC paywall and is not worth guessing.
 

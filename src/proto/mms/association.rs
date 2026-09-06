@@ -45,6 +45,9 @@ pub const ACSE_CONTEXT: u16 = 1;
 pub const MMS_CONTEXT: u16 = 3;
 /// The plain TCP port for MMS over RFC 1006.
 pub const PORT: u16 = 102;
+/// This end's COTP reference. One association is one transport connection, so a constant is
+/// enough; what may not be constant is the *peer's*, which is read off its CR or CC.
+const LOCAL_REF: u16 = 1;
 /// The TCP port for MMS over TLS (`iso-tp0s`, IEC 62351-4).
 pub const PORT_TLS: u16 = 3782;
 
@@ -229,6 +232,18 @@ pub enum AssociationEvent {
     /// association survives it — one bad report is not a reason to drop a connection — and
     /// [`AssociationStats::malformed`] counts it.
     Malformed(Error),
+    /// The peer **rejected** a PDU: not a service that failed, but one it could not act on
+    /// at all — an unrecognised service, an invoke identifier it cannot use, more requests
+    /// outstanding than were negotiated, or octets that are not a PDU.
+    ///
+    /// A reject naming an outstanding request answers it, so the identifier is released and
+    /// the caller learns why immediately instead of waiting out its timeout.
+    Rejected {
+        /// The request it rejects, when the peer named one.
+        invoke_id: Option<i64>,
+        /// Why.
+        reject: crate::proto::mms::reject::Reject,
+    },
     /// No answer arrived within `request_timeout_ms`. The invoke identifier is released.
     Timeout {
         /// The request that went unanswered.
@@ -252,6 +267,8 @@ pub struct AssociationStats {
     pub timeouts: u64,
     /// PDUs that did not decode.
     pub malformed: u64,
+    /// PDUs the peer rejected, and PDUs this end rejected.
+    pub rejected: u64,
     /// TPKT packets sent.
     pub packets_sent: u64,
     /// TPKT packets received.
@@ -309,6 +326,13 @@ pub struct Association {
     acse_context: u16,
     /// The presentation context MMS was negotiated into.
     mms_context: u16,
+    /// The peer's COTP source reference, learned from its CR or CC.
+    ///
+    /// A DR has to name it: a peer that receives a disconnect for a reference it never issued
+    /// is entitled to ignore it, and this end only ever agreed with *itself* while the number
+    /// was hard-coded — the exact self-consistency trap the reference-capture tests exist to
+    /// avoid.
+    peer_ref: u16,
 }
 
 impl Association {
@@ -344,6 +368,7 @@ impl Association {
             tpdu_data,
             acse_context: ACSE_CONTEXT,
             mms_context: MMS_CONTEXT,
+            peer_ref: 0,
         }
     }
 
@@ -381,7 +406,7 @@ impl Association {
             return Err(Error::InvalidValue("association already started"));
         }
         let cr = Tpdu::ConnectionRequest(cotp::Connect::request(
-            1,
+            LOCAL_REF,
             Tsel::new(self.cfg.local.t_sel.clone()),
             Tsel::new(self.cfg.remote.t_sel.clone()),
             self.cfg.tpdu_size_exp,
@@ -552,7 +577,7 @@ impl Association {
         if matches!(self.state, State::Closed) {
             return;
         }
-        let dr = Tpdu::DisconnectRequest { dst_ref: 1, src_ref: 1, reason: 0 };
+        let dr = Tpdu::DisconnectRequest { dst_ref: self.peer_ref, src_ref: LOCAL_REF, reason: 0 };
         let mut body = Vec::new();
         if dr.write(&mut body).is_ok() {
             let _ = self.queue_tpkt(&body);
@@ -597,9 +622,10 @@ impl Association {
         // Class 0 negotiates *down*: the responder may propose no more than the initiator did.
         let exp = c.tpdu_size_exp.unwrap_or(cotp::TPDU_SIZE_MIN_EXP).min(self.cfg.tpdu_size_exp);
         self.tpdu_data = cotp::tpdu_size(exp).saturating_sub(3);
+        self.peer_ref = c.src_ref;
         let cc = cotp::Connect {
             dst_ref: c.src_ref,
-            src_ref: 1,
+            src_ref: LOCAL_REF,
             class_options: 0,
             tpdu_size_exp: Some(exp),
             src_tsel: c.dst_tsel.clone(),
@@ -620,6 +646,7 @@ impl Association {
         }
         let exp = c.tpdu_size_exp.unwrap_or(cotp::TPDU_SIZE_MIN_EXP).min(self.cfg.tpdu_size_exp);
         self.tpdu_data = cotp::tpdu_size(exp).saturating_sub(3);
+        self.peer_ref = c.src_ref;
         self.state = State::Associating;
         self.send_associate_request()
     }
@@ -677,12 +704,12 @@ impl Association {
         };
         self.peer_max_pdu = usize::try_from(init.local_detail.unwrap_or(0)).unwrap_or(0);
         // The **called** end's budget: how many requests the client agreed this server may
-        // have outstanding toward it.
-        let mine = usize::try_from(init.max_serv_outstanding_called).unwrap_or(0);
+        // have outstanding toward it, capped by what this server negotiated back.
+        let mine = usize::try_from(init.max_serv_outstanding_called).unwrap_or(0).clamp(1, usize::from(self.cfg.max_outstanding).max(1));
         self.answer_associate(&cp, mms_context, acse_context, &init)?;
         self.established(Negotiated {
             max_pdu: if self.peer_max_pdu == 0 { self.cfg.max_pdu as usize } else { self.peer_max_pdu },
-            max_outstanding: mine.max(1),
+            max_outstanding: mine,
             tpdu_data: self.tpdu_data,
             mms_context,
         });
@@ -806,6 +833,17 @@ impl Association {
                 self.stats.reports_received = self.stats.reports_received.saturating_add(1);
                 AssociationEvent::Unconfirmed { pdu: bytes.to_vec() }
             }
+            Mms::Reject(reject) => {
+                let reject = *reject;
+                // A reject *answers* the request it names. Releasing the slot here is the
+                // whole point: without it the caller blocks for `request_timeout_ms` and then
+                // reports a timeout for an answer that arrived at once.
+                if let Some(id) = reject.original_invoke_id {
+                    self.outstanding.remove(&id);
+                }
+                self.stats.rejected = self.stats.rejected.saturating_add(1);
+                AssociationEvent::Rejected { invoke_id: reject.original_invoke_id, reject }
+            }
             Mms::ConcludeRequest => {
                 // The MMS-level orderly release. Answer it and go.
                 let _ = self.send_pdu_unchecked(&Mms::ConcludeResponse);
@@ -835,7 +873,9 @@ impl Association {
 
     /// The client's CR-follow-up: session CONNECT ▸ presentation CP ▸ AARQ ▸ MMS `Initiate`.
     fn send_associate_request(&mut self) -> Result<()> {
-        let initiate = Mms::InitiateRequest(Initiate::request(i64::from(self.cfg.max_pdu), PARAMETER_CBB, SERVICES_SUPPORTED)).to_vec()?;
+        let initiate =
+            Mms::InitiateRequest(Initiate::request(i64::from(self.cfg.max_pdu), i64::from(self.cfg.max_outstanding), PARAMETER_CBB, SERVICES_SUPPORTED))
+                .to_vec()?;
         let called = self.cfg.remote.ap_title_element();
         let calling = self.cfg.local.ap_title_element();
         let called_q = self.cfg.remote.ae_qualifier_element();
@@ -866,9 +906,14 @@ impl Association {
     /// The server's answer: session ACCEPT ▸ presentation CPA ▸ AARE ▸ `Initiate` response.
     fn answer_associate(&mut self, cp: &Cp<'_>, mms_context: u16, acse_context: u16, peer: &Initiate<'_>) -> Result<()> {
         let max_pdu = i64::from(self.cfg.max_pdu).min(peer.local_detail.unwrap_or(i64::from(self.cfg.max_pdu)));
-        let mut init = Initiate::request(max_pdu, PARAMETER_CBB, SERVICES_SUPPORTED);
-        init.max_serv_outstanding_calling = i64::from(self.cfg.max_outstanding);
-        init.max_serv_outstanding_called = i64::from(self.cfg.max_outstanding);
+        let mine = i64::from(self.cfg.max_outstanding);
+        let mut init = Initiate::request(max_pdu, mine, PARAMETER_CBB, SERVICES_SUPPORTED);
+        // ISO 9506 negotiates *down*, exactly as `localDetail` above does: the negotiated
+        // value may not exceed what the client proposed. Answering with this server's own
+        // configuration regardless would tell a client that asked for two that it may have
+        // ten, and the limit each end enforces would then be a different number.
+        init.max_serv_outstanding_calling = mine.min(peer.max_serv_outstanding_calling.max(1));
+        init.max_serv_outstanding_called = mine.min(peer.max_serv_outstanding_called.max(1));
         let initiate = Mms::InitiateResponse(init).to_vec()?;
         let responding = self.cfg.local.ap_title_element();
         let responding_q = self.cfg.local.ae_qualifier_element();
@@ -1064,6 +1109,116 @@ mod tests {
         (c, s)
     }
 
+    /// ISO 9506 negotiates the outstanding-call budget *down*, exactly as it does the PDU
+    /// size. A server that answers with its own configuration regardless tells a client that
+    /// asked for two that it may have ten, and the two ends then enforce different numbers.
+    #[test]
+    fn the_outstanding_call_budget_is_negotiated_down_from_both_sides() {
+        for (client_max, server_max) in [(2u8, 10u8), (10, 2), (4, 4)] {
+            let c_cfg = AssociationConfig { max_outstanding: client_max, ..AssociationConfig::default() };
+            let s_cfg = AssociationConfig { max_outstanding: server_max, ..AssociationConfig::default() };
+            let (mut c, mut s) = (Association::client(c_cfg), Association::server(s_cfg));
+            c.start(Instant::ZERO).unwrap();
+            pump(&mut c, &mut s, Instant::ZERO);
+            let agreed = usize::from(client_max.min(server_max));
+            assert_eq!(c.negotiated().unwrap().max_outstanding, agreed, "client with {client_max} against server with {server_max}");
+            assert_eq!(s.negotiated().unwrap().max_outstanding, agreed, "server with {server_max} against client with {client_max}");
+        }
+    }
+
+    /// The budget is the one `call` enforces, so the negotiation is not cosmetic.
+    #[test]
+    fn a_client_may_not_exceed_the_budget_the_server_agreed_to() {
+        let c_cfg = AssociationConfig { max_outstanding: 10, request_timeout_ms: 0, ..AssociationConfig::default() };
+        let s_cfg = AssociationConfig { max_outstanding: 2, ..AssociationConfig::default() };
+        let (mut c, mut s) = (Association::client(c_cfg), Association::server(s_cfg));
+        c.start(Instant::ZERO).unwrap();
+        pump(&mut c, &mut s, Instant::ZERO);
+        let req = ConfirmedRequest::Identify;
+        assert!(c.call(Instant::ZERO, &req).is_ok());
+        assert!(c.call(Instant::ZERO, &req).is_ok());
+        assert!(matches!(c.call(Instant::ZERO, &req), Err(Error::LimitExceeded { limit: "max_outstanding", .. })), "the third exceeds the agreed two");
+    }
+
+    /// A COTP disconnect request has to name the reference the *peer* issued. Hard-coding it
+    /// worked only because this crate's own server also hard-coded the same number — the
+    /// self-consistency trap the reference-capture tests exist to catch.
+    #[test]
+    fn a_disconnect_request_names_the_reference_the_peer_issued() {
+        let mut c = Association::client(AssociationConfig::default());
+        c.start(Instant::ZERO).unwrap();
+        while c.poll_transmit().is_some() {}
+        // A connection confirm from a peer that picked its own reference, as a real IED does.
+        let cc = cotp::Connect { dst_ref: 1, src_ref: 0x1234, class_options: 0, tpdu_size_exp: Some(cotp::TPDU_SIZE_MAX_EXP), src_tsel: None, dst_tsel: None };
+        let mut body = Vec::new();
+        Tpdu::ConnectionConfirm(cc).write(&mut body).unwrap();
+        let mut packet = tpkt::header(body.len()).unwrap().to_vec();
+        packet.extend_from_slice(&body);
+        c.on_bytes(Instant::ZERO, &packet);
+        // Drain the association request the confirm triggered, then abort.
+        while c.poll_transmit().is_some() {}
+        c.abort();
+        let dr = c.poll_transmit().expect("a disconnect request").to_vec();
+        let tpdu = Tpdu::parse(dr.get(tpkt::HEADER_LEN..).unwrap()).unwrap();
+        assert!(matches!(tpdu, Tpdu::DisconnectRequest { dst_ref: 0x1234, src_ref: LOCAL_REF, .. }), "{tpdu:?}");
+    }
+
+    /// ISO 9506's `reject-PDU` **answers** the request it names, so it releases that invoke.
+    /// Handing it up as an unconfirmed PDU — a report — instead leaves the identifier
+    /// outstanding, and the caller waits out its whole request timeout for an answer that has
+    /// already arrived, then reports silence rather than the reason.
+    #[test]
+    fn a_reject_answers_the_request_it_names_and_releases_it() {
+        use crate::proto::mms::reject::{Reject, RejectReason, UNRECOGNIZED_SERVICE};
+
+        let (mut c, mut s) = connect();
+        let id = c.call(Instant::ZERO, &ConfirmedRequest::Identify).unwrap();
+        pump(&mut c, &mut s, Instant::ZERO);
+        assert_eq!(c.outstanding(), 1);
+        let _ = events(&mut c);
+
+        // The server rejects it rather than answering the service.
+        s.send(&Mms::Reject(Reject::confirmed_request(id, UNRECOGNIZED_SERVICE))).unwrap();
+        pump(&mut c, &mut s, Instant::ZERO);
+
+        assert_eq!(c.outstanding(), 0, "the reject released the invoke identifier");
+        assert_eq!(c.stats().rejected, 1);
+        let seen = events(&mut c);
+        assert!(
+            matches!(
+                seen.as_slice(),
+                [AssociationEvent::Rejected { invoke_id: Some(got), reject: Reject { reason: RejectReason::ConfirmedRequest(UNRECOGNIZED_SERVICE), .. } }]
+                    if *got == id
+            ),
+            "{seen:?}"
+        );
+        // …and it is not counted as a report.
+        assert_eq!(c.stats().reports_received, 0);
+    }
+
+    /// A reject that names no request cannot release one, but it still has to be reported —
+    /// it is the peer saying it could not read what we sent.
+    #[test]
+    fn a_reject_without_an_invoke_identifier_is_still_reported() {
+        use crate::proto::mms::reject::{INVALID_PDU, Reject, RejectReason};
+
+        let (mut c, mut s) = connect();
+        let id = c.call(Instant::ZERO, &ConfirmedRequest::Identify).unwrap();
+        pump(&mut c, &mut s, Instant::ZERO);
+        let _ = events(&mut c);
+
+        s.send(&Mms::Reject(Reject::pdu_error(INVALID_PDU))).unwrap();
+        pump(&mut c, &mut s, Instant::ZERO);
+
+        assert_eq!(c.outstanding(), 1, "nothing was named, so nothing is released");
+        let seen = events(&mut c);
+        assert!(
+            matches!(seen.as_slice(), [AssociationEvent::Rejected { invoke_id: None, reject: Reject { reason: RejectReason::PduError(INVALID_PDU), .. } }]),
+            "{seen:?}"
+        );
+        let _ = id;
+    }
+
     #[test]
     fn the_two_ends_complete_the_six_layer_handshake() {
         let (mut c, mut s) = connect();
@@ -1179,7 +1334,7 @@ mod tests {
         let _connect = c.poll_transmit().map(<[u8]>::to_vec).unwrap();
 
         // A server answering "you may have 5 outstanding, I may have 1".
-        let mut init = Initiate::request(16_000, PARAMETER_CBB, SERVICES_SUPPORTED);
+        let mut init = Initiate::request(16_000, 10, PARAMETER_CBB, SERVICES_SUPPORTED);
         init.max_serv_outstanding_calling = 5;
         init.max_serv_outstanding_called = 1;
         c.on_bytes(Instant::ZERO, &tpkt_packet(&server_accept(&init)));

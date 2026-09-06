@@ -146,7 +146,7 @@ fn a_patched_template_dissects_as_well_as_an_encoded_one() {
         .with_time_fields(true, true),
     )
     .unwrap();
-    mu.set_smp_synch(SmpSynch::Global);
+    mu.set_smp_synch(SmpSynch::Global).unwrap();
     mu.set_gm_identity([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
     mu.set_refr_tm(UtcTime::from_unix(1_700_000_000, 0, TimeQuality::SYNCHRONIZED));
     mu.set_smp_cnt(4798);
@@ -176,4 +176,84 @@ fn a_patched_template_dissects_as_well_as_an_encoded_one() {
     }
     // refrTm advances one sample interval per ASDU, not one per frame.
     assert!(text.contains("22:13:20.000208318"), "the second ASDU must be one sample later: {text}");
+}
+
+#[test]
+fn a_local_area_clock_identity_dissects_as_the_number_it_is() {
+    // IEC 61850-9-2 Ed2 gives `smpSynch` the values 0, 1, 2 and 5–254, the last naming the
+    // local-area clock a merging unit is locked to. Written as the single octet the vendor
+    // captures use, 200 is the ASN.1 INTEGER −56, and Wireshark says so — an emitted frame
+    // that does not dissect as itself, which is the one thing this crate promises it will
+    // never ship. The width has to grow with the value.
+    if common::tshark().is_none() {
+        return;
+    }
+    let mut mu = SvPublisher::new(SvPublisherConfig::new(
+        FrameHeader {
+            dst: MacAddr::parse("01-0C-CD-04-00-01").unwrap(),
+            src: MacAddr([2, 0, 0, 0, 0, 2]),
+            vlan: Some(VlanTag::DEFAULT),
+            ethertype: ETHERTYPE_SV,
+            appid: 0x4001,
+            reserved1: 0,
+            reserved2: 0,
+        },
+        "LOCALCLK",
+        SvProfile::LE_80_50HZ,
+    ))
+    .unwrap();
+    let sample = PhsMeas1 { currents: [1, 2, 3, 4], current_quality: [Quality::GOOD; 4], voltages: [5, 6, 7, 8], voltage_quality: [Quality::GOOD; 4] }.encode();
+    let mut frames = Vec::new();
+    for (i, synch) in [SmpSynch::Global, SmpSynch::LocalClock(200), SmpSynch::LocalClock(254), SmpSynch::None].into_iter().enumerate() {
+        mu.set_smp_synch(synch).unwrap();
+        mu.publish_repeating(Instant(i as u64), &sample).unwrap();
+        frames.push(mu.poll_transmit().unwrap().to_vec());
+    }
+    let text = dissect(&frames);
+    assert!(!text.contains("_ws.malformed"), "{text}");
+    assert!(!text.contains("\"_ws.expert.severity\": \"Error\""), "{text}");
+    for needle in ["\"sv.smpSynch\": \"2\"", "\"sv.smpSynch\": \"200\"", "\"sv.smpSynch\": \"254\"", "\"sv.smpSynch\": \"0\""] {
+        assert!(text.contains(needle), "missing {needle} in {text}");
+    }
+    assert!(!text.contains("\"sv.smpSynch\": \"-"), "no smpSynch may dissect as a negative number: {text}");
+    // The samples survive the re-encode the width change costs.
+    assert!(!text.contains("\"sv.smpCnt\": \"-"), "{text}");
+}
+
+#[test]
+fn a_ninety_six_kilohertz_stream_numbers_its_samples_positively() {
+    // IEC 61869-9 allows 96 kHz for HV d.c. `smpCnt` is `INTEGER (0..65535)`, so the count
+    // falls back to the field's own range — and 65 535 in the two octets an ordinary stream
+    // uses is −1.
+    if common::tshark().is_none() {
+        return;
+    }
+    let profile = SvProfile { samples_per_second: 96_000, asdus_per_frame: 1, ..SvProfile::F4800S2I4U4 };
+    let mut mu = SvPublisher::new(SvPublisherConfig::new(
+        FrameHeader {
+            dst: MacAddr::parse("01-0C-CD-04-00-01").unwrap(),
+            src: MacAddr([2, 0, 0, 0, 0, 2]),
+            vlan: Some(VlanTag::DEFAULT),
+            ethertype: ETHERTYPE_SV,
+            appid: 0x4001,
+            reserved1: 0,
+            reserved2: 0,
+        },
+        "HVDC",
+        profile,
+    ))
+    .unwrap();
+    mu.set_smp_cnt(65_534);
+    let sample = PhsMeas1 { currents: [1, 2, 3, 4], current_quality: [Quality::GOOD; 4], voltages: [5, 6, 7, 8], voltage_quality: [Quality::GOOD; 4] }.encode();
+    let mut frames = Vec::new();
+    for i in 0..3u64 {
+        mu.publish_repeating(Instant(i), &sample).unwrap();
+        frames.push(mu.poll_transmit().unwrap().to_vec());
+    }
+    let text = dissect(&frames);
+    assert!(!text.contains("_ws.malformed"), "{text}");
+    for needle in ["\"sv.smpCnt\": \"65534\"", "\"sv.smpCnt\": \"65535\"", "\"sv.smpCnt\": \"0\""] {
+        assert!(text.contains(needle), "missing {needle} in {text}");
+    }
+    assert!(!text.contains("\"sv.smpCnt\": \"-"), "no smpCnt may dissect as a negative number: {text}");
 }

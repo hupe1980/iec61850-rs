@@ -722,6 +722,15 @@ pub struct IedModel {
 }
 
 impl IedModel {
+    /// The IEC 61850 edition this file declares, from [`IedModel::scl_version`].
+    ///
+    /// Edition is a property of the *server*, never of an association, and this is where a
+    /// server gets it from without being told twice
+    /// ([`Edition::from_scl_version`](crate::common::Edition::from_scl_version)).
+    pub fn edition(&self) -> crate::common::Edition {
+        crate::common::Edition::from_scl_version(&self.scl_version)
+    }
+
     /// The enumerated type with this `id`.
     pub fn enum_type(&self, id: &str) -> Option<&EnumType> {
         self.enum_types.iter().find(|e| e.id == id)

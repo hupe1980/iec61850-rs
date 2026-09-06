@@ -169,14 +169,24 @@ device to keep in step with the first:
 
 ```bash
 $ ied sim bay.scd
-IED1 on 127.0.0.1:102 — logical device(s) IED1LD0
-IED2 on 127.0.0.1:103 — logical device(s) IED2LD0, IED2LD1
+IED1 on 127.0.0.1:102 — Edition 2.1 — logical device(s) IED1LD0
+IED2 on 127.0.0.1:103 — Edition 2.1 — logical device(s) IED2LD0, IED2LD1
 serving; ^C to stop
 ```
 
 Every IED in the file gets its own port. `--ied` serves just one, `--bind` and `--port` choose
 where, and `--files DIR` serves a directory through the MMS file services — read-only unless
 `--writable`, and sandboxed to that directory either way.
+
+The **edition** in the banner is the file's own: `2003` is Edition 1, `2007B` is Edition 2,
+`2007B4` and later Edition 2.1. It decides the report control block's attribute set, so an
+Edition 1 file serves a block with no `ResvTms` and no `Owner` — `--edition 1|2|2.1` overrides
+it.
+
+```bash
+$ ied sim valid2003.scd
+IED1 on 127.0.0.1:102 — Edition 1 — logical device(s) IED1CircuitBreaker_CB1, IED1Disconnectors
+```
 
 It is a real server: browse it, enable a report control block on it, operate its breaker,
 activate a setting group. That is also how the `ied mms` subcommands are tested in CI — one

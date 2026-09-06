@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut mu = Publisher::new(PublisherConfig::new(header, SV_ID, profile).with_conf_rev(1))?;
     // Clock state is publisher state, not a per-frame argument: at 2400 frames a second
     // there is no sense in re-passing the grandmaster's identity 2400 times.
-    mu.set_smp_synch(SmpSynch::Global);
+    mu.set_smp_synch(SmpSynch::Global)?;
 
     let mut sub = Subscriber::new(vec![
         StreamConfig::new(StreamKey { dst, appid: APPID, sv_id: SV_ID.into() }).with_samples_per_second(profile.samples_per_second).with_conf_rev(1),

@@ -1,6 +1,6 @@
 [package]
 name = "iec61850-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -89,7 +89,7 @@ path = "tests/concepts.rs"
 [[test]]
 name = "allocation"
 path = "tests/allocation.rs"
-required-features = ["goose", "sv"]
+required-features = ["goose", "sv", "server"]
 
 [[test]]
 name = "simulation"

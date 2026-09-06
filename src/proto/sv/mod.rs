@@ -27,7 +27,7 @@ pub const fn smp_cnt_wrap(samples_per_second: u32) -> u32 {
     }
 }
 
-pub use apdu::{Asdu, AsduOffsets, AsduView, SavPdu, SavPduView, SmpSynch, TAG_SAV_PDU};
+pub use apdu::{Asdu, AsduOffsets, AsduView, Field, SavPdu, SavPduView, SmpSynch, TAG_SAV_PDU};
 pub use layout::{Channel, ChannelType, ChannelValue, SampleLayout};
 pub use publisher::{Publisher, PublisherConfig, SmpMod, SvProfile};
 pub use subscriber::{Sample, SimulationMode, StreamConfig, StreamKey, StreamState, Subscriber, SubscriberEvent};

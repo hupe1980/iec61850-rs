@@ -28,9 +28,19 @@ fn openscd_fixtures_load() {
         files += 1;
         let version = scl::scl_version(&xml).unwrap();
         assert!(["2003", "2007B", "2007B4"].contains(&version.as_str()), "{}: {version}", path.display());
+        // Edition is a property of the server and the server's edition is what its file
+        // declares — so this corpus, which spans three schema versions, is where that
+        // mapping is checked against files nobody here wrote.
+        let want = match version.as_str() {
+            "2003" => Edition::Ed1,
+            "2007B" => Edition::Ed2,
+            _ => Edition::Ed2_1,
+        };
+        assert_eq!(Edition::from_scl_version(&version), want, "{}: {version}", path.display());
         for name in scl::ied_names(&xml).unwrap() {
             let model = IedModel::from_scl(&xml, Some(&name)).unwrap_or_else(|e| panic!("{}: IED {name}: {e}", path.display()));
             assert_eq!(model.name, name);
+            assert_eq!(model.edition(), want, "{}: IED {name}", path.display());
             ieds += 1;
             let strict = IedModel::from_scl_with(&xml, Some(&name), LoadOptions { strict: true });
             assert_eq!(strict.is_err(), !model.diagnostics.is_empty(), "{}: strict must fail iff lenient reported something", path.display());

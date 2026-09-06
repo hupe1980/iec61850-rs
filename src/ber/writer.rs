@@ -123,6 +123,26 @@ impl Encoder {
         self.primitive(tag, &bytes[start..])
     }
 
+    /// Unsigned INTEGER at `min_width` contents octets, widened by one when the value would
+    /// otherwise come out **negative**.
+    ///
+    /// This is what a fixed-width field on the wire actually needs. A sampled-value publisher
+    /// writes `smpCnt`, `confRev`, `smpSynch` and `smpRate` at a constant width so a template
+    /// patch cannot shift a length underneath it, and the vendor captures confirm the widths:
+    /// `82 02` for `smpCnt`, `83 04` for `confRev`, `85 01` for `smpSynch`. But those widths
+    /// only stay *valid* while the top bit is clear. `smpSynch` is `0..254` (values 5–254
+    /// name a local-area clock, IEC 61850-9-2 Ed2), and 200 written as the single octet `C8`
+    /// is the ASN.1 INTEGER **−56** — Wireshark dissects it as −56, which is the project's
+    /// oracle rule failing on a value the standard defines. `smpCnt` reaches 65 535 on the
+    /// 96 kHz profile IEC 61869-9 allows for HV DC, and `12 C0` is fine while `FF FF` is −1.
+    ///
+    /// So the width is the field's width *or* one more, and the extra octet is the leading
+    /// zero BER wants. It stays constant for a given stream because the publisher sizes the
+    /// template from the largest value the stream can produce, not from the current one.
+    pub fn unsigned_fixed_min(&mut self, tag: Tag, value: u64, min_width: usize) -> Result<&mut Self> {
+        self.unsigned_fixed(tag, value, unsigned_width(value, min_width))
+    }
+
     /// Unsigned INTEGER encoded with exactly `width` contents octets, big-endian, with no
     /// leading zero octet even when the top bit is set.
     ///
@@ -235,6 +255,25 @@ fn encode_length_into(len: usize, out: &mut [u8; 5]) -> Result<usize> {
     out[0] = 0x80 | n as u8;
     out[1..=n].copy_from_slice(&bytes[skip..]);
     Ok(n + 1)
+}
+
+/// Contents octets needed to encode `value` as a **positive** BER INTEGER, at least
+/// `min_width`.
+///
+/// Values above `i64::MAX` cannot be expressed as a positive INTEGER in eight octets and are
+/// reported as eight; no field in this crate reaches that, the widest being `confRev`'s
+/// `INT32U`.
+pub const fn unsigned_width(value: u64, min_width: usize) -> usize {
+    let mut w = 1;
+    while w < 8 && value >> (w * 8) != 0 {
+        w += 1;
+    }
+    // The most significant octet's top bit would make the INTEGER negative: one more octet,
+    // which is the leading zero X.690 asks for.
+    if w < 8 && (value >> (w * 8 - 1)) & 1 == 1 {
+        w += 1;
+    }
+    if w < min_width { min_width } else { w }
 }
 
 #[cfg(test)]

@@ -34,7 +34,7 @@ impl Float {
         }
     }
 }
-pub use writer::Encoder;
+pub use writer::{Encoder, unsigned_width};
 
 /// The class of a BER tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

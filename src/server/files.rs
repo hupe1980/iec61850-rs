@@ -36,11 +36,22 @@ pub struct FileInfo {
 /// Implement it to serve records out of a database, a ring buffer or a compressed archive;
 /// [`DirectoryStore`] serves a directory, and [`NoFiles`] is the default, because an IED that
 /// has no files should say so rather than expose a filesystem by accident.
+/// The store is read in **ranges**, never whole. A `FileRead` hands a client one chunk at a
+/// time, so a server that reads the whole file to serve the first chunk has made its memory
+/// bound the *file* size rather than the chunk size — and a client that opens a 200 MB
+/// COMTRADE record five times has then allocated a gigabyte of it. `read_at` is the shape
+/// that makes an open cost nothing.
 pub trait FileStore: core::fmt::Debug + Send + Sync {
     /// Files matching `spec` — a directory prefix, or everything when `None`.
     fn list(&self, spec: Option<&str>) -> Vec<FileInfo>;
-    /// The contents of `path`, or `None` when there is no such file.
-    fn read(&self, path: &str) -> Option<Vec<u8>>;
+    /// What the store knows about one file, or `None` when there is no such file.
+    fn info(&self, path: &str) -> Option<FileInfo>;
+    /// Up to `len` octets of `path` from `offset`.
+    ///
+    /// A short answer means end of file; `None` means there is no such file (any more). The
+    /// caller never asks for more than one `FileRead` carries, so an implementation may read
+    /// exactly what was asked for and nothing else.
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Option<Vec<u8>>;
     /// Delete `path`; `false` when it does not exist or may not be deleted.
     fn delete(&self, path: &str) -> bool {
         let _ = path;
@@ -57,7 +68,11 @@ impl FileStore for NoFiles {
         Vec::new()
     }
 
-    fn read(&self, _path: &str) -> Option<Vec<u8>> {
+    fn info(&self, _path: &str) -> Option<FileInfo> {
+        None
+    }
+
+    fn read_at(&self, _path: &str, _offset: u64, _len: usize) -> Option<Vec<u8>> {
         None
     }
 }
@@ -163,9 +178,37 @@ impl FileStore for DirectoryStore {
         out
     }
 
-    fn read(&self, path: &str) -> Option<Vec<u8>> {
+    fn info(&self, path: &str) -> Option<FileInfo> {
         let real = self.resolve(path)?;
-        real.is_file().then(|| std::fs::read(real).ok())?
+        let meta = std::fs::metadata(&real).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        Some(FileInfo { name: self.relative(&real)?, size: u32::try_from(meta.len()).unwrap_or(u32::MAX), modified: modified_of(&meta) })
+    }
+
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let real = self.resolve(path)?;
+        if !real.is_file() {
+            return None;
+        }
+        let mut file = std::fs::File::open(real).ok()?;
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        // `len` is one `FileRead` chunk, which the server configures; the buffer is that
+        // size and never the file's, which is the whole point of reading in ranges.
+        let mut buf = alloc::vec![0u8; len];
+        let mut filled = 0usize;
+        while filled < len {
+            match file.read(buf.get_mut(filled..)?) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return None,
+            }
+        }
+        buf.truncate(filled);
+        Some(buf)
     }
 
     fn delete(&self, path: &str) -> bool {
@@ -245,24 +288,60 @@ mod tests {
         let store = DirectoryStore::new(&dir);
         let names: Vec<String> = store.list(None).into_iter().map(|f| f.name).collect();
         assert_eq!(names, ["COMTRADE/rec0001.cfg", "top.txt"]);
-        assert_eq!(store.read("COMTRADE/rec0001.cfg").as_deref(), Some(&b"STATION,IED1,2013\n"[..]));
+        assert_eq!(store.read_at("COMTRADE/rec0001.cfg", 0, 64).as_deref(), Some(&b"STATION,IED1,2013\n"[..]));
+        assert_eq!(store.info("COMTRADE/rec0001.cfg").map(|f| f.size), Some(18));
         assert_eq!(store.list(Some("COMTRADE")).len(), 1);
 
         // Every shape of traversal reads as "not found", and never as a different error: a
         // client that can tell the two apart can map the filesystem.
         for escape in ["../outside.txt", "COMTRADE/../../outside.txt", "/etc/hosts", "..%2foutside.txt"] {
-            assert!(store.read(escape).is_none(), "`{escape}` escaped the sandbox");
+            assert!(store.read_at(escape, 0, 64).is_none(), "`{escape}` escaped the sandbox");
+            assert!(store.info(escape).is_none(), "`{escape}` escaped the sandbox");
             assert!(store.list(Some(escape)).is_empty());
         }
         // Read-only by default: a client cannot delete a record an operator has not agreed
         // to lose.
         assert!(!store.delete("top.txt"));
         assert!(DirectoryStore::new(&dir).writable().delete("top.txt"));
-        assert!(store.read("top.txt").is_none());
+        assert!(store.read_at("top.txt", 0, 64).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
         if let Some(p) = &outside {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// A store is read in ranges so that a `FileRead` costs one chunk, not one file. The
+    /// ranges have to tile the file exactly: a short read means end of file and nothing else,
+    /// and an offset past the end is empty rather than an error.
+    #[test]
+    fn a_range_read_tiles_the_file_and_stops_at_its_end() {
+        let dir = std::env::temp_dir().join(alloc::format!("iec61850-ranges-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create");
+        let body: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        std::fs::write(dir.join("rec.dat"), &body).expect("write");
+        let store = DirectoryStore::new(&dir);
+
+        assert_eq!(store.info("rec.dat").map(|f| f.size), Some(1000));
+        let mut got = Vec::new();
+        let mut at = 0u64;
+        loop {
+            let chunk = store.read_at("rec.dat", at, 256).expect("read");
+            if chunk.is_empty() {
+                break;
+            }
+            at += chunk.len() as u64;
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(got, body, "the ranges reassemble the file exactly");
+        // The last range is short, which is how end-of-file is signalled.
+        assert_eq!(store.read_at("rec.dat", 768, 256).map(|c| c.len()), Some(232));
+        // Past the end is empty, not an error: a client resuming a transfer of a file that
+        // shrank has to get a clean end rather than a fault.
+        assert_eq!(store.read_at("rec.dat", 5000, 256).map(|c| c.len()), Some(0));
+        assert!(store.read_at("missing.dat", 0, 8).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -112,7 +112,7 @@ use iec61850_rs::proto::sv::{Publisher, PublisherConfig, SmpSynch, SvProfile};
 
 // 9-2LE, 80 samples per cycle at 50 Hz.
 let mut mu = Publisher::new(PublisherConfig::new(header, "MU01", SvProfile::LE_80_50HZ))?;
-mu.set_smp_synch(SmpSynch::Global);   // stream state, set when the clock changes
+mu.set_smp_synch(SmpSynch::Global)?;  // stream state, set when the clock changes
 
 mu.publish(now, &[&sample_block])?;
 if let Some(frame) = mu.poll_transmit() {

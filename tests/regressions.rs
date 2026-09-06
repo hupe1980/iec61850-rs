@@ -36,6 +36,53 @@ fn every_mms_stack_regression_still_decodes_without_panicking() {
     }
 }
 
+/// The server half, from the same corpus rule: an input the `mms_server` target crashed on is
+/// replayed through the request path it crashed in.
+#[cfg(all(feature = "server", feature = "scl"))]
+#[test]
+fn every_mms_server_regression_still_answers_without_panicking() {
+    use iec61850_rs::common::Instant;
+    use iec61850_rs::proto::mms::Mms;
+    use iec61850_rs::server::{Acsi, Ied};
+
+    let files = corpus("mms_server");
+    if files.is_empty() {
+        return;
+    }
+    for file in &files {
+        let data = std::fs::read(file).unwrap();
+        let ied = Ied::from_scl(FUZZ_MODEL, Some("IED1")).unwrap();
+        let mut acsi = Acsi::new(ied);
+        for (n, chunk) in data.chunks(64).enumerate() {
+            let assoc = (n % 2) as u64 + 1;
+            let now = Instant::ZERO.plus_millis(n as u64 + 1);
+            if let Ok(Mms::ConfirmedRequest { invoke_id, service }) = Mms::parse(chunk, &Limits::DEFAULT) {
+                let answer = acsi.request(assoc, now, &service);
+                // The property the crash broke: an answer the encoder refuses is a request a
+                // client waits for ever on, which is worse than any error response.
+                answer.encode(invoke_id).expect("every answer must encode");
+            }
+            for (_, pdu) in acsi.commit(now) {
+                Mms::parse(&pdu, &Limits::DEFAULT).expect("every report must decode");
+            }
+        }
+    }
+}
+
+/// The model `fuzz/fuzz_targets/mms_server.rs` uses, trimmed to what these inputs reach.
+#[cfg(all(feature = "server", feature = "scl"))]
+const FUZZ_MODEL: &str = r#"<?xml version="1.0"?>
+<SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">
+  <Header id="f"/>
+  <IED name="IED1"><AccessPoint name="P1"><Server><LDevice inst="LD0">
+    <LN0 lnClass="LLN0" inst="" lnType="LLN0_T"/>
+  </LDevice></Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="Mod" type="INC_T"/></LNodeType>
+    <DOType id="INC_T" cdc="INC"><DA name="stVal" fc="ST" bType="INT32"/></DOType>
+  </DataTypeTemplates>
+</SCL>"#;
+
 #[cfg(feature = "goose")]
 #[test]
 fn every_goose_regression_still_decodes_without_panicking() {

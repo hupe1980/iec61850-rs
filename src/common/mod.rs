@@ -18,7 +18,9 @@ pub use error::{DecodeReason, Error, Result};
 pub use flags::{ControlModel, OptFlds, ReasonCode, TrgOps};
 pub use limits::Limits;
 pub use mac::MacAddr;
-pub use machine::{Clock, EventQueue, Instant, ManualClock};
+#[cfg(feature = "std")]
+pub use machine::SystemClock;
+pub use machine::{Clock, EventQueue, Instant, ManualClock, Now};
 pub use quality::{Quality, Source, Validity};
 pub use reference::{Fc, ObjectReference};
 pub use time::{EntryTime, TimeQuality, UtcTime};

@@ -38,7 +38,7 @@ let mut mu = Publisher::new(
     PublisherConfig::new(header, "MU01", SvProfile::F4800S2I4U4)   // header: MAC, VLAN, APPID
         .with_conf_rev(1),
 )?;
-mu.set_smp_synch(SmpSynch::Global);          // stream state, not a per-frame argument
+mu.set_smp_synch(SmpSynch::Global)?;         // stream state, not a per-frame argument
 
 loop {
     let blocks = adc.next_blocks(mu.asdus_per_frame());   // one per ASDU
@@ -63,8 +63,7 @@ If your merging unit derives `smpCnt` from an absolute time source rather than c
 change on the order of seconds while frames leave 2400 times a second. So they are setters —
 `set_smp_synch`, `set_refr_tm`, `set_gm_identity` — each of which patches every ASDU of the
 template in place. Whether the two optional fields exist at all is decided when the publisher
-is built, because their presence changes the frame length and nothing may change the frame
-length after that:
+is built, because their presence changes the frame length:
 
 ```rust
 let mut mu = Publisher::new(
@@ -73,9 +72,15 @@ let mut mu = Publisher::new(
 )?;
 
 // Whenever ptp4l says the clock state moved:
-mu.set_smp_synch(if traceable { SmpSynch::Global } else { SmpSynch::None });
+mu.set_smp_synch(if traceable { SmpSynch::Global } else { SmpSynch::None })?;
 mu.set_gm_identity(grandmaster_identity);
 ```
+
+`set_smp_synch` is the one setter that returns a `Result`, because it is the one whose field
+can change width. `smpSynch` is `0..254` and the values 5–254 name the local-area clock a
+merging unit is locked to; 200 needs two octets where 2 needs one, so crossing that boundary
+re-encodes the template instead of writing a value that would come out negative. It happens at
+a clock transition, never on the publishing path.
 
 `set_refr_tm` takes the timestamp of the **first sample of the frame** and stamps each ASDU
 after it one sample interval later, because the ASDUs of one frame are consecutive samples —
@@ -96,14 +101,24 @@ Publishing then patches only what changes: each ASDU's `smpCnt` and its sample b
 frames a second the steady state does no encoding and no allocation.
 
 That is only sound because the encoder writes `smpCnt`, `confRev`, `smpSynch`, `refrTm` and
-`gmIdentity` at fixed widths, so no length can shift underneath a patch. And the patch
-offsets are not computed by hand: the publisher **decodes the template it just encoded** and
-takes the offsets the decoder reports, so the two can never disagree about the layout.
+`gmIdentity` at fixed widths, so no length can shift underneath a patch. And the patch offsets
+are not computed by hand: the publisher **decodes the template it just encoded** and takes the
+offsets *and widths* the decoder reports, so the two can never disagree about the layout.
 
-This is checked directly. A `sv_publisher` fuzz target throws arbitrary sample bytes and
+The width is chosen for the whole stream's range rather than for the value in front of it,
+which matters more than it sounds. A BER INTEGER is **signed**: `smpSynch = 200` in the single
+octet a vendor capture shows is the number −56, and a 96 kHz stream's `smpCnt` of 65 535 in two
+octets is −1. Wireshark dissects both exactly that way. So each field is written at its
+customary width *or one octet more* — the leading zero X.690 asks for — and the publisher sizes
+its template from the largest `smpCnt` the profile can reach. Every ordinary value is
+byte-identical to what a real merging unit emits; no value is ever negative.
+
+This is checked two ways. A `sv_publisher` fuzz target throws arbitrary sample bytes and
 counters at the patching path on both template layouts — with and without the optional clock
-fields — decodes the result, and compares field by field. A patch that ever wrote outside its
-field would show up immediately.
+fields — decodes the result, and compares field by field; a patch that ever wrote outside its
+field shows up immediately. And the Wireshark oracle walks the *declared range* of each field
+rather than the values that happen to be typical, asserting that no `smpSynch` and no `smpCnt`
+ever dissects as a negative number.
 
 ## What the octets of an ASDU mean
 

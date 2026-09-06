@@ -19,6 +19,7 @@ pub mod association;
 pub mod control;
 pub mod file;
 pub mod journal;
+pub mod reject;
 pub mod report;
 pub mod typespec;
 
@@ -29,6 +30,7 @@ use crate::common::{DecodeReason, Error, Limits, Result};
 use crate::proto::data::DataView;
 use file::{DirectoryEntry, FileAttributes, FileName};
 use journal::{AfterEntry, JournalEntry, RangeStart, RangeStop, TimeOfDay};
+use reject::Reject;
 use typespec::TypeSpec;
 
 /// `Identifier ::= VisibleString`.
@@ -310,16 +312,19 @@ pub struct Initiate<'a> {
 }
 
 impl<'a> Initiate<'a> {
-    /// The proposal a client makes: `max_pdu` octets, ten outstanding calls, nesting five,
-    /// and the services this crate can actually issue.
+    /// The proposal one end makes: `max_pdu` octets, `outstanding` calls in each direction,
+    /// nesting five, and the services this crate can actually issue.
     ///
-    /// `parameter_cbb` and `services_supported` are passed in because what a peer may ask of
-    /// us is a property of the layer above, not of the codec.
-    pub fn request(max_pdu: i64, parameter_cbb: (u8, &'a [u8]), services_supported: (u8, &'a [u8])) -> Initiate<'a> {
+    /// `outstanding` is a parameter rather than a constant because it is what the association
+    /// then *enforces*: a client that proposes ten and is configured for two would either
+    /// have to break its own limit or discover it as a reject. `parameter_cbb` and
+    /// `services_supported` are passed in for the same reason — what a peer may ask of us is
+    /// a property of the layer above, not of the codec.
+    pub fn request(max_pdu: i64, outstanding: i64, parameter_cbb: (u8, &'a [u8]), services_supported: (u8, &'a [u8])) -> Initiate<'a> {
         Initiate {
             local_detail: Some(max_pdu),
-            max_serv_outstanding_calling: 10,
-            max_serv_outstanding_called: 10,
+            max_serv_outstanding_calling: outstanding,
+            max_serv_outstanding_called: outstanding,
             data_structure_nesting_level: Some(5),
             version: 1,
             parameter_cbb,
@@ -722,8 +727,13 @@ pub enum Mms<'a> {
     },
     /// `unconfirmed-PDU [3]`.
     Unconfirmed(Unconfirmed<'a>),
-    /// `rejectPDU [4]`, kept encoded.
-    Reject(Tlv<'a>),
+    /// `rejectPDU [4]`.
+    ///
+    /// Decoded rather than kept as octets, because it is an **answer**: its
+    /// `originalInvokeID` names a confirmed request that will never be answered any other
+    /// way, and a peer that treats it as an unsolicited PDU waits out its whole request
+    /// timeout for something that already arrived.
+    Reject(Reject),
     /// `initiate-RequestPDU [8]`.
     InitiateRequest(Initiate<'a>),
     /// `initiate-ResponsePDU [9]`.
@@ -1259,6 +1269,18 @@ impl<'a> ConfirmedResponse<'a> {
     }
 }
 
+/// `invokeID` is `Unsigned32` in every PDU that carries one ✅ (`mms.asn`), so a negative or
+/// oversized one is not an identifier any peer could have issued.
+///
+/// Accepting one has a specific cost: the answer has to *name* it, and a name outside the
+/// field's range is one the answer cannot encode — leaving the client waiting for ever for a
+/// response the server could not build. A PDU whose identifier is unusable is not a request
+/// that can be answered at all, so it is refused here rather than patched at the encoder.
+fn invoke_id_of(t: &Tlv<'_>) -> Result<i64> {
+    let v = t.integer_i64()?;
+    if (0..=i64::from(u32::MAX)).contains(&v) { Ok(v) } else { Err(Error::decode(DecodeReason::BadValue, t.value_offset)) }
+}
+
 impl<'a> Mms<'a> {
     /// Decode an MMS PDU, enforcing `limits` on the lists inside it.
     pub fn parse(buf: &'a [u8], limits: &Limits) -> Result<Mms<'a>> {
@@ -1269,7 +1291,7 @@ impl<'a> Mms<'a> {
         Ok(match top.tag.number {
             0 => {
                 let mut c = top.children();
-                let invoke_id = c.next_tag(TAG_INTEGER)?.integer_i64()?;
+                let invoke_id = invoke_id_of(&c.next_tag(TAG_INTEGER)?)?;
                 // `listOfModifier` is a SEQUENCE OF and IEC 61850 never sends one; a peer
                 // that does would put it here, so it is skipped rather than mistaken for
                 // the service.
@@ -1281,7 +1303,7 @@ impl<'a> Mms<'a> {
             }
             1 => {
                 let mut c = top.children();
-                let invoke_id = c.next_tag(TAG_INTEGER)?.integer_i64()?;
+                let invoke_id = invoke_id_of(&c.next_tag(TAG_INTEGER)?)?;
                 Mms::ConfirmedResponse { invoke_id, service: ConfirmedResponse::parse(c.next_required()?, limits)? }
             }
             2 => {
@@ -1291,7 +1313,7 @@ impl<'a> Mms<'a> {
                 // the service error itself whenever that error is tagged [1], which is a PDU
                 // that decodes and then cannot be re-encoded. The fuzzer found exactly that.
                 let mut c = top.children();
-                let invoke_id = c.next_tag(Tag::context(0))?.integer_i64()?;
+                let invoke_id = invoke_id_of(&c.next_tag(Tag::context(0))?)?;
                 let modifier_position = c.next_if_tag(Tag::context(1))?.map(|t| t.unsigned_lenient_u32()).transpose()?;
                 let error = c.next_required()?;
                 Mms::ConfirmedError { invoke_id, modifier_position, error }
@@ -1307,7 +1329,7 @@ impl<'a> Mms<'a> {
                     Unconfirmed::Other(service)
                 })
             }
-            4 => Mms::Reject(top),
+            4 => Mms::Reject(Reject::parse(&top)?),
             8 => Mms::InitiateRequest(Initiate::parse(&top)?),
             9 => Mms::InitiateResponse(Initiate::parse(&top)?),
             10 => Mms::InitiateError(top),
@@ -1362,7 +1384,8 @@ impl<'a> Mms<'a> {
             Mms::ConcludeResponse => {
                 out.primitive(Tag::context(12), &[])?;
             }
-            Mms::Reject(t) | Mms::InitiateError(t) | Mms::ConcludeError(t) | Mms::Other(t) => {
+            Mms::Reject(r) => r.write(out)?,
+            Mms::InitiateError(t) | Mms::ConcludeError(t) | Mms::Other(t) => {
                 out.primitive(t.tag, t.value)?;
             }
         }
@@ -1380,6 +1403,8 @@ impl<'a> Mms<'a> {
     pub fn invoke_id(&self) -> Option<i64> {
         match self {
             Mms::ConfirmedRequest { invoke_id, .. } | Mms::ConfirmedResponse { invoke_id, .. } | Mms::ConfirmedError { invoke_id, .. } => Some(*invoke_id),
+            // A reject names the request it rejects, which is what makes it an answer.
+            Mms::Reject(r) => r.original_invoke_id,
             _ => None,
         }
     }
@@ -1387,6 +1412,30 @@ impl<'a> Mms<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// `invokeID` is `Unsigned32` in every PDU that carries one. A negative one is not an
+    /// identifier a peer could have issued — and accepting it made the *answer* unencodable,
+    /// because a reject has to name it and `originalInvokeID` is `Unsigned32` too. A request
+    /// a server cannot answer at all is worse than any error response, which is why the
+    /// `mms_server` fuzz target asserts it and why this is refused at the decoder.
+    #[test]
+    fn an_invoke_identifier_outside_unsigned32_is_not_a_pdu() {
+        // `a0 05 02 01 ff 9b 00` — confirmed request, invokeID −1, an unknown service.
+        let wire = [0xA0u8, 0x05, 0x02, 0x01, 0xFF, 0x9B, 0x00];
+        assert!(Mms::parse(&wire, &Limits::DEFAULT).is_err(), "invokeID −1");
+
+        // Five octets above `u32::MAX`.
+        let wire = [0xA0u8, 0x09, 0x02, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x9B, 0x00];
+        assert!(Mms::parse(&wire, &Limits::DEFAULT).is_err(), "invokeID above u32::MAX");
+
+        // The whole legal range is still a request.
+        for id in [0u32, 1, 0x7FFF_FFFF, u32::MAX] {
+            let pdu = Mms::ConfirmedRequest { invoke_id: i64::from(id), service: ConfirmedRequest::Identify };
+            let bytes = pdu.to_vec().unwrap();
+            let back = Mms::parse(&bytes, &Limits::DEFAULT).unwrap();
+            assert_eq!(back.invoke_id(), Some(i64::from(id)), "{id}");
+        }
+    }
+
     use super::*;
     use crate::proto::data::Typed;
     use file::{DirectoryEntry, FileAttributes};

@@ -61,6 +61,7 @@ pub const RELAY: &str = r#"<?xml version="1.0"?>
     <DOType id="DPC_T" cdc="DPC">
       <DA name="stVal" fc="ST" bType="Dbpos"/>
       <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
       <DA name="ctlModel" fc="CF" bType="Enum" type="CtlModel_E"/>
       <DA name="Oper" fc="CO" bType="Struct" type="Oper_T"/>
       <DA name="SBOw" fc="CO" bType="Struct" type="Oper_T"/>
@@ -730,4 +731,334 @@ fn a_log_records_what_changed_and_is_read_back_by_time_and_after_an_entry() {
     // like an empty log.
     assert!(c.query_log_by_time("IED1LD0/LLN0$NoSuchLog", EntryTime::default(), None).is_err());
     c.release().unwrap();
+}
+
+/// The three things a report gets wrong when the engine is driven by the wrong clock, under
+/// the wrong name, or with a blunt instrument for its own bookkeeping. All three were real.
+mod report_engine {
+    use iec61850_rs::client::Unsolicited;
+    use iec61850_rs::common::{EntryTime, Instant, Limits};
+    use iec61850_rs::proto::data::Value;
+    use iec61850_rs::proto::mms::{Mms, ObjectName, Unconfirmed, VariableAccess};
+    use iec61850_rs::server::{Engine, Ied};
+
+    const BLOCK: &str = "IED1LD0/LLN0$RP$urcb";
+    const MEMBER: &str = "IED1LD0/PTRC1$ST$Tr$general";
+    /// 2023-11-14T22:13:20.500Z, well inside the `BinaryTime` epoch.
+    const WALL_MS: u64 = 1_700_000_000_500;
+
+    /// A model with `BLOCK` enabled for association 7 and a clean dirty set.
+    fn enabled() -> (Ied, Engine) {
+        let mut ied = Ied::from_scl(super::RELAY, Some("IED1")).expect("load the model");
+        let mut engine = Engine::new(&ied);
+        engine.on_write(7, &ied, BLOCK, "RptEna", &Value::Boolean(true), Instant::ZERO).expect("enable");
+        ied.write_leaf(&format!("{BLOCK}$RptEna"), Value::Boolean(true)).expect("write RptEna");
+        ied.take_dirty();
+        (ied, engine)
+    }
+
+    /// `TimeOfEntry` is an absolute time an operator reads. Deriving it from the monotonic
+    /// `Instant` the cores are driven by put every report at 1984-01-01, the floor of the
+    /// `BinaryTime` epoch — and made `QueryLogByTime` match nothing.
+    #[test]
+    fn a_report_carries_the_wall_clock_and_not_the_monotonic_one() {
+        let (mut ied, mut engine) = enabled();
+        ied.write_leaf(MEMBER, Value::Boolean(true)).expect("write");
+        let dirty = ied.take_dirty();
+        let wall = EntryTime::from_unix_millis(WALL_MS);
+        // `now` is what it always is at the start of a process: a few microseconds.
+        let out = engine.commit(&mut ied, &dirty, wall, Instant(12_345));
+        assert_eq!(out.len(), 1, "one report");
+
+        let report = match Unsolicited::from_pdu(&out[0].pdu, &Limits::DEFAULT) {
+            Some(Unsolicited::Report(r)) => r,
+            other => panic!("not a report: {other:?}"),
+        };
+        assert_eq!(report.time_of_entry, Some(wall));
+        assert_eq!(report.time_of_entry.map(EntryTime::to_unix_millis), Some(WALL_MS));
+        assert_ne!(report.time_of_entry, Some(EntryTime::default()), "1984-01-01 is what the monotonic instant used to produce");
+    }
+
+    /// IEC 61850-8-1 reports every `InformationReport` under the VMD-specific name `RPT`;
+    /// libiec61850 writes exactly that. Deriving the name from `RptID` produced an
+    /// unparseable `domain-specific` name the moment a file set `rptID` to anything else —
+    /// and `rptID` is a plain SCL attribute.
+    #[test]
+    fn a_report_is_reported_under_the_name_the_mapping_gives_it() {
+        let (mut ied, mut engine) = enabled();
+        // Exactly what an engineer writes in the SCD, and what used to break the encoding.
+        ied.write_leaf(&format!("{BLOCK}$RptID"), Value::VisibleString("Trip report".into())).expect("write RptID");
+        ied.take_dirty();
+        ied.write_leaf(MEMBER, Value::Boolean(true)).expect("write");
+        let dirty = ied.take_dirty();
+        let out = engine.commit(&mut ied, &dirty, EntryTime::from_unix_millis(WALL_MS), Instant::ZERO);
+        assert_eq!(out.len(), 1);
+
+        let Ok(Mms::Unconfirmed(Unconfirmed::InformationReport { access, .. })) = Mms::parse(&out[0].pdu, &Limits::DEFAULT) else {
+            panic!("not an information report");
+        };
+        assert_eq!(access, VariableAccess::VariableListName(ObjectName::VmdSpecific("RPT")));
+        // The `RptID` still travels — inside the report, which is where a client reads it.
+        match Unsolicited::from_pdu(&out[0].pdu, &Limits::DEFAULT) {
+            Some(Unsolicited::Report(r)) => assert_eq!(r.rpt_id, "Trip report"),
+            other => panic!("not a report: {other:?}"),
+        }
+    }
+
+    /// The engine writes `SqNum`, `EntryID` and `TimeOfEntry` back into the model as it
+    /// publishes. It used to clear the *whole* dirty set afterwards to stop those counters
+    /// triggering another report — which also threw away any application write that had
+    /// landed in between. With more than one association that is a race, and the write is
+    /// lost from the report **and** from the log.
+    #[test]
+    fn publishing_a_report_does_not_swallow_a_write_that_has_not_been_committed() {
+        let (mut ied, mut engine) = enabled();
+        // A client asks for a general interrogation…
+        ied.write_leaf(&format!("{BLOCK}$GI"), Value::Boolean(true)).expect("write GI");
+        ied.take_dirty();
+        // …and the application writes a value before that interrogation is served.
+        ied.write_leaf(MEMBER, Value::Boolean(true)).expect("write");
+
+        let out = engine.on_timeout(&mut ied, EntryTime::from_unix_millis(WALL_MS), Instant::ZERO);
+        assert_eq!(out.len(), 1, "the general interrogation is answered");
+
+        let dirty = ied.take_dirty();
+        assert!(dirty.contains_key(MEMBER), "the application's write must survive a report built on the way past");
+        assert!(!dirty.keys().any(|k| k.starts_with(&format!("{BLOCK}$"))), "the engine's own bookkeeping must never enter the dirty set");
+
+        // And it is still reported, which is the consequence that matters.
+        let out = engine.commit(&mut ied, &dirty, EntryTime::from_unix_millis(WALL_MS), Instant::ZERO);
+        assert_eq!(out.len(), 1, "the write that survived produces its own report");
+    }
+}
+
+/// Controls: the timestamp a command writes, and the command that runs later.
+mod controls {
+    use iec61850_rs::common::{Clock, Instant, Now, TimeQuality, UtcTime};
+    use iec61850_rs::proto::data::{Dbpos, Typed, Value};
+    use iec61850_rs::proto::mms::control::ControlRequest;
+    use iec61850_rs::server::{Controls, Ied};
+
+    const OBJECT: &str = "IED1LD0/CSWI1$CO$Pos";
+    const STATUS_T: &str = "IED1LD0/CSWI1$ST$Pos$t";
+    /// 2023-11-14T22:13:20Z.
+    const WALL_SECS: u32 = 1_700_000_000;
+
+    fn wall() -> UtcTime {
+        UtcTime::from_unix(WALL_SECS, 0, TimeQuality::SYNCHRONIZED)
+    }
+
+    fn model() -> Ied {
+        Ied::from_scl(super::RELAY, Some("IED1")).expect("load the model")
+    }
+
+    fn oper(ctl_val: Dbpos, at: Option<UtcTime>) -> Value {
+        let mut r = ControlRequest::new(Value::dbpos(ctl_val), 1, wall());
+        r.oper_tm = at;
+        r.to_value()
+    }
+
+    /// The status timestamp an operate writes is a **date**. It used to be the monotonic
+    /// instant reinterpreted as a Unix time, which put every operated breaker's `Pos.t` a few
+    /// microseconds after 1970-01-01 — the same defect as the report engine's `TimeOfEntry`,
+    /// in a fourth place (D33).
+    #[test]
+    fn an_operate_stamps_the_status_with_the_wall_clock() {
+        let (mut ied, mut controls) = (model(), Controls::default());
+        controls.write(1, &mut ied, OBJECT, "Oper", &oper(Dbpos::On, None), Now::new(Instant(9_999), wall())).expect("operate");
+
+        assert_eq!(ied.value("IED1LD0/CSWI1$ST$Pos$stVal").and_then(Typed::as_dbpos), Some(Dbpos::On));
+        let t = ied.value(STATUS_T).and_then(Typed::as_utc_time).expect("a status timestamp");
+        assert_eq!(t.seconds, WALL_SECS, "the status carries the wall clock, not the monotonic instant");
+    }
+
+    /// IEC 61850-7-2 time-activated operate: an `operTm` in the future arms the command
+    /// instead of running it. The server used to ignore `operTm` and operate immediately —
+    /// which is the one behaviour a time-activated command must not have.
+    #[test]
+    fn an_operate_with_a_future_oper_tm_waits_for_it() {
+        let (mut ied, mut controls) = (model(), Controls::default());
+        let at = UtcTime::from_unix(WALL_SECS + 5, 0, TimeQuality::SYNCHRONIZED);
+        let now = Instant(1_000_000_000);
+
+        controls.write(1, &mut ied, OBJECT, "Oper", &oper(Dbpos::On, Some(at)), Now::new(now, wall())).expect("the write is accepted");
+        assert_eq!(ied.value("IED1LD0/CSWI1$ST$Pos$stVal").and_then(Typed::as_dbpos), Some(Dbpos::Intermediate), "nothing has moved yet");
+        assert_eq!(controls.next_timeout(), Some(now.plus_millis(5_000)), "the deadline is monotonic, five seconds out");
+
+        // Not yet.
+        controls.on_timeout(&mut ied, now.plus_millis(4_999));
+        assert_eq!(ied.value("IED1LD0/CSWI1$ST$Pos$stVal").and_then(Typed::as_dbpos), Some(Dbpos::Intermediate));
+
+        // Now.
+        controls.on_timeout(&mut ied, now.plus_millis(5_000));
+        assert_eq!(ied.value("IED1LD0/CSWI1$ST$Pos$stVal").and_then(Typed::as_dbpos), Some(Dbpos::On), "the command ran when its time came");
+        assert_eq!(controls.next_timeout(), None);
+    }
+
+    /// An `operTm` that has already passed is a command for now, not a command to drop.
+    #[test]
+    fn an_operate_with_a_past_oper_tm_runs_immediately() {
+        let (mut ied, mut controls) = (model(), Controls::default());
+        let at = UtcTime::from_unix(WALL_SECS - 5, 0, TimeQuality::SYNCHRONIZED);
+        controls.write(1, &mut ied, OBJECT, "Oper", &oper(Dbpos::On, Some(at)), Now::new(Instant::ZERO, wall())).expect("operate");
+        assert_eq!(ied.value("IED1LD0/CSWI1$ST$Pos$stVal").and_then(Typed::as_dbpos), Some(Dbpos::On));
+    }
+
+    /// `Cancel` is the only way to disarm one, so it has to work on a command that has no
+    /// selection behind it — a server that cannot disarm what it armed is worse than one that
+    /// never armed anything.
+    #[test]
+    fn cancel_withdraws_a_command_that_is_waiting_for_its_time() {
+        let (mut ied, mut controls) = (model(), Controls::default());
+        let at = UtcTime::from_unix(WALL_SECS + 5, 0, TimeQuality::SYNCHRONIZED);
+        let now = Instant(1_000_000_000);
+        controls.write(1, &mut ied, OBJECT, "Oper", &oper(Dbpos::On, Some(at)), Now::new(now, wall())).expect("armed");
+
+        let cancel = ControlRequest::new(Value::dbpos(Dbpos::On), 1, wall()).to_value();
+        controls.write(1, &mut ied, OBJECT, "Cancel", &cancel, Now::new(now, wall())).expect("cancelled");
+        assert_eq!(controls.next_timeout(), None);
+
+        controls.on_timeout(&mut ied, now.plus_millis(10_000));
+        assert_eq!(ied.value("IED1LD0/CSWI1$ST$Pos$stVal").and_then(Typed::as_dbpos), Some(Dbpos::Intermediate), "a cancelled command never runs");
+    }
+
+    /// And an association that goes away takes its armed commands with it.
+    #[test]
+    fn an_association_that_ends_disarms_what_it_armed() {
+        let (mut ied, mut controls) = (model(), Controls::default());
+        let at = UtcTime::from_unix(WALL_SECS + 5, 0, TimeQuality::SYNCHRONIZED);
+        let now = Instant(1_000_000_000);
+        controls.write(7, &mut ied, OBJECT, "Oper", &oper(Dbpos::On, Some(at)), Now::new(now, wall())).expect("armed");
+        controls.on_association_closed(7);
+        controls.on_timeout(&mut ied, now.plus_millis(10_000));
+        assert_eq!(ied.value("IED1LD0/CSWI1$ST$Pos$stVal").and_then(Typed::as_dbpos), Some(Dbpos::Intermediate));
+    }
+
+    /// The clock is pluggable, which is what lets the tests above pin a date at all.
+    #[test]
+    fn the_system_clock_reports_a_plausible_date() {
+        let now = iec61850_rs::common::SystemClock.now();
+        assert!(now.seconds > 1_700_000_000, "the system clock is a wall clock: {now}");
+    }
+}
+
+/// What the server answers when there is no service to answer for.
+mod rejects {
+    use iec61850_rs::ber::Cursor;
+    use iec61850_rs::common::{Instant, Limits};
+    use iec61850_rs::proto::mms::reject::{INVALID_PDU, RejectReason, UNRECOGNIZED_SERVICE};
+    use iec61850_rs::proto::mms::{ConfirmedRequest, Mms};
+    use iec61850_rs::server::{Acsi, Answer, Ied};
+
+    /// ISO 9506 answers an unrecognised *service* with a reject-PDU, not a confirmed-error:
+    /// a confirmed-error says "this service failed", and there was no service. libiec61850's
+    /// server draws the same line, so this is also what a client in the field expects.
+    #[test]
+    fn an_unrecognised_service_is_rejected_rather_than_failed() {
+        let mut acsi = Acsi::new(Ied::from_scl(super::RELAY, Some("IED1")).expect("model"));
+        // A confirmed request whose service tag is one nothing implements.
+        let bytes = [0xBF, 0x7F, 0x00];
+        let tlv = Cursor::new(&bytes).next_required().expect("frame");
+        let answer = acsi.request(1, Instant::ZERO, &ConfirmedRequest::Other(tlv));
+        assert_eq!(answer, Answer::UNSUPPORTED);
+
+        let pdu = answer.encode(77).expect("encode");
+        match Mms::parse(&pdu, &Limits::DEFAULT).expect("decode") {
+            Mms::Reject(r) => {
+                assert_eq!(r.original_invoke_id, Some(77), "the reject names the request it rejects");
+                assert_eq!(r.reason, RejectReason::ConfirmedRequest(UNRECOGNIZED_SERVICE));
+            }
+            other => panic!("not a reject: {other:?}"),
+        }
+        // The wire shape libiec61850 writes: a4 06 80 01 4d 81 01 01.
+        assert_eq!(pdu, [0xA4, 0x06, 0x80, 0x01, 77, 0x81, 0x01, 0x01]);
+    }
+
+    /// And a PDU that is not a confirmed request at all is a `pdu-error`, which names the PDU
+    /// rather than a service that was never called.
+    #[test]
+    fn something_that_is_not_a_request_is_a_pdu_error() {
+        let pdu = Answer::INVALID_PDU.encode(5).expect("encode");
+        match Mms::parse(&pdu, &Limits::DEFAULT).expect("decode") {
+            Mms::Reject(r) => assert_eq!(r.reason, RejectReason::PduError(INVALID_PDU)),
+            other => panic!("not a reject: {other:?}"),
+        }
+    }
+}
+
+/// Edition is a property of the server, and the server's edition is what its file declares.
+mod editions {
+    use iec61850_rs::common::Edition;
+    use iec61850_rs::model::IedModel;
+    use iec61850_rs::server::Ied;
+
+    fn components(ied: &Ied, block: &str) -> Vec<String> {
+        ied.node_at(block).map(|n| n.children.iter().map(|c| c.name.clone()).collect()).unwrap_or_default()
+    }
+
+    /// `ResvTms` and `Owner` arrived with Edition 2. An Edition 1 server that publishes them
+    /// claims a reservation service it does not have — and a client that reads a control
+    /// block positionally then reads every field after them at the wrong offset.
+    #[test]
+    fn an_edition_1_report_control_block_has_no_reservation_attributes() {
+        let model = IedModel::from_scl(super::RELAY, Some("IED1")).expect("model");
+
+        let ed2 = Ied::with_edition(model.clone(), Edition::Ed2_1).expect("ed2.1");
+        let urcb = components(&ed2, "IED1LD0/LLN0$RP$urcb");
+        assert!(urcb.contains(&String::from("Owner")), "Edition 2 has Owner: {urcb:?}");
+        assert!(ed2.value("IED1LD0/LLN0$RP$urcb$Owner").is_some());
+
+        let ed1 = Ied::with_edition(model, Edition::Ed1).expect("ed1");
+        let urcb = components(&ed1, "IED1LD0/LLN0$RP$urcb");
+        assert!(ed1.value("IED1LD0/LLN0$RP$urcb$Owner").is_none(), "no value is seeded for an attribute the edition has not got");
+        // Everything an Edition 1 block *does* have is still there, in the order 8-1 Table 39
+        // puts it — `Resv` third, not trailing.
+        assert_eq!(urcb, ["RptID", "RptEna", "Resv", "DatSet", "ConfRev", "OptFlds", "BufTm", "SqNum", "TrgOps", "IntgPd", "GI"]);
+    }
+
+    /// The buffered block loses `ResvTms` as well, and keeps everything Edition 1 does have.
+    #[test]
+    fn an_edition_1_buffered_block_has_no_resv_tms() {
+        let buffered = super::RELAY.replacen(
+            r#"<ReportControl name="urcb" datSet="dsTrip" confRev="3" indexed="false""#,
+            r#"<ReportControl name="brcb" datSet="dsTrip" confRev="3" buffered="true" indexed="false""#,
+            1,
+        );
+        assert!(buffered.contains("brcb"), "the fixture rewrite must apply");
+        let model = IedModel::from_scl(&buffered, Some("IED1")).expect("model");
+
+        let ed2 = components(&Ied::with_edition(model.clone(), Edition::Ed2_1).expect("ed2"), "IED1LD0/LLN0$BR$brcb");
+        let ed1 = components(&Ied::with_edition(model, Edition::Ed1).expect("ed1"), "IED1LD0/LLN0$BR$brcb");
+        assert!(ed2.contains(&String::from("ResvTms")), "{ed2:?}");
+        assert!(!ed1.contains(&String::from("ResvTms")), "{ed1:?}");
+        assert!(!ed1.contains(&String::from("Owner")), "{ed1:?}");
+        // `EntryID` and `TimeOfEntry` are Edition 1 attributes and stay.
+        assert!(ed1.contains(&String::from("EntryID")));
+        assert!(ed1.contains(&String::from("TimeOfEntry")));
+    }
+
+    /// And a server takes its edition from the file rather than from a second setting.
+    #[test]
+    fn the_edition_comes_from_the_schema_version_the_file_declares() {
+        for (version, revision, release, want) in [
+            ("2003", "", "", Edition::Ed1),
+            ("2007", "A", "", Edition::Ed2),
+            ("2007", "B", "", Edition::Ed2),
+            ("2007", "B", "3", Edition::Ed2),
+            ("2007", "B", "4", Edition::Ed2_1),
+            ("2007", "C", "5", Edition::Ed2_1),
+        ] {
+            let xml = super::RELAY.replacen(
+                r#"version="2007" revision="B" release="4""#,
+                &format!(r#"version="{version}" revision="{revision}" release="{release}""#),
+                1,
+            );
+            let model = IedModel::from_scl(&xml, Some("IED1")).expect("model");
+            assert_eq!(model.edition(), want, "{version}{revision}{release}");
+            assert_eq!(Ied::new(model).expect("ied").edition(), want);
+        }
+        // A schema this crate has not seen is read as the newest, not the oldest: guessing
+        // Edition 1 would silently drop attributes from a modern file.
+        assert_eq!(Edition::from_scl_version("2030A"), Edition::Ed2_1);
+    }
 }

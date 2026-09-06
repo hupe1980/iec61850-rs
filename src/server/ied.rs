@@ -14,7 +14,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::tree::{self, Domain, VarKind, Variable};
-use crate::common::{EntryTime, Error, Fc, OptFlds, Quality, Result, TrgOps, UtcTime};
+use crate::common::{Edition, EntryTime, Error, Fc, OptFlds, Quality, Result, TrgOps, UtcTime};
 use crate::model::{BType, IedModel, LogicalNode, ReportControl};
 use crate::proto::data::Value;
 
@@ -82,6 +82,11 @@ pub struct Ied {
     blocks: Vec<Block>,
     /// References written since the last commit, and what triggered each.
     dirty: BTreeMap<String, TrgOps>,
+    /// The edition this IED serves — taken from the SCL file, because that is where an
+    /// IED's edition is declared. It decides the report control block's attribute set:
+    /// `ResvTms` and `Owner` arrived with Edition 2, and a server that publishes them to an
+    /// Edition 1 client is claiming a service it does not have.
+    edition: Edition,
 }
 
 impl Ied {
@@ -100,22 +105,37 @@ impl Ied {
     }
 
     /// Build the served IED from a model that is already loaded.
+    ///
+    /// The edition comes from the file's own schema version ([`IedModel::edition`]);
+    /// [`Ied::with_edition`] overrides it for a device whose file says one thing and whose
+    /// certificate says another.
     pub fn new(model: IedModel) -> Result<Ied> {
+        let edition = model.edition();
+        Ied::with_edition(model, edition)
+    }
+
+    /// Build the served IED at an explicit edition.
+    pub fn with_edition(model: IedModel, edition: Edition) -> Result<Ied> {
         let mut blocks = Vec::new();
         let mut domains = Vec::with_capacity(model.logical_devices.len());
         for ld in &model.logical_devices {
             let ld_name = ld.name.clone();
             let mut found: Vec<Block> = Vec::new();
-            let domain = tree::domain_of(ld, &mut |ln| control_blocks(&ld_name, ln, &mut found));
+            let domain = tree::domain_of(ld, &mut |ln| control_blocks(&ld_name, ln, edition, &mut found));
             blocks.extend(found);
             domains.push(domain);
         }
 
-        let mut ied = Ied { model, domains, values: BTreeMap::new(), data_sets: BTreeMap::new(), blocks, dirty: BTreeMap::new() };
+        let mut ied = Ied { model, domains, values: BTreeMap::new(), data_sets: BTreeMap::new(), blocks, dirty: BTreeMap::new(), edition };
         ied.seed_values();
         ied.seed_data_sets();
         ied.seed_blocks();
         Ok(ied)
+    }
+
+    /// The edition this IED serves.
+    pub const fn edition(&self) -> Edition {
+        self.edition
     }
 
     /// The MMS domain names, which are the logical device names.
@@ -252,6 +272,26 @@ impl Ied {
         Ok(())
     }
 
+    /// Write a value without marking it dirty — a write the *server itself* makes.
+    ///
+    /// A report control block's `SqNum`, `EntryID` and `TimeOfEntry`, a log control block's
+    /// `OldEnt`/`NewEnt`, an `SGCB`'s `LActTm` and the `GI`/`PurgeBuf` flags a request
+    /// consumes are all bookkeeping the server writes *while publishing*. They are not
+    /// application data and no data set contains them, so they must not enter the dirty set.
+    /// Publishing through the ordinary write and clearing the set with [`Ied::take_dirty`]
+    /// afterwards would also discard any application write that had landed in the meantime —
+    /// losing it from the report *and* the log whenever another association's thread committed
+    /// at the wrong moment.
+    pub fn set_internal(&mut self, reference: &str, value: Value) -> core::result::Result<(), i64> {
+        let Some(node) = self.node_at(reference) else { return Err(DATA_ACCESS_NON_EXISTENT) };
+        let VarKind::Leaf(btype) = node.kind.clone() else { return Err(DATA_ACCESS_TYPE_INCONSISTENT) };
+        if !accepts(&btype, &value) {
+            return Err(DATA_ACCESS_TYPE_INCONSISTENT);
+        }
+        self.values.insert(String::from(reference), value);
+        Ok(())
+    }
+
     /// An SCL `Val` text as the value of the attribute at `reference`.
     ///
     /// The type comes from the model and, for an enumeration, so does the symbol table — the
@@ -359,6 +399,7 @@ impl Ied {
 
     /// Put the engineered defaults into every control block's attributes.
     fn seed_blocks(&mut self) {
+        let edition = self.edition;
         let mut writes: Vec<(String, Value)> = Vec::new();
         for ld in &self.model.logical_devices {
             for ln in &ld.logical_nodes {
@@ -366,7 +407,7 @@ impl Ied {
                     let data_set = rcb.dat_set.as_ref().map(|d| alloc::format!("{}/{}${d}", ld.name, ln.name));
                     for name in rcb.instance_names() {
                         let base = alloc::format!("{}/{}${}${name}", ld.name, ln.name, rcb.fc().as_str());
-                        for (attribute, value) in rcb_defaults(rcb, &base, data_set.as_deref()) {
+                        for (attribute, value) in rcb_defaults(rcb, &base, data_set.as_deref(), edition) {
                             writes.push((alloc::format!("{base}${attribute}"), value));
                         }
                     }
@@ -549,7 +590,7 @@ pub fn accepts(btype: &BType, value: &Value) -> bool {
 /// buffered block's `SqNum` is sixteen bits where the unbuffered one's is eight 🌐
 /// (libiec61850 `reporting.c`). A client that reads the whole block positionally depends on
 /// every one of these.
-pub fn rcb_components(buffered: bool) -> Vec<(&'static str, BType)> {
+pub fn rcb_components(buffered: bool, edition: Edition) -> Vec<(&'static str, BType)> {
     let mut out: Vec<(&'static str, BType)> = alloc::vec![("RptID", BType::VisString129), ("RptEna", BType::Boolean)];
     if !buffered {
         out.push(("Resv", BType::Boolean));
@@ -565,9 +606,17 @@ pub fn rcb_components(buffered: bool) -> Vec<(&'static str, BType)> {
         ("GI", BType::Boolean),
     ]);
     if buffered {
-        out.extend([("PurgeBuf", BType::Boolean), ("EntryID", BType::EntryID), ("TimeOfEntry", BType::EntryTime), ("ResvTms", BType::Int16)]);
+        out.extend([("PurgeBuf", BType::Boolean), ("EntryID", BType::EntryID), ("TimeOfEntry", BType::EntryTime)]);
+        // `ResvTms` arrived with Edition 2. An Ed1 server that publishes it claims a
+        // reservation service it does not have, and a client reading the block positionally
+        // then reads everything after it at the wrong offset.
+        if edition.has_rcb_reservation() {
+            out.push(("ResvTms", BType::Int16));
+        }
     }
-    out.push(("Owner", BType::Octet64));
+    if edition.has_rcb_reservation() {
+        out.push(("Owner", BType::Octet64));
+    }
     out
 }
 
@@ -622,7 +671,7 @@ fn msvcb_components() -> Vec<(&'static str, BType)> {
     ]
 }
 
-fn rcb_defaults(rcb: &ReportControl, base: &str, data_set: Option<&str>) -> Vec<(&'static str, Value)> {
+fn rcb_defaults(rcb: &ReportControl, base: &str, data_set: Option<&str>, edition: Edition) -> Vec<(&'static str, Value)> {
     let mut out: Vec<(&'static str, Value)> = alloc::vec![
         // A block with no engineered `rptID` reports under its own reference, which is what
         // IEC 61850-7-2 §17.2.2 says the default is.
@@ -640,15 +689,19 @@ fn rcb_defaults(rcb: &ReportControl, base: &str, data_set: Option<&str>) -> Vec<
         ("TrgOps", rcb.trg_ops.to_value()),
         ("IntgPd", Value::Unsigned(u64::from(rcb.intg_pd_ms))),
         ("GI", Value::Boolean(false)),
-        ("Owner", Value::OctetString(Vec::new())),
     ];
+    if edition.has_rcb_reservation() {
+        out.push(("Owner", Value::OctetString(Vec::new())));
+    }
     if rcb.buffered {
         out.extend([
             ("PurgeBuf", Value::Boolean(false)),
             ("EntryID", Value::OctetString(Vec::new())),
             ("TimeOfEntry", Value::BinaryTime(EntryTime::default().to_octets().to_vec())),
-            ("ResvTms", Value::Integer(0)),
         ]);
+        if edition.has_rcb_reservation() {
+            out.push(("ResvTms", Value::Integer(0)));
+        }
     } else {
         out.push(("Resv", Value::Boolean(false)));
     }
@@ -682,7 +735,7 @@ fn sgcb_defaults(sg: crate::model::SettingControl) -> Vec<(&'static str, Value)>
 }
 
 /// The control-block variables of one logical node, and the [`Block`] record for each.
-fn control_blocks(ld_name: &str, ln: &LogicalNode, found: &mut Vec<Block>) -> Vec<(Fc, Variable)> {
+fn control_blocks(ld_name: &str, ln: &LogicalNode, edition: Edition, found: &mut Vec<Block>) -> Vec<(Fc, Variable)> {
     let mut out = Vec::new();
     let mut add = |fc: Fc, name: String, kind: BlockKind, components: Vec<(&'static str, BType)>, data_set: Option<String>, out: &mut Vec<(Fc, Variable)>| {
         let children = components.into_iter().map(|(n, b)| Variable::leaf(n, Some(fc), b)).collect();
@@ -702,7 +755,7 @@ fn control_blocks(ld_name: &str, ln: &LogicalNode, found: &mut Vec<Block>) -> Ve
         let kind = if rcb.buffered { BlockKind::Buffered } else { BlockKind::Unbuffered };
         let data_set = rcb.dat_set.as_ref().map(|d| alloc::format!("{ld_name}/{}${d}", ln.name));
         for name in rcb.instance_names() {
-            add(fc, name, kind, rcb_components(rcb.buffered), data_set.clone(), &mut out);
+            add(fc, name, kind, rcb_components(rcb.buffered, edition), data_set.clone(), &mut out);
         }
     }
     for lcb in &ln.log_controls {

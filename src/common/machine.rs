@@ -31,12 +31,67 @@ impl Instant {
     }
 }
 
+/// The two clocks a server needs at once, carried together so they cannot be swapped.
+///
+/// There are exactly two kinds of time here and they answer different questions (D33):
+/// [`Now::mono`] is a monotonic [`Instant`] and is what every deadline, window and duration is
+/// measured on; [`Now::wall`] is an absolute [`UtcTime`] and is what every *published*
+/// timestamp carries — a report's `TimeOfEntry`, a log entry, an `SGCB`'s `LActTm`, the status
+/// timestamp an operate writes.
+///
+/// Neither may be derived from the other, and passing them as one value is what stops a
+/// signature from letting a caller pass the wrong one: a monotonic instant reinterpreted as a
+/// date reads as 1970-01-01 plus the process's uptime, which every test where both ends are
+/// ours will happily agree on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Now {
+    /// Monotonic, for deadlines and durations.
+    pub mono: Instant,
+    /// Absolute, for timestamps that leave the process.
+    pub wall: UtcTime,
+}
+
+impl Now {
+    /// Both readings, taken together.
+    pub const fn new(mono: Instant, wall: UtcTime) -> Now {
+        Now { mono, wall }
+    }
+
+    /// The wall reading as the six-octet `EntryTime` the report and log services publish.
+    pub const fn entry(self) -> super::EntryTime {
+        super::EntryTime::from_unix_millis(self.wall.to_unix_nanos() / 1_000_000)
+    }
+}
+
 /// A source of wall-clock time with quality, as IEC 61850 needs it.
 ///
 /// Implementations: a PTP-disciplined PHC, an SNTP client, or [`ManualClock`] in tests.
-pub trait Clock {
+///
+/// `Debug` is a supertrait for the same reason [`FileStore`](crate::server::FileStore) has
+/// one: a clock is a field of a server that derives `Debug`, and a trait object that cannot
+/// be printed forces every holder to hand-write the impl.
+pub trait Clock: core::fmt::Debug {
     /// The current UTC time with its quality bits.
     fn now(&self) -> UtcTime;
+}
+
+/// The system's own wall clock, as [`std::time::SystemTime`] reports it.
+///
+/// This is the default clock of a server built on `std`. It reports
+/// [`TimeQuality::SYNCHRONIZED`](super::TimeQuality::SYNCHRONIZED) with no leap-second or
+/// accuracy claim, because a plain
+/// system clock knows nothing about how it is disciplined; a deployment that runs
+/// `ptp4l`/`phc2sys` replaces it with a clock that does.
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemClock;
+
+#[cfg(feature = "std")]
+impl Clock for SystemClock {
+    fn now(&self) -> UtcTime {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        UtcTime::from_unix_nanos(nanos, super::TimeQuality::SYNCHRONIZED)
+    }
 }
 
 /// A clock that returns whatever it was last told. For tests and simulation.

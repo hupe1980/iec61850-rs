@@ -152,6 +152,16 @@ impl Server {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_file_store(store);
     }
 
+    /// Replace the wall clock every absolute timestamp is read from.
+    ///
+    /// The default is [`SystemClock`](crate::common::SystemClock). A report's `TimeOfEntry`,
+    /// a log entry's time and an `SGCB`'s `LActTm` come from here; a test pins it, and a
+    /// device with a PTP- or SNTP-disciplined source supplies one whose readings carry the
+    /// real time quality.
+    pub fn set_clock(&mut self, clock: Box<dyn crate::common::Clock + Send + Sync>) {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_clock(clock);
+    }
+
     /// Accept associations for ever, one thread each.
     pub fn run(&self) -> Result<()> {
         loop {
@@ -307,8 +317,10 @@ fn serve(id: AssocId, mut stream: TcpStream, shared: &Arc<Mutex<Shared>>, cfg: &
                 let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
                 match Mms::parse(&pdu, &limits) {
                     Ok(Mms::ConfirmedRequest { service, .. }) => guard.acsi.request(id, now, &service),
-                    // A PDU that is not a confirmed request cannot be answered as one.
-                    _ => super::acsi::Answer::UNSUPPORTED,
+                    // Not a confirmed request, or not a PDU at all — which ISO 9506 answers
+                    // with a reject naming the *PDU*, not with a service error naming a
+                    // service that was never called.
+                    _ => super::acsi::Answer::INVALID_PDU,
                 }
             };
             if let Ok(bytes) = answer.encode(invoke_id) {

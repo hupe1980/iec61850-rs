@@ -1,7 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::apdu::{Asdu, AsduOffsets, SavPdu, SmpSynch};
+use super::apdu::{Asdu, AsduOffsets, Field, SavPdu, SmpSynch};
 use crate::common::{Error, Instant, Result, UtcTime};
 use crate::proto::ethernet::{FrameHeader, RESERVED1_SIMULATION};
 
@@ -194,6 +194,11 @@ pub struct Publisher {
     at: Vec<AsduOffsets>,
     smp_cnt: u16,
     smp_synch: SmpSynch,
+    /// The clock state currently written into every ASDU. Kept rather than only patched,
+    /// because a `smpSynch` that no longer fits its reserved width needs the template built
+    /// again and the rest of the state has to survive that.
+    refr_tm: Option<UtcTime>,
+    gm_identity: Option<[u8; 8]>,
     pending: bool,
     next_send: Option<Instant>,
     dropped: u64,
@@ -212,34 +217,21 @@ impl Publisher {
             return Err(Error::InvalidValue("samples_per_second must not be zero"));
         }
 
-        // Encode one complete frame with placeholder samples, then find the fields to patch.
-        let asdus: Vec<Asdu> = (0..cfg.profile.asdus_per_frame)
-            .map(|_| Asdu {
-                sv_id: cfg.sv_id.clone(),
-                dat_set: cfg.dat_set.clone(),
-                smp_cnt: 0,
-                conf_rev: cfg.conf_rev,
-                refr_tm: cfg.refr_tm.then(UtcTime::default),
-                smp_synch: Some(SmpSynch::None),
-                smp_rate: cfg.profile.smp_rate,
-                sample: alloc::vec![0u8; cfg.profile.sample_len],
-                smp_mod: cfg.profile.smp_mod.map(SmpMod::to_u8),
-                gm_identity: cfg.gm_identity.then_some([0u8; 8]),
-            })
-            .collect();
-        let apdu = SavPdu { asdus }.encode()?;
-
-        let mut link = cfg.header;
-        link.reserved1 = if cfg.simulation { link.reserved1 | RESERVED1_SIMULATION } else { link.reserved1 & !RESERVED1_SIMULATION };
-        let mut frame = alloc::vec![0u8; link.len() + apdu.len()];
-        link.write(&apdu, &mut frame)?;
-        let apdu_at = link.len();
-
-        // Locate the patch points by decoding what we just wrote: the offsets come from the
-        // decoder, so template and codec can never disagree about the layout.
-        let at = locate_fields(&frame, apdu_at, &cfg)?;
-
-        Ok(Publisher { cfg, frame, at, smp_cnt: 0, smp_synch: SmpSynch::None, pending: false, next_send: Some(Instant::ZERO), dropped: 0 })
+        let (frame, at) = build_template(&cfg, SmpSynch::None, None, None)?;
+        let mut p = Publisher {
+            cfg,
+            frame,
+            at,
+            smp_cnt: 0,
+            smp_synch: SmpSynch::None,
+            refr_tm: None,
+            gm_identity: None,
+            pending: false,
+            next_send: Some(Instant::ZERO),
+            dropped: 0,
+        };
+        p.write_smp_cnt_fields();
+        Ok(p)
     }
 
     /// The configuration.
@@ -315,10 +307,7 @@ impl Publisher {
             return Err(Error::InvalidValue("template is missing a patch point"));
         };
         let cnt = self.smp_cnt;
-        let Some(slot) = self.frame.get_mut(at.smp_cnt..at.smp_cnt + 2) else {
-            return Err(Error::InvalidValue("template offset out of range"));
-        };
-        slot.copy_from_slice(&cnt.to_be_bytes());
+        write_unsigned(&mut self.frame, at.smp_cnt, u64::from(cnt))?;
         let Some(slot) = self.frame.get_mut(at.sample..at.sample + block.len()) else {
             return Err(Error::InvalidValue("template offset out of range"));
         };
@@ -338,14 +327,68 @@ impl Publisher {
 
     /// The synchronisation state every ASDU advertises. Takes effect with the next frame,
     /// and with every frame after it.
-    pub fn set_smp_synch(&mut self, synch: SmpSynch) {
+    ///
+    /// Almost always a patch of one octet. It is not one when the width has to change:
+    /// `smpSynch` is `0..254` and values 5–254 name a local-area clock, so 200 needs the two
+    /// octets `00 C8` to stay a positive INTEGER while 2 needs one. Crossing that boundary
+    /// re-encodes the template — off the publishing path, and rare, because a merging unit's
+    /// clock identity is a configured number rather than something that moves per frame.
+    pub fn set_smp_synch(&mut self, synch: SmpSynch) -> Result<()> {
         self.smp_synch = synch;
-        let byte = synch.to_u8();
+        let value = u64::from(synch.to_u8());
+        let fits = self.at.iter().all(|a| a.smp_synch.is_none_or(|f| f.len >= crate::ber::unsigned_width(value, 1)));
+        if !fits {
+            return self.rebuild();
+        }
         for i in 0..self.at.len() {
-            let Some(o) = self.at.get(i).and_then(|a| a.smp_synch) else { continue };
-            if let Some(slot) = self.frame.get_mut(o) {
-                *slot = byte;
+            let Some(f) = self.at.get(i).and_then(|a| a.smp_synch) else { continue };
+            write_unsigned(&mut self.frame, f, value)?;
+        }
+        Ok(())
+    }
+
+    /// Re-encode the template from the current stream state and re-locate every patch point
+    /// from the frame that comes out.
+    ///
+    /// Transparent to everything else the frame holds: each ASDU's sample block *and* its
+    /// `smpCnt` are read out of the old frame and written back into the new one, so a rebuild
+    /// between a `publish` and a `poll_transmit` does not renumber the frame that is waiting.
+    fn rebuild(&mut self) -> Result<()> {
+        let held: Vec<(u64, Vec<u8>)> = self
+            .at
+            .iter()
+            .map(|a| {
+                let count = read_unsigned(&self.frame, a.smp_cnt);
+                let block = self.frame.get(a.sample..a.sample + self.cfg.profile.sample_len).map(<[u8]>::to_vec).unwrap_or_default();
+                (count, block)
+            })
+            .collect();
+        let (frame, at) = build_template(&self.cfg, self.smp_synch, self.refr_tm, self.gm_identity)?;
+        self.frame = frame;
+        self.at = at;
+        for (i, (count, block)) in held.iter().enumerate() {
+            let Some(&a) = self.at.get(i) else { continue };
+            let _ = write_unsigned(&mut self.frame, a.smp_cnt, *count);
+            if block.len() != self.cfg.profile.sample_len {
+                continue;
             }
+            if let Some(slot) = self.frame.get_mut(a.sample..a.sample + block.len()) {
+                slot.copy_from_slice(block);
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the current `smpCnt` into every ASDU, without advancing it.
+    ///
+    /// The template is *encoded* with the largest count the stream can reach, so that the
+    /// field is wide enough for every value; this puts the real one back.
+    fn write_smp_cnt_fields(&mut self) {
+        let mut cnt = u64::from(self.smp_cnt);
+        for i in 0..self.at.len() {
+            let Some(&a) = self.at.get(i) else { continue };
+            let _ = write_unsigned(&mut self.frame, a.smp_cnt, cnt);
+            cnt = (cnt + 1) % u64::from(self.cfg.profile.smp_cnt_wrap());
         }
     }
 
@@ -362,6 +405,7 @@ impl Publisher {
     /// which is what a merging unit sending 2 or 6 ASDUs per frame actually puts on the
     /// wire. The caller passes one timestamp, not six.
     pub fn set_refr_tm(&mut self, t: UtcTime) {
+        self.refr_tm = Some(t);
         // Arithmetic in the wire's own unit of 2⁻²⁴ s, so the first ASDU carries exactly the
         // timestamp it was handed rather than one rounded through nanoseconds and back. The
         // offset of ASDU `i` is computed from `i` rather than added a step at a time: one
@@ -383,6 +427,7 @@ impl Publisher {
     /// Set `gmIdentity`, the PTP grandmaster clock identity. Ignored unless the
     /// configuration reserved the field ([`PublisherConfig::gm_identity`]).
     pub fn set_gm_identity(&mut self, id: [u8; 8]) {
+        self.gm_identity = Some(id);
         for i in 0..self.at.len() {
             let Some(o) = self.at.get(i).and_then(|a| a.gm_identity) else { continue };
             if let Some(slot) = self.frame.get_mut(o..o + 8) {
@@ -408,6 +453,63 @@ impl Publisher {
     }
 }
 
+/// Read a fixed-width unsigned field back out of a frame. Zero when it is out of range,
+/// which cannot happen for offsets the decoder produced.
+fn read_unsigned(frame: &[u8], field: Field) -> u64 {
+    frame.get(field.at..field.at + field.len).map_or(0, |o| o.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b)))
+}
+
+/// Write `value` big-endian into a fixed-width field, zero-padded on the left.
+///
+/// The field was sized to hold every value the stream can produce, so the padding is the
+/// leading zero that keeps the BER INTEGER positive rather than a truncation.
+fn write_unsigned(frame: &mut [u8], field: Field, value: u64) -> Result<()> {
+    if field.len == 0 || field.len > 8 {
+        return Err(Error::InvalidValue("template field has an impossible width"));
+    }
+    let Some(slot) = frame.get_mut(field.at..field.at + field.len) else {
+        return Err(Error::InvalidValue("template offset out of range"));
+    };
+    let bytes = value.to_be_bytes();
+    slot.copy_from_slice(bytes.get(8 - field.len..).unwrap_or(&bytes));
+    Ok(())
+}
+
+/// Encode one complete frame — link layer, `savPdu`, every ASDU — and report where its
+/// patchable fields ended up.
+///
+/// `smpCnt` is encoded at the **largest** value the stream can reach, so the field is wide
+/// enough for every count the publisher will write into it; the caller puts the real count
+/// back. Everything else is written at the value it will carry.
+fn build_template(cfg: &PublisherConfig, smp_synch: SmpSynch, refr_tm: Option<UtcTime>, gm: Option<[u8; 8]>) -> Result<(Vec<u8>, Vec<AsduOffsets>)> {
+    let max_smp_cnt = u16::try_from(cfg.profile.smp_cnt_wrap().saturating_sub(1)).unwrap_or(u16::MAX);
+    let asdus: Vec<Asdu> = (0..cfg.profile.asdus_per_frame)
+        .map(|_| Asdu {
+            sv_id: cfg.sv_id.clone(),
+            dat_set: cfg.dat_set.clone(),
+            smp_cnt: max_smp_cnt,
+            conf_rev: cfg.conf_rev,
+            refr_tm: cfg.refr_tm.then(|| refr_tm.unwrap_or_default()),
+            smp_synch: Some(smp_synch),
+            smp_rate: cfg.profile.smp_rate,
+            sample: alloc::vec![0u8; cfg.profile.sample_len],
+            smp_mod: cfg.profile.smp_mod.map(SmpMod::to_u8),
+            gm_identity: cfg.gm_identity.then(|| gm.unwrap_or_default()),
+        })
+        .collect();
+    let apdu = SavPdu { asdus }.encode()?;
+
+    let mut link = cfg.header;
+    link.reserved1 = if cfg.simulation { link.reserved1 | RESERVED1_SIMULATION } else { link.reserved1 & !RESERVED1_SIMULATION };
+    let mut frame = alloc::vec![0u8; link.len() + apdu.len()];
+    link.write(&apdu, &mut frame)?;
+    let apdu_at = link.len();
+    // Locate the patch points by decoding what we just wrote: the offsets and widths come
+    // from the decoder, so template and codec can never disagree about the layout.
+    let at = locate_fields(&frame, apdu_at, cfg)?;
+    Ok((frame, at))
+}
+
 /// Find the patchable field offsets in an encoded frame by decoding it.
 fn locate_fields(frame: &[u8], apdu_at: usize, cfg: &PublisherConfig) -> Result<Vec<AsduOffsets>> {
     use super::apdu::SavPduView;
@@ -421,8 +523,8 @@ fn locate_fields(frame: &[u8], apdu_at: usize, cfg: &PublisherConfig) -> Result<
         let a = asdu?;
         // The decoder reports offsets relative to the APDU; the patcher works on the frame.
         out.push(AsduOffsets {
-            smp_cnt: apdu_at + a.at.smp_cnt,
-            smp_synch: a.at.smp_synch.map(|o| apdu_at + o),
+            smp_cnt: Field { at: apdu_at + a.at.smp_cnt.at, len: a.at.smp_cnt.len },
+            smp_synch: a.at.smp_synch.map(|f| Field { at: apdu_at + f.at, len: f.len }),
             refr_tm: a.at.refr_tm.map(|o| apdu_at + o),
             sample: apdu_at + a.at.sample,
             gm_identity: a.at.gm_identity.map(|o| apdu_at + o),
@@ -462,6 +564,77 @@ mod tests {
         PhsMeas1 { currents: [v; 4], current_quality: [Quality::GOOD; 4], voltages: [v; 4], voltage_quality: [Quality::GOOD; 4] }.encode()
     }
 
+    /// `smpSynch` 5–254 names a local-area clock (IEC 61850-9-2 Ed2). Written as one octet,
+    /// 200 is the ASN.1 INTEGER −56 and Wireshark dissects it as −56; the field has to widen
+    /// to keep the value positive, and the template has to stay patchable across the change.
+    #[test]
+    fn a_local_clock_identity_above_127_stays_a_positive_integer() {
+        let mut p = Publisher::new(cfg(SvProfile::LE_80_50HZ)).unwrap();
+        // The ordinary values keep the one-octet field every vendor capture shows.
+        p.set_smp_synch(SmpSynch::Global).unwrap();
+        let frame = publish_one(&mut p, 1);
+        let fr = Frame::parse(&frame).unwrap();
+        let pdu = SavPduView::parse(fr.apdu, &Limits::DEFAULT).unwrap();
+        let a = pdu.asdus().next().unwrap().unwrap();
+        assert_eq!(a.smp_synch, Some(SmpSynch::Global));
+        assert_eq!(a.at.smp_synch.unwrap().len, 1, "an ordinary smpSynch is one octet, as the vendor capture writes it");
+
+        // Crossing 127 re-encodes the template and the value still reads back as itself.
+        p.set_smp_synch(SmpSynch::LocalClock(200)).unwrap();
+        let frame = publish_one(&mut p, 2);
+        let fr = Frame::parse(&frame).unwrap();
+        let pdu = SavPduView::parse(fr.apdu, &Limits::DEFAULT).unwrap();
+        let a = pdu.asdus().next().unwrap().unwrap();
+        assert_eq!(a.smp_synch, Some(SmpSynch::LocalClock(200)));
+        assert_eq!(a.at.smp_synch.unwrap().len, 2, "200 needs the leading zero octet");
+        // And it is a *positive* INTEGER, not the two's-complement −56 a bare `C8` would be.
+        let octets = &fr.apdu[a.at.smp_synch.unwrap().at..a.at.smp_synch.unwrap().at + 2];
+        assert_eq!(octets, &[0x00, 0xC8]);
+        // The rest of the stream survived the re-encode.
+        assert_eq!(a.sv_id, "MU01");
+        assert_eq!(a.sample, &sample(2)[..]);
+    }
+
+    /// IEC 61869-9 allows 96 kHz for HV d.c., where `smpCnt` runs to the field's own 65 535.
+    /// Two octets of `FF FF` is −1; the width has to come from the stream's maximum.
+    #[test]
+    fn a_high_rate_stream_numbers_its_samples_without_going_negative() {
+        let profile = SvProfile { samples_per_second: 96_000, asdus_per_frame: 1, ..SvProfile::F4800S2I4U4 };
+        let mut p = Publisher::new(cfg(profile)).unwrap();
+        p.set_smp_cnt(65_535);
+        let frame = publish_one(&mut p, 1);
+        let fr = Frame::parse(&frame).unwrap();
+        let pdu = SavPduView::parse(fr.apdu, &Limits::DEFAULT).unwrap();
+        let a = pdu.asdus().next().unwrap().unwrap();
+        assert_eq!(a.smp_cnt, 65_535);
+        assert_eq!(a.at.smp_cnt.len, 3, "the field is sized from the largest count the stream can reach");
+        assert_eq!(&fr.apdu[a.at.smp_cnt.at..a.at.smp_cnt.at + 3], &[0x00, 0xFF, 0xFF]);
+        // …and the width is constant across the whole stream, which is what makes it patchable.
+        assert_eq!(p.smp_cnt(), 0, "65 535 is the last count before the wrap");
+        let frame = publish_one(&mut p, 1);
+        let fr = Frame::parse(&frame).unwrap();
+        let pdu = SavPduView::parse(fr.apdu, &Limits::DEFAULT).unwrap();
+        let a = pdu.asdus().next().unwrap().unwrap();
+        assert_eq!(a.smp_cnt, 0);
+        assert_eq!(a.at.smp_cnt.len, 3);
+    }
+
+    /// A stream at an ordinary rate keeps the exact widths the vendor capture holds —
+    /// `82 02` for smpCnt and `83 04` for confRev — because widening is only ever a fix for
+    /// a value that would come out negative.
+    #[test]
+    fn ordinary_streams_keep_the_widths_the_field_uses() {
+        let mut p = Publisher::new(cfg(SvProfile::LE_80_50HZ).with_conf_rev(1)).unwrap();
+        let frame = publish_one(&mut p, 1);
+        let fr = Frame::parse(&frame).unwrap();
+        let pdu = SavPduView::parse(fr.apdu, &Limits::DEFAULT).unwrap();
+        let a = pdu.asdus().next().unwrap().unwrap();
+        assert_eq!(a.at.smp_cnt.len, 2);
+        // `83 04 00 00 00 01` — the confRev encoding the reference capture carries.
+        let at = fr.apdu.windows(6).position(|w| w == [0x83, 0x04, 0x00, 0x00, 0x00, 0x01]);
+        assert!(at.is_some(), "confRev keeps its four-octet field");
+    }
+
     fn publish_one(p: &mut Publisher, v: i32) -> Vec<u8> {
         let block = sample(v);
         p.publish_repeating(Instant::ZERO, &block).unwrap();
@@ -483,7 +656,7 @@ mod tests {
     #[test]
     fn patching_the_template_yields_a_decodable_frame() {
         let mut p = Publisher::new(cfg(SvProfile::LE_80_50HZ)).unwrap();
-        p.set_smp_synch(SmpSynch::Global);
+        p.set_smp_synch(SmpSynch::Global).unwrap();
         let frame = publish_one(&mut p, 1234);
         assert!(p.poll_transmit().is_none(), "a frame is handed out once");
 
@@ -500,7 +673,7 @@ mod tests {
     #[test]
     fn multi_asdu_frames_number_their_samples_consecutively() {
         let mut p = Publisher::new(cfg(SvProfile::F4800S2I4U4)).unwrap();
-        p.set_smp_synch(SmpSynch::Global);
+        p.set_smp_synch(SmpSynch::Global).unwrap();
         let (a, b) = (sample(10), sample(20));
         p.publish(Instant::ZERO, &[&a, &b]).unwrap();
         let frame = p.poll_transmit().unwrap().to_vec();
@@ -523,7 +696,7 @@ mod tests {
         let t = UtcTime::from_unix(1_700_000_000, 500_000, TimeQuality::SYNCHRONIZED);
         p.set_refr_tm(t);
         p.set_gm_identity([0xAA, 1, 2, 3, 4, 5, 6, 7]);
-        p.set_smp_synch(SmpSynch::Global);
+        p.set_smp_synch(SmpSynch::Global).unwrap();
         let frame = publish_one(&mut p, 0);
         assert_eq!(frame.len(), len, "patching must not change the frame length");
         let pdu = SavPduView::parse(Frame::parse(&frame).unwrap().apdu, &Limits::DEFAULT).unwrap();

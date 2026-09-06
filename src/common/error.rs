@@ -51,6 +51,26 @@ pub enum Error {
     /// One value of a `Read` or `Write` failed with an MMS `DataAccessError`: 10 is
     /// object-non-existent, 3 object-access-denied, 11 object-access-unsupported.
     DataAccess(i64),
+    /// The peer **rejected** the PDU rather than failing the service: an unrecognised
+    /// service, an invoke identifier it cannot use, more requests outstanding than were
+    /// negotiated, or octets it could not read as a PDU at all. Distinct from
+    /// [`Error::Service`], which is a service that ran and failed.
+    ///
+    /// The reason is carried as its two wire numbers rather than as the typed
+    /// `RejectReason`, for the same reason [`Error::ControlRejected`] carries a bare
+    /// `add_cause`: this module is `common`, and an error type that names a `proto::mms`
+    /// type cannot be built without the `mms` feature. `RejectReason::from_parts(tag, code)`
+    /// turns the pair back into the named value, and the tag matters — the same code means
+    /// different things under different tags.
+    Rejected {
+        /// The request it rejects, when the peer named one.
+        invoke_id: Option<i64>,
+        /// The `rejectReason` choice tag: 1 confirmed-request, 2 confirmed-response,
+        /// 3 confirmed-error, 4 unconfirmed, 5 pdu-error, …
+        reason_tag: u32,
+        /// The integer inside that choice.
+        code: i64,
+    },
     /// A control was refused or abandoned. `add_cause` is the IEC 61850-8-1 Table 77 value —
     /// `AddCause::from_code` names it — and it is the field that turns "the breaker did not
     /// close" into a diagnosis.
@@ -108,6 +128,10 @@ impl fmt::Display for Error {
             Error::Io(msg) => write!(f, "transport: {msg}"),
             Error::Service { class, code } => write!(f, "MMS service error: class {class}, code {code}"),
             Error::DataAccess(code) => write!(f, "MMS data access error {code}"),
+            Error::Rejected { invoke_id, reason_tag, code } => match invoke_id {
+                Some(id) => write!(f, "the peer rejected invoke {id}: reason {reason_tag}/{code}"),
+                None => write!(f, "the peer rejected the PDU: reason {reason_tag}/{code}"),
+            },
             Error::ControlRejected { add_cause } => write!(f, "control rejected, AddCause {add_cause}"),
         }
     }

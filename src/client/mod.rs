@@ -689,16 +689,24 @@ impl Client {
                 AssociationEvent::Timeout { invoke_id: id } if id == invoke_id => {
                     return Err(Error::Io(String::from("request timed out")));
                 }
+                // A reject *is* the answer: the server will send nothing else, so failing
+                // now with the reason it gave beats waiting out the request timeout and
+                // reporting silence.
+                AssociationEvent::Rejected { invoke_id: Some(id), reject } if id == invoke_id => return Err(rejected(&reject)),
+                // One that names no request cannot be attributed, but it is still the peer
+                // telling us it could not read what we sent — and it will not answer.
+                AssociationEvent::Rejected { invoke_id: None, reject } => return Err(rejected(&reject)),
                 AssociationEvent::Unconfirmed { pdu } => self.keep_unsolicited(&pdu),
                 AssociationEvent::Refused { layer, code } => {
                     return Err(Error::Io(format!("association refused at {layer}: {code:?}")));
                 }
                 AssociationEvent::Closed(reason) => return Err(closed(reason)),
-                // Another request's answer or timeout, a request from the peer (this end is
-                // a client and serves none), an established event, an undecodable PDU: none
-                // of them answer *this* request, and none of them end the association.
+                // Another request's answer, timeout or reject, a request from the peer (this
+                // end is a client and serves none), an established event, an undecodable PDU:
+                // none of them answer *this* request, and none of them end the association.
                 AssociationEvent::Response { .. }
                 | AssociationEvent::Timeout { .. }
+                | AssociationEvent::Rejected { .. }
                 | AssociationEvent::Request { .. }
                 | AssociationEvent::Malformed(_)
                 | AssociationEvent::Established(_) => {}
@@ -736,11 +744,27 @@ impl Client {
 
     fn drain_events(&mut self) -> Result<()> {
         while let Some(event) = self.assoc.poll_event() {
+            // Every variant is named rather than caught by a wildcard. A `_ => {}` here is
+            // how `Rejected` was silently absorbed when it was added: the compiler cannot
+            // ask about a variant a wildcard already answers for.
             match event {
                 AssociationEvent::Unconfirmed { pdu } => self.keep_unsolicited(&pdu),
                 AssociationEvent::Closed(reason) => return Err(closed(reason)),
                 AssociationEvent::Refused { layer, code } => return Err(Error::Io(format!("association refused at {layer}: {code:?}"))),
-                _ => {}
+                // A reject arriving outside a call answers a request that already timed out,
+                // or is the peer objecting to something we sent and are no longer waiting on.
+                // The association has released the invoke and counted it in
+                // `AssociationStats::rejected`; there is no call left to fail.
+                AssociationEvent::Rejected { .. }
+                // An answer or a timeout for a request nobody is waiting on any more, a
+                // request from the peer (this end serves none), the establishment event, and a
+                // PDU that did not decode — one bad report is not a reason to drop a
+                // connection, and `AssociationStats::malformed` counts it.
+                | AssociationEvent::Response { .. }
+                | AssociationEvent::Timeout { .. }
+                | AssociationEvent::Request { .. }
+                | AssociationEvent::Malformed(_)
+                | AssociationEvent::Established(_) => {}
             }
         }
         self.flush()
@@ -875,6 +899,15 @@ fn with_default_port(addr: &str) -> String {
 /// ceiling, or a server that never answers blocks the caller for ever.
 fn request_timeout(cfg: &AssociationConfig) -> Duration {
     Duration::from_millis(if cfg.request_timeout_ms == 0 { 30_000 } else { cfg.request_timeout_ms })
+}
+
+/// The reject as the error a caller sees.
+///
+/// The named reason lives in `proto::mms::reject`; the error carries the wire numbers,
+/// because `common::Error` is built by every feature and cannot name an MMS type.
+fn rejected(reject: &crate::proto::mms::reject::Reject) -> Error {
+    let (invoke_id, reason_tag, code) = reject.to_error_parts();
+    Error::Rejected { invoke_id, reason_tag, code }
 }
 
 fn closed(reason: CloseReason) -> Error {

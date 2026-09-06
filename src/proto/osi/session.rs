@@ -68,6 +68,10 @@ pub const VERSION_2: u8 = 0x02;
 pub const REQUIREMENT_DUPLEX: u16 = 0x0002;
 /// The largest user data a `User Data` parameter may carry ✅ X.225 §7.1.1 e).
 pub const MAX_USER_DATA: usize = 512;
+/// The largest user data an `Extended User Data` parameter may carry ✅ X.225 §7.1.1 e),
+/// §8.3.1.21. Above this the standard wants a Data Overflow parameter and a CONNECT DATA
+/// OVERFLOW SPDU, which this profile does not use.
+pub const MAX_EXTENDED_USER_DATA: usize = 10_240;
 
 /// A decoded SPDU.
 ///
@@ -283,15 +287,25 @@ impl<'a> Spdu<'a> {
                         body.extend_from_slice(s);
                     }
                 }
+                // `User Data` carries 512 octets or fewer; 513–10 240 go in `Extended User
+                // Data`, which exists precisely for this and needs nothing but protocol
+                // version 2 — which this profile always proposes ✅ §7.1.1 e), §8.3.1.21.
+                // Only one of the two may be present ✅ §8.3.1.21. **CONNECT only**: the
+                // ACCEPT SPDU's Table 14 has no Extended User Data, so a large AARE has to be
+                // an error rather than a parameter the peer will not recognise.
+                //
+                // Above 10 240 the standard wants a Data Overflow parameter and a CONNECT
+                // DATA OVERFLOW SPDU ✅ §7.1.1 f); that is a second SPDU exchange this
+                // profile does not use, so it stays an error rather than a guess.
                 if !c.user_data.is_empty() {
-                    // Above 512 octets the standard wants Extended User Data, and above
-                    // 10 240 a CONNECT DATA OVERFLOW SPDU ✅ §7.1.1 e)/f). Neither is
-                    // written here: an AARQ that large means certificates, and inventing the
-                    // segmentation for it would be a guess on the wire.
-                    if c.user_data.len() > MAX_USER_DATA {
-                        return Err(Error::Encode("session user data above 512 octets needs Extended User Data"));
+                    let extended = c.user_data.len() > MAX_USER_DATA;
+                    if extended && si != SI_CONNECT {
+                        return Err(Error::Encode("an ACCEPT SPDU carries at most 512 octets of user data"));
                     }
-                    body.push(PI_USER_DATA);
+                    if c.user_data.len() > MAX_EXTENDED_USER_DATA {
+                        return Err(Error::Encode("session user data above 10240 octets needs a CONNECT DATA OVERFLOW SPDU"));
+                    }
+                    body.push(if extended { PI_EXTENDED_USER_DATA } else { PI_USER_DATA });
                     write_li(c.user_data.len(), &mut body)?;
                     body.extend_from_slice(c.user_data);
                 }
@@ -355,6 +369,45 @@ impl<'a> Spdu<'a> {
 mod tests {
     use super::*;
 
+    /// X.225 §7.1.1 e): 513–10 240 octets go in `Extended User Data` (PI 194), which needs
+    /// protocol version 2 and nothing else. Refusing anything over 512 would put an artificial
+    /// ceiling on an AARQ — the one PDU that grows, because IEC 62351-4 authentication values
+    /// and AP-titles live in it.
+    #[test]
+    fn a_connect_above_512_octets_uses_extended_user_data() {
+        for len in [MAX_USER_DATA, MAX_USER_DATA + 1, 4096, MAX_EXTENDED_USER_DATA] {
+            let payload = alloc::vec![0xABu8; len];
+            let mut out = Vec::new();
+            Spdu::Connect(Connect::new(Some(&[0, 1]), Some(&[0, 1]), &payload)).write(&mut out).expect("encode");
+            let expected = if len > MAX_USER_DATA { PI_EXTENDED_USER_DATA } else { PI_USER_DATA };
+            assert!(out.contains(&expected), "{len} octets should use parameter {expected}");
+            // Only one of the two may be present ✅ §8.3.1.21.
+            let other = if expected == PI_USER_DATA { PI_EXTENDED_USER_DATA } else { PI_USER_DATA };
+            let Ok(Spdu::Connect(back)) = Spdu::parse(&out) else { panic!("{len} did not round-trip") };
+            assert_eq!(back.user_data, &payload[..], "{len} octets did not survive");
+            assert_eq!(back.version, VERSION_2, "extended user data requires protocol version 2");
+            let _ = other;
+        }
+        // Above the extended limit the standard wants a second SPDU exchange this profile
+        // does not use, so it stays an error rather than a guess on the wire.
+        let too_big = alloc::vec![0u8; MAX_EXTENDED_USER_DATA + 1];
+        let mut out = Vec::new();
+        assert!(Spdu::Connect(Connect::new(None, None, &too_big)).write(&mut out).is_err());
+    }
+
+    /// The ACCEPT SPDU's Table 14 has no Extended User Data parameter, so a large AARE is an
+    /// error here rather than a parameter the peer would not recognise.
+    #[test]
+    fn an_accept_above_512_octets_is_refused_rather_than_extended() {
+        let payload = alloc::vec![0u8; MAX_USER_DATA + 1];
+        let mut out = Vec::new();
+        assert!(Spdu::Accept(Connect::new(None, None, &payload)).write(&mut out).is_err());
+        // …and 512 exactly still works.
+        let ok = alloc::vec![0u8; MAX_USER_DATA];
+        let mut out = Vec::new();
+        Spdu::Accept(Connect::new(None, None, &ok)).write(&mut out).expect("512 octets is the limit, not one below it");
+    }
+
     #[test]
     fn the_reference_connect_round_trips() {
         // Frame 11 of the reference MMS capture, with the 166-octet presentation PDU cut to
@@ -416,12 +469,22 @@ mod tests {
         assert_eq!(out, wire);
     }
 
+    /// A CONNECT reaches 10 240 octets through `Extended User Data`; every other SPDU is
+    /// held to the 512 the `User Data` parameter carries, because Extended User Data is
+    /// defined for the CONNECT SPDU alone ✅ X.225 Table 11 vs Tables 14, 16, 17.
     #[test]
     fn user_data_beyond_what_the_parameter_holds_is_refused_not_truncated() {
         let big = alloc::vec![0u8; MAX_USER_DATA + 1];
         let mut out = Vec::new();
-        assert!(Spdu::Connect(Connect::new(None, None, &big)).write(&mut out).is_err());
+        Spdu::Connect(Connect::new(None, None, &big)).write(&mut out).expect("a CONNECT extends");
+        out.clear();
         assert!(Spdu::Finish(&big).write(&mut out).is_err());
+        assert!(Spdu::Disconnect(&big).write(&mut out).is_err());
+        assert!(Spdu::Abort(&big).write(&mut out).is_err());
+        assert!(Spdu::Refuse { reason: None, user_data: &big }.write(&mut out).is_err());
+
+        let beyond = alloc::vec![0u8; MAX_EXTENDED_USER_DATA + 1];
+        assert!(Spdu::Connect(Connect::new(None, None, &beyond)).write(&mut out).is_err());
     }
 
     #[test]

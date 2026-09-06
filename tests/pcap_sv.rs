@@ -159,7 +159,7 @@ fn the_publisher_reproduces_the_captured_stream() {
         let pdu = SavPduView::parse(fr.apdu, &Limits::DEFAULT).unwrap();
         let asdu = pdu.asdus().next().unwrap().unwrap();
         publisher.set_smp_cnt(asdu.smp_cnt);
-        publisher.set_smp_synch(asdu.smp_synch.unwrap());
+        publisher.set_smp_synch(asdu.smp_synch.unwrap()).unwrap();
         publisher.publish(Instant(n as u64), &[asdu.sample]).unwrap();
         assert_eq!(publisher.poll_transmit().unwrap(), &wire[..], "frame {n} differs from the captured one");
     }
