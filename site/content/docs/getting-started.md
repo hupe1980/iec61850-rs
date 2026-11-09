@@ -28,7 +28,7 @@ hyphen-to-underscore rule implies. (`iec61850` on crates.io belongs to an unrela
 | `cli` | The `ied` command line. Implies every other feature |
 
 There is no `alloc` feature: the crate is `no_std` **+ alloc** in every configuration. Every
-feature builds on its own, and so does none of them; CI checks both on every push.
+feature builds on its own, and so does none of them.
 
 ```bash
 cargo add iec61850-rs --no-default-features --features goose   # GOOSE on an MCU

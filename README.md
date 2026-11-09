@@ -235,12 +235,15 @@ cargo run --example supervised_subscriber  # a GOOSE subscription's health, publ
   libiec61850's GOOSE and SV publishers and subscribers in both directions. Each peer is a
   container built from a pinned, checksummed release; Docker is the only prerequisite.
 - **Loopback:** client and server run against each other from an SCL file.
+- **Live interfaces:** GOOSE and SV over a veth pair on a real Linux kernel, on both receive
+  paths, and the CLI pair `ied mu --iface` → `ied sv monitor --iface` without a gap.
 - **Adversarial simulation** of publisher and subscriber under loss, reordering, duplication,
   replay and partition, across 512 seeds in CI.
 - **Zero steady-state allocations**, asserted by a counting allocator.
 - **Thirteen fuzz targets**, `#![forbid(unsafe_code)]`, and `unwrap`/`expect`/`panic`/indexing
   denied by lint; every fuzzer crash is kept as a named regression test.
-- **OpenSCD's SCL files** load and every data-set member resolves.
+- **OpenSCD's SCL files** load, every data-set member resolves, and every file round-trips
+  through the editor byte for byte.
 
 What this does not prove: [Verification](https://hupe1980.github.io/iec61850-rs/docs/verification/).
 
@@ -250,6 +253,7 @@ What this does not prove: [Verification](https://hupe1980.github.io/iec61850-rs/
 cargo test --all-features                     # captures, tshark and Docker tests skip if absent
 
 cargo test --all-features --test interop     # needs Docker; builds the peer images on first use
+scripts/linux-test.sh --docker                # live GOOSE/SV over a veth pair, in a container
 
 SIM_SEED=42 cargo test --test simulation      # replay one simulation seed
 cargo +nightly fuzz run mms_association -- -max_total_time=60

@@ -33,7 +33,7 @@ These pages are the guide. The per-item API reference lives on
 |---|---|
 | Protocols | GOOSE (IEC 61850-8-1), Sampled Values (IEC 61850-9-2, 9-2LE, IEC 61869-9), MMS with its OSI stack (TPKT, COTP, session, presentation, ACSE) and a **client and server** over it: browse, read, write, reporting, control, files, logs, setting groups, LGOS/LSVS supervision |
 | Edition | 2.1 semantics, including the Edition 2 simulation bit |
-| Security | The IEC 62351-6 replay-protection state machine, always on |
+| Security | The IEC 62351-6 replay-protection state machine, always on; an optional ACSE password on the server; file writes off by default |
 | Engineering | SCL (IEC 61850-6) schema versions 2003 through 2007B4: model loading, `Inputs/ExtRef` subscription resolution, the engineering checks the schema does not make, and editing that leaves untouched bytes untouched |
 | Dependencies | all optional, per feature: `roxmltree` (SCL), `redb` (durable log), `rawether` (live interfaces). The protocol cores have none; client and server are blocking and need no async runtime |
 | Targets | `std`, and `no_std` + `alloc` on `thumbv7em-none-eabihf` |
@@ -42,11 +42,11 @@ These pages are the guide. The per-item API reference lives on
 
 ## Status
 
-The process bus — over capture files and live interfaces — and both halves of the station bus —
-the association over all six OSI layers, a SCADA client and a server built from an SCL file
-(`ied sim relay.icd`) that also publishes its GOOSE and SV — are implemented and tested, the
-station bus against **libiec61850 in both roles** in CI.
+The process bus, over capture files and live interfaces, and both halves of the station bus —
+the association over all six OSI layers, a SCADA client, and a server built from an SCL file
+(`ied sim relay.icd`) that also publishes its GOOSE and SV — are implemented and tested in CI
+against **libiec61850, IEC61850bean and csp0924's crates**, in both roles.
 
-Not included: TLS (IEC 62351-3), the IEC 62351-6 authentication extension and routable GOOSE/SV. Nothing here has been through
-a conformance laboratory; [Verification](@/docs/verification.md) says what is and is not
-proven.
+Not included: TLS (IEC 62351-3), the IEC 62351-6 authentication extension and routable
+GOOSE/SV. Nothing here has been through a conformance laboratory;
+[Verification](@/docs/verification.md) says what is and is not proven.

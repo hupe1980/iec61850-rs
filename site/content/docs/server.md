@@ -1,6 +1,6 @@
 +++
 title = "Server"
-description = "Serve an IEC 61850 model from an SCL file: the MMS namespace, reads and writes, a report engine with buffering, general interrogation and segmentation, all four control models, setting groups, a sandboxed file store and logs — with no generated model and no build step."
+description = "Serve an IEC 61850 model from an SCL file: the MMS namespace, reads and writes, a report engine with buffering and segmentation, all four control models, setting groups, a sandboxed file store with SetFile, durable logs, and the GOOSE and SV a client enables — with no generated model and no build step."
 weight = 47
 +++
 
@@ -94,7 +94,7 @@ IEC 61850-7-2 §5.7 decides which functional constraints a client may write:
 Inside a control block the rule is per attribute: `RptEna`, `DatSet`, `OptFlds`, `BufTm`,
 `TrgOps`, `IntgPd`, `GI`, `PurgeBuf` and `EntryID` are writable; `SqNum`, `ConfRev`,
 `TimeOfEntry`, `BufOvfl` and `Owner` are not. `Owner` holds the network address of the client
-holding the block and is cleared when its association ends.
+holding the block.
 
 The application is not bound by these rules: `handle.txn()` is the process interface and may
 write `ST` and `MX`.
@@ -165,9 +165,25 @@ outlive the association.
 ## Publisher control blocks
 
 GoCBs and MSVCBs are served from the file with their `Communication` addresses; only
-`GoEna`/`SvEna` are writable by a client. A unicast sampled-value stream
-(`multicast="false"`) is a `USVCB` under `US`, with `UsvID` and no `noASDU`. Enabling a block
-does not start a publisher.
+`GoEna`/`SvEna` are writable by a client. Enabling a block starts its publisher, built from the
+file: GOOSE on every data-set change with the file's retransmission curve, SV every sample
+period with the model's current values. A block the file does not describe well enough to
+publish — no address, a data set with no fixed SV layout, a unicast `USVCB` (`multicast="false"`,
+served under `US`) — is refused with `object-value-invalid`, and a data set a publishing block
+uses cannot be deleted.
+
+Frames go to a sink you register before serving:
+
+```rust
+let link = iec61850_rs::net::Link::open("eth1", &iec61850_rs::net::LinkOptions::process_bus())?;
+server.publish_on(link)?;                 // or publish_to(|frame| …) for any other transport
+iec61850_rs::net::drop_capabilities()?;   // before Server::run starts any thread
+server.run()?;
+```
+
+The process-bus thread starts with `run` (or the first `accept_one`) and takes only the
+publishers' lock, so a slow log write cannot delay a sample. Frames that could not be queued are
+counted by `Server::frames_dropped`. `ied sim --iface eth1` does all of this.
 
 ## Service tracking
 
@@ -403,8 +419,9 @@ let node = model.supervision().into_iter().find(|n| n.watches(gocb_ref));
 ## Driving it yourself
 
 `Server::run` is an accept loop with a thread per association. Driving `Acsi` directly (sans-IO)
-requires waking at `Acsi::next_timeout`: the earliest gathering window, integrity period,
-select expiry or time-activated command.
+requires waking at `Acsi::next_timeout` — the earliest gathering window, integrity period,
+select expiry, time-activated command, file transfer deadline or publisher frame — and sending
+what `Acsi::drain_frames` hands over.
 
 | Layer | Role |
 |---|---|
@@ -415,7 +432,7 @@ select expiry or time-activated command.
 
 ## Limits
 
-Not implemented: TLS (IEC 62351-3). `GoEna`/`SvEna` drive no publisher.
+Not implemented: TLS (IEC 62351-3) and unicast sampled values.
 
-The server is tested against this crate's client, Wireshark and libiec61850's client — see
-[Verification](@/docs/verification.md).
+The server is tested against this crate's client, Wireshark, and the clients of libiec61850,
+IEC61850bean and csp0924's crates — see [Verification](@/docs/verification.md).

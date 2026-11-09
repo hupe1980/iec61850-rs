@@ -33,7 +33,12 @@ A live capture is recorded for `--duration` seconds (default 10) and then judged
 the code that judges a capture file, so both report the same thing about the same frames;
 `--write` keeps it. The kernel filters on the GOOSE or SV EtherType and on the IEC multicast
 range (or the groups a command joins) before anything reaches `ied`; truncated frames are
-counted, not decoded. `--promiscuous` is for port mirrors.
+counted, not decoded. `--group <MAC>` (repeatable) receives exactly the groups named instead of
+the IEC range, for a publisher engineered outside it; `--promiscuous` is for port mirrors.
+
+`goose publish` sends one control block from the file: `--value` gives one value per data-set
+member (default: the file's), `--duration` how long to keep the retransmission curve going
+(default 10 s), `--ied` the publisher when the file holds several.
 
 The capability is dropped as soon as the interface is open. On Linux the sockets use a
 TPACKET_V3 ring, kernel timestamps and, with `--launch-time`, `SO_TXTIME`; on macOS they use
@@ -189,6 +194,8 @@ serving; ^C to stop
 | `--password` | none | Require this ACSE password of every association; with `--writable`, only those may send files |
 | `--edition` | from the file | `1`, `2` or `2.1` |
 | `--log-db` | in memory | Keep the logs in this file across restarts (a directory of `<IED>.redb` files when serving several IEDs) |
+| `--iface` | — | Publish the GoCBs and MSVCBs a client enables on this interface |
+| `--freq` | 50 | Nominal frequency, for an MSVCB's `smpRate` per period |
 
 The edition is the file's own: `2003` is Edition 1, `2007B` Edition 2, `2007B4` and later
 Edition 2.1. An Edition 1 server's report control blocks have no `ResvTms` and no `Owner`.
@@ -513,7 +520,7 @@ The six changes of the rename are the IED, its `ConnectedAP`, an `LNode`, a subs
 
 | Option | |
 |---|---|
-| `-o <FILE>`, `--in-place` | where to write (default stdout); the file is replaced atomically |
+| `-o`/`--out <FILE>`, `--in-place` | where to write (default stdout); the file is replaced atomically |
 | `--dry-run` | print a unified diff and write nothing |
 | `--who`, `--why` | also record the edit as a `Header/History` item |
 | `--check` | refuse to write if the result has any validation error |

@@ -223,7 +223,7 @@ reported on the transition, counted on every ASDU.
 drops, layout mismatches, and whether it is currently stale. A frame counts as **one** frame
 however many ASDUs it carries.
 
-## Verified against hardware
+## Verified against a vendor capture
 
 A `Publisher` configured as a captured merging unit was, fed that capture's sample blocks,
 reproduces its frames **byte for byte**. All 10,161 frames of the reference 9-2LE capture

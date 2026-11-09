@@ -29,15 +29,19 @@ let w = c.read("IED1LD0/MMXU1.TotW.mag.f", Fc::MX)?;   // one round trip, typed 
 # structured data from this one source, so the two cannot drift apart.
 [[extra.faq]]
 q = "Is there an IEC 61850 library for Rust?"
-a = "This is one: GOOSE and Sampled Values on the process bus, and an MMS client and server on the station bus, tested against real captures, Wireshark and libiec61850 in CI. It is pre-1.0 and has not been through a conformance laboratory; libiec61850 (C, GPLv3 or commercial) is the mature alternative if you need a certified stack today."
+a = "This is one: GOOSE and Sampled Values on the process bus, and an MMS client and server on the station bus, tested against real captures, Wireshark, and libiec61850, IEC61850bean and csp0924's crates in CI. It is pre-1.0 and has not been through a conformance laboratory; libiec61850 (C, GPLv3 or commercial) is the mature alternative if you need a certified stack today."
 
 [[extra.faq]]
 q = "Which parts of IEC 61850 does it cover?"
-a = "GOOSE (IEC 61850-8-1), Sampled Values (IEC 61850-9-2, 9-2LE, IEC 61869-9), and MMS over its full OSI stack with the ACSI services in both directions: browse, read, write, reporting, all four control models, files, logs, setting groups, LGOS/LSVS supervision, service tracking and type discovery. SCL (IEC 61850-6) loads the IED model, resolves subscriptions and configures the server, with Edition 2.1 semantics throughout."
+a = "GOOSE (IEC 61850-8-1), Sampled Values (IEC 61850-9-2, 9-2LE, IEC 61869-9), and MMS over its full OSI stack with the ACSI services in both directions: browse, read, write, reporting, all four control models, files, logs, setting groups, LGOS/LSVS supervision, service tracking and type discovery. SCL (IEC 61850-6) loads the IED model, resolves subscriptions, configures the server and is edited without reformatting, with Edition 2.1 semantics throughout. GOOSE and SV run over capture files or live interfaces."
 
 [[extra.faq]]
 q = "Can I run an IEC 61850 server or IED simulator with it?"
-a = "Yes, and the SCL file is the whole configuration — no generated model, no build step. `ied sim relay.icd` serves every IED in a file, each on its own port; in code it is `Server::bind(addr, Ied::from_scl_file(path, None)?)`, plus a hook where your application decides whether the breaker actually moves."
+a = "Yes, and the SCL file is the whole configuration — no generated model, no build step. `ied sim relay.icd` serves every IED in a file, each on its own port, and with `--iface` publishes the GOOSE and SV a client enables; in code it is `Server::bind(addr, Ied::from_scl_file(path, None)?)`, plus a hook where your application decides whether the breaker actually moves."
+
+[[extra.faq]]
+q = "Does it work on a live network, not just captures?"
+a = "Yes. With the `net` feature GOOSE and SV go on and off a real interface: Linux `AF_PACKET` with a `TPACKET_V3` ring, kernel or NIC timestamps and `SO_TXTIME` launch-time transmit, and BPF on macOS. `brew install hupe1980/tap/ied` gives the command line: `ied goose sniff --iface eth1`, `ied mu --iface eth1`."
 
 [[extra.faq]]
 q = "Can it run on a microcontroller?"
@@ -49,7 +53,7 @@ a = "It allocates nothing once running: a counting allocator asserts zero alloca
 
 [[extra.faq]]
 q = "Does it do the IEC 62351 security extensions?"
-a = "The IEC 62351-6 replay-protection state machine, yes, and it is always on, because a conforming subscriber must run it whether or not the stream carries security. The layer-2 authentication extension and TLS (IEC 62351-3) are not implemented."
+a = "The IEC 62351-6 replay-protection state machine, yes, and it is always on, because a conforming subscriber must run it whether or not the stream carries security. A server can require the ACSE password. The layer-2 authentication extension and TLS (IEC 62351-3) are not implemented."
 
 [[extra.faq]]
 q = "What licence is it under, and can I use it commercially?"
@@ -109,11 +113,11 @@ marker or an expert error fails the build, and so does a field that does not dis
 the value that was encoded.</p>
 </div>
 <div class="card">
-<h3>And libiec61850 is the second opinion</h3>
+<h3>And three other stacks are the second opinion</h3>
 <p>A dissector says whether a PDU is well formed; a peer says whether it was the PDU expected,
-in the order expected. CI builds libiec61850 and runs its client against
-this server — browse, type discovery, all four control models, array elements, reporting — and
-this client against its server, logs included.</p>
+in the order expected. CI runs libiec61850, IEC61850bean and csp0924's crates in containers
+against this stack in both roles — browse, types, control, reporting, logs, files — and
+libiec61850's GOOSE and SV publishers and subscribers against this crate's, both ways.</p>
 </div>
 <div class="card">
 <h3>Replay protection is not optional</h3>
@@ -206,10 +210,12 @@ bus the server's service layer is a function from request to answer, tested with
 needs no privileges and no Linux.
 
 ```bash
+brew install hupe1980/tap/ied                        # or: cargo install iec61850-rs --features cli
 ied sim relay.icd                                    # be the IED: a server from an SCL file
 ied mu stream.pcap --profile f4800s2 --frames 2000   # virtual merging unit, IEC 61869-9
 ied sv monitor stream.pcap --scd bay.scd             # the real subscriber, channels named by the SCD
 ied goose sniff capture.pcap                         # gocbRef, stNum/sqNum, TAL, simulation bit
+ied goose sniff --iface eth1                         # …or off the wire
 ied mms sniff station.pcap                           # six OSI layers: association, services, values
 ied mms browse 10.0.0.5                              # a live server: devices, data, data sets
 ied mms report 10.0.0.5 --rcb IED1LD0/LLN0.urcb01 --gi   # enable a report and decode it
