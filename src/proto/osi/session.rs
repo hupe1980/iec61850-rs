@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(out, wire, "re-encoding must reproduce the octets");
     }
 
-    /// IEC61850bean reads a session selector as a 1-, 2-, 4- or 8-octet number and refuses the
+    /// `IEC61850bean` reads a session selector as a 1-, 2-, 4- or 8-octet number and refuses the
     /// association on any other length, so an empty selector — the default when the file names
     /// none — is left out of the SPDU, in both directions.
     #[test]

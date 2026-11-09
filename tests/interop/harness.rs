@@ -35,6 +35,13 @@ pub fn required() -> bool {
 /// by name — or it panics, if a skip is not allowed.
 pub fn docker() -> bool {
     static UP: OnceLock<bool> = OnceLock::new();
+    // A job that runs the peers elsewhere opts out explicitly, and says so; it never
+    // combines with `IEC61850_REQUIRE_INTEROP`.
+    if std::env::var("IEC61850_SKIP_INTEROP").is_ok_and(|v| v != "0") {
+        assert!(!required(), "IEC61850_SKIP_INTEROP and IEC61850_REQUIRE_INTEROP are both set");
+        eprintln!("skipping: IEC61850_SKIP_INTEROP is set");
+        return false;
+    }
     let up = *UP.get_or_init(|| Command::new("docker").args(["info", "--format", "{{.ServerVersion}}"]).output().is_ok_and(|o| o.status.success()));
     if !up {
         assert!(!required(), "IEC61850_REQUIRE_INTEROP is set, but Docker is not available");
@@ -217,6 +224,8 @@ pub fn on_network(request: impl Into<ContainerRequest<GenericImage>>, net: &Netw
 /// The container this crate's `ied` runs in on the process bus: the repository and `rawether`
 /// mounted read-only, the build cached in named volumes, the binary built on first use.
 pub fn ied_container(net: &Network, files: &[(&str, &str)]) -> Container<GenericImage> {
+    // One build at a time: the cargo cache is a shared volume, and two unpacks into it race.
+    static BUILD: Mutex<()> = Mutex::new(());
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).canonicalize().expect("repository");
     let rawether = repo.join("../rawether").canonicalize().expect("rawether next to the repository");
     let mut request = image("ied")
@@ -228,8 +237,6 @@ pub fn ied_container(net: &Network, files: &[(&str, &str)]) -> Container<Generic
         request = request.with_copy_to((*path).to_string(), text.as_bytes().to_vec());
     }
     let c = on_network(request, net, "ied");
-    // One build at a time: the cargo cache is a shared volume, and two unpacks into it race.
-    static BUILD: Mutex<()> = Mutex::new(());
     let _one = BUILD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let started = Instant::now();
     let (out, _, code) = exec(&c, &["bash", "-c", "set -o pipefail; cd /src/iec61850-rs && cargo build --locked --features cli --bin ied 2>&1 | tail -20"]);

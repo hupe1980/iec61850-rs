@@ -2,7 +2,7 @@
 //!
 //! Every other test proves consistency: the two halves of this crate share one codec, so they
 //! agree by construction, and `tshark` checks the octets but never the *sequence*. This is the
-//! missing third — **libiec61850** (C) on the station bus and the process bus, **IEC61850bean**
+//! missing third — **libiec61850** (C) on the station bus and the process bus, **`IEC61850bean`**
 //! (Java) and **csp0924's crates** (Rust) on the station bus.
 //!
 //! **Running it** needs Docker and nothing else: each peer is an image built from its Dockerfile
@@ -204,7 +204,11 @@ fn libiec61850s_file_tool_sends_a_file_to_this_server() {
     let store = std::env::temp_dir().join(format!("iec61850-interop-setfile-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&store);
     std::fs::create_dir_all(&store).unwrap();
-    let body: String = (1..=3000).map(|i| format!("{i}\n")).collect();
+    let body = (1..=3000).fold(String::new(), |mut s, i| {
+        use std::fmt::Write as _;
+        let _ = writeln!(s, "{i}");
+        s
+    });
     let (_, err, code) = sh(&peer, "seq 1 3000 > /tmp/upload.bin");
     assert_eq!(code, 0, "{err}");
 
@@ -350,7 +354,7 @@ fn process_bus_libiec61850_goose_reaches_this_subscriber() {
     assert!(heard.contains("simpleIOGenericIO/LLN0$GO$gcbAnalogValues"), "our subscriber did not see their GoCB:\n{heard}");
 }
 
-/// **Our publisher, their subscriber**: a GoCB of libiec61850's own GOOSE model, published by
+/// **Our publisher, their subscriber**: a `GoCB` of libiec61850's own GOOSE model, published by
 /// `ied goose publish`, decoded by their subscriber example.
 #[test]
 fn process_bus_this_goose_reaches_libiec61850s_subscriber() {
@@ -421,7 +425,7 @@ fn steps(peer: &str, out: &str, expected: &[&str]) {
     }
 }
 
-/// **Their client, our server** (IEC61850bean).
+/// **Their client, our server** (`IEC61850bean`).
 #[test]
 fn iec61850bean_client_drives_this_server() {
     if !docker() {
@@ -434,7 +438,7 @@ fn iec61850bean_client_drives_this_server() {
     steps("IEC61850bean", &format!("{out}{err}"), &["associate", "model", "read", "write", "report", "control-direct", "files", "release"]);
 }
 
-/// **Our client, their server** (IEC61850bean).
+/// **Our client, their server** (`IEC61850bean`).
 #[test]
 fn this_client_drives_an_iec61850bean_server() {
     if !docker() {
@@ -492,4 +496,68 @@ fn this_client_drives_a_csp0924_server() {
     let spec = c.variable_type("IED1LD0/MMXU1$MX$TotW", Fc::MX).expect("GetVariableAccessAttributes");
     assert!(spec.component("mag").is_some(), "{spec:?}");
     c.release().expect("orderly release");
+}
+
+// --- The harness's own guarantees --------------------------------------------------------------
+
+/// Every artifact an image downloads is pinned and checked, or built from a lock file.
+#[test]
+fn every_peer_artifact_is_pinned_and_checked() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/interop");
+    let dockerfile = |peer: &str| std::fs::read_to_string(dir.join(peer).join("Dockerfile")).unwrap();
+    for peer in ["libiec61850", "iec61850bean"] {
+        let text = dockerfile(peer);
+        assert!(text.contains("sha256sum -c"), "{peer}: downloads are not checked");
+        assert_eq!(text.matches("curl -fsSL").count(), text.matches("sha256sum -c").count(), "{peer}: one checksum per download");
+    }
+    assert!(dockerfile("csp0924").contains("--locked") && dir.join("csp0924/Cargo.lock").is_file(), "csp0924 builds from its lock file");
+}
+
+/// The server a peer client reaches is never on an address the LAN can reach.
+#[test]
+fn the_test_server_never_listens_on_all_interfaces() {
+    if !docker() {
+        return;
+    }
+    let addr = harness::bind_addr();
+    assert!(!addr.is_unspecified(), "{addr}");
+    assert!(addr.is_loopback() || cfg!(target_os = "linux"), "off Linux it is loopback: {addr}");
+}
+
+/// A container is removed when the test that owns it panics.
+#[test]
+fn a_peer_container_does_not_outlive_a_panicking_test() {
+    if !docker() {
+        return;
+    }
+    let id = std::thread::spawn(|| {
+        let c = harness::client_container(LIB);
+        std::panic::panic_any(c.id().to_string())
+    })
+    .join()
+    .unwrap_err();
+    let id = *id.downcast::<String>().expect("the container id");
+    let out = std::process::Command::new("docker").args(["ps", "-a", "-q", "--no-trunc", "--filter", &format!("id={id}")]).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty(), "container {id} outlived its test");
+}
+
+/// A peer runs as an unprivileged user, unprivileged, on the default bridge, without the socket.
+#[test]
+fn peer_containers_run_unprivileged() {
+    if !docker() {
+        return;
+    }
+    for peer in [LIB, "iec61850bean", "csp0924"] {
+        let c = harness::client_container(peer);
+        let out = std::process::Command::new("docker")
+            .args(["inspect", "-f", "{{.Config.User}}|{{.HostConfig.Privileged}}|{{.HostConfig.NetworkMode}}|{{range .Mounts}}{{.Source}} {{end}}", c.id()])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let parts: Vec<_> = text.split('|').collect();
+        assert!(!parts[0].is_empty() && parts[0] != "root" && parts[0] != "0", "{peer} runs as root: {text}");
+        assert_eq!(parts[1], "false", "{peer} is privileged: {text}");
+        assert_ne!(parts[2], "host", "{peer} is on the host network: {text}");
+        assert!(!parts.get(3).is_some_and(|m| m.contains("docker.sock")), "{peer} sees the Docker socket: {text}");
+    }
 }

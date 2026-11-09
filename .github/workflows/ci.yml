@@ -45,10 +45,12 @@ jobs:
             cargo test --doc --no-default-features --features "$f" || exit 1
           done
       # `IEC61850_REQUIRE_TSHARK` turns "tshark missing or too old" from a skip into a
-      # failure, so the Wireshark oracle cannot quietly stop running here.
+      # failure, so the Wireshark oracle cannot quietly stop running here. The interop peers
+      # run in their own job below, so this one skips them by name.
       - run: cargo test --all-features
         env:
           IEC61850_REQUIRE_TSHARK: "1"
+          IEC61850_SKIP_INTEROP: "1"
       # 512 seeds instead of the 64 a normal run does.
       - run: for s in $(seq 1 512); do SIM_SEED=$s cargo test --release --test simulation -- --exact publisher_and_subscriber_hold_their_invariants_under_an_adversarial_network || exit 1; done
       - run: cargo run --all-features --bin ied -- --help
@@ -89,21 +91,12 @@ jobs:
       # ../rawether; cargo resolves it even when the feature is off.
       - run: git clone --depth 1 https://github.com/hupe1980/rawether "$GITHUB_WORKSPACE/../rawether"
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build libiec61850
-        run: |
-          git clone --depth 1 https://github.com/mz-automation/libiec61850 "$RUNNER_TEMP/libiec61850"
-          make -C "$RUNNER_TEMP/libiec61850" -j"$(nproc)" examples
-          # `make examples` walks their makefile's *example* list, and
-          # `server_example_logging` is only in its *model* list — so it is built by name.
-          # `IEC61850_REQUIRE_INTEROP` turns a tool that is missing here into a failure rather
-          # than a test that quietly stops running.
-          make -C "$RUNNER_TEMP/libiec61850/examples/server_example_logging"
-          # Their log client and file tool are outside the example list too.
-          make -C "$RUNNER_TEMP/libiec61850/examples/iec61850_client_example_log"
-          make -C "$RUNNER_TEMP/libiec61850/examples/iec61850_client_example_files"
-      - run: cargo test --all-features --test interop -- --test-threads=3
+      # Every peer — libiec61850 on both buses, IEC61850bean, csp0924 — is an image built from
+      # its Dockerfile under tests/interop/ by the test itself, pinned by release and SHA-256;
+      # Docker is all this job needs. `IEC61850_REQUIRE_INTEROP` turns a skip into a failure,
+      # so the oracle cannot quietly stop running.
+      - run: cargo test --all-features --test interop -- --test-threads=4
         env:
-          IEC61850_LIBIEC61850: ${{ runner.temp }}/libiec61850
           IEC61850_REQUIRE_INTEROP: "1"
 
   no_std:
