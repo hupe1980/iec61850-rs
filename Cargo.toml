@@ -55,7 +55,7 @@ cli = ["std", "pcap", "scl", "goose", "sv", "mms", "client", "server", "log-redb
 # At least 0.21.2: earlier versions overflow the stack on deeply nested input.
 roxmltree = { version = "0.21.2", optional = true }
 redb = { version = "4.5", optional = true }
-rawether = { version = "0.1", optional = true }
+rawether = { version = "0.2", optional = true }
 
 [dev-dependencies]
 proptest = "1.11"

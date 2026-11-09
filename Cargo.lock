@@ -1405,9 +1405,9 @@ dependencies = [
 
 [[package]]
 name = "rawether"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7266488cc9d62b14ad6a5c569a768d1610f159fa3aa5dd1305d6a201b9d9bb6"
+checksum = "40e09494d3edeac7e0a84ce5944aba88f889f0c64ac5106b50031e76abba4286"
 dependencies = [
  "libc",
 ]
