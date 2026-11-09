@@ -16,6 +16,9 @@
 // nanosecond count loses past 2^52 is 104 days of sub-nanosecond digits nobody reads.
 #![allow(clippy::print_stdout, clippy::print_stderr, clippy::cast_precision_loss)]
 
+#[path = "ied/scl_edit.rs"]
+mod scl_edit;
+
 use std::fmt::Write as _;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -66,6 +69,7 @@ COMMANDS:
     scl validate <FILE.scl>        Engineering checks the XML schema does not make
     scl show <FILE.scl> [IED]      Print an IED's model: devices, nodes, control blocks
     scl subs <FILE.scd> <IED>      What an IED subscribes to, resolved from the publishers
+    scl edit <FILE.scl> <EDIT>     Change the file without reformatting it (see below)
     mu <FILE.pcap> [OPTIONS]       Generate a sampled-value stream into a capture
     sim <FILE.scd|.icd|.cid>       Serve the file's IEDs as real MMS servers
 
@@ -116,6 +120,24 @@ COMMANDS:
 
 `scl subs` options:
     --freq <50|60>      nominal frequency, to read smpRate (default 50)
+
+`scl edit` edits (references to a renamed or removed IED move with it):
+    rename-ied <OLD> <NEW>
+    remove-ied <NAME>
+    gse <IED> <LD> <CB>  --mac M --appid HEX --vlan HEX --vlan-priority N
+                         --min-time MS --max-time MS   (unset fields keep their value)
+    smv <IED> <LD> <CB>  --mac M --appid HEX --vlan HEX --vlan-priority N
+    ap-address <IED> <AP> <P-TYPE> <VALUE>              e.g. IP 10.0.0.5
+    history --what TEXT [--version V] [--revision R]    add a Header/History item
+`scl edit` options:
+    -o <FILE> | --in-place   where to write (default stdout); written atomically
+    --dry-run           print a unified diff and write nothing
+    --who <NAME> --why <TEXT>
+                        also record the edit as a Header/History item
+    --check             refuse to write if the result has any validation error
+    --force             write even if the edit adds validation errors (refused otherwise)
+    --max-size <BYTES>  refuse larger input before reading it (default 1 GiB)
+    --freq <50|60>      nominal frequency, for validation (default 50)
 
 `sv monitor` options:
     --freq <50|60>      nominal frequency, to read smpRate in samples per period (default 50)
@@ -168,6 +190,7 @@ fn main() -> ExitCode {
         ["scl", "validate", file, rest @ ..] => scl_validate(file, rest),
         ["scl", "show", file, rest @ ..] => scl_show(file, rest.first().copied()),
         ["scl", "subs", file, ied, rest @ ..] => scl_subs(file, ied, rest),
+        ["scl", "edit", file, rest @ ..] => scl_edit::run(file, rest),
         ["mu", file, rest @ ..] => merging_unit(file, rest),
         ["sim", file, rest @ ..] => simulate(file, rest),
         other => Err(format!("unknown command `{}`\n\n{USAGE}", other.join(" "))),

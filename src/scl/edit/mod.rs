@@ -101,6 +101,13 @@ impl Document {
         Scl::parse(&self.text)
     }
 
+    /// Look at the current text through the same [`Element`] API an edit uses, without
+    /// starting a transaction.
+    pub fn read<R>(&self, f: impl FnOnce(Element<'_>) -> R) -> Result<R> {
+        let doc = parse(&self.text)?;
+        Ok(f(Tx::new(&self.text, &doc).root()))
+    }
+
     /// Run one transaction. `f` records changes against a parse of the current text; they are
     /// applied together when it returns `Ok`. Returns the number of patches applied (zero leaves
     /// no history entry).
