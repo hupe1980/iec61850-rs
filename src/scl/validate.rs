@@ -710,7 +710,8 @@ mod tests {
         assert_eq!(r.findings.iter().filter(|f| f.code == FindingCode::DuplicateTypeMember).count(), 1);
 
         // The same file with one declaration is clean.
-        assert!(validate(&scl(GOOD_GSE, GOOD_CB), 50, Edition::Ed2_1).unwrap().findings.is_empty());
+        let v = validate(&scl(GOOD_GSE, GOOD_CB), 50, Edition::Ed2_1).unwrap().findings;
+        assert!(v.is_empty(), "{v:?}");
     }
 
     #[test]

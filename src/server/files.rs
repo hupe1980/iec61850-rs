@@ -520,7 +520,8 @@ mod tests {
         for escape in ["../outside.txt", "COMTRADE/../../outside.txt", "/etc/hosts", "..%2foutside.txt"] {
             assert!(store.read_at(escape, 0, 64).is_none(), "`{escape}` escaped the sandbox");
             assert!(store.info(escape).is_none(), "`{escape}` escaped the sandbox");
-            assert!(store.list(Some(escape)).is_empty());
+            let v = store.list(Some(escape));
+            assert!(v.is_empty(), "{v:?}");
         }
         // Read-only by default: a client cannot delete a record an operator has not agreed
         // to lose.

@@ -1540,7 +1540,8 @@ mod tests {
         assert_eq!(m.diagnostics[2].at, "IED1/LD0/GGIO1");
         // The broken control block exists without an address; the broken LN without DOs.
         assert!(m.gse_control("IED1LD0/LLN0.gcbBroken").unwrap().2.address.is_none());
-        assert!(m.logical_device("IED1LD0").unwrap().logical_nodes[3].data_objects.is_empty());
+        let v = &m.logical_device("IED1LD0").unwrap().logical_nodes[3].data_objects;
+        assert!(v.is_empty(), "{v:?}");
 
         let err = IedModel::from_scl_with(ICD, Some("IED1"), LoadOptions { strict: true }).unwrap_err();
         assert!(err.to_string().contains("BadAddress at Communication/GSE LD0.gcbBroken"), "{err}");

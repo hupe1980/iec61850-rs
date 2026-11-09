@@ -264,7 +264,8 @@ mod tests {
         // Nothing selected is not an empty element — it is no element at all.
         let mut e = Encoder::new();
         Path::default().write(&mut e).unwrap();
-        assert!(e.into_vec().is_empty());
+        let v = e.into_vec();
+        assert!(v.is_empty(), "{v:?}");
     }
 
     /// A selection this decoder cannot read is refused rather than narrowed to its first

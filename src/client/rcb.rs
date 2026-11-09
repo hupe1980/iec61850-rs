@@ -371,7 +371,8 @@ mod tests {
     fn settings_are_written_by_name_and_only_when_set() {
         // The default writes nothing at all: a block engineered in the SCD keeps its
         // engineering, which is the point.
-        assert!(settings_writes("LD/LLN0$RP$u", false, &RcbSettings::new()).is_empty());
+        let v = settings_writes("LD/LLN0$RP$u", false, &RcbSettings::new());
+        assert!(v.is_empty(), "{v:?}");
 
         let s = RcbSettings::new().with_useful_fields().with_trg_ops(TrgOps::EVENTS).with_buf_tm(100).with_intg_pd(1000);
         let writes = settings_writes("LD/LLN0$RP$u", false, &s);
@@ -381,7 +382,8 @@ mod tests {
         // The buffered-only settings are dropped on an unbuffered block rather than sent and
         // rejected: an unbuffered block has no `EntryID` to resume from.
         let resumed = RcbSettings::new().resume_after(alloc::vec![1, 2, 3, 4, 5, 6, 7, 8]);
-        assert!(settings_writes("LD/LLN0$RP$u", false, &resumed).is_empty());
+        let v = settings_writes("LD/LLN0$RP$u", false, &resumed);
+        assert!(v.is_empty(), "{v:?}");
         assert_eq!(settings_writes("LD/LLN0$BR$b", true, &resumed).len(), 1);
     }
 }

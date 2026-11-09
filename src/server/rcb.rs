@@ -952,7 +952,8 @@ mod tests {
     /// A report with nothing in it is not a report, and no amount of splitting makes it one.
     #[test]
     fn an_empty_report_produces_nothing() {
-        assert!(segments(&report(0, &Value::Boolean(true)), 8).is_empty());
+        let v = segments(&report(0, &Value::Boolean(true)), 8);
+        assert!(v.is_empty(), "{v:?}");
     }
 
     /// The `AccessResult`s of an encoded `InformationReport`, as values.
