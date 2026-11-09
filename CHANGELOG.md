@@ -51,7 +51,13 @@ receives files, the log survives a restart, and SCL can be edited without being 
   `ied goose publish`, `ied sim --iface/--freq/--log-db/--password`, `ied mms put`,
   `ied scl edit` (dry-run diff, atomic write, refuses an edit that adds a validation error unless
   `--force`, records who and why in the header history). Every subcommand answers `--help`.
+- `ied goose sniff` / `ied sv monitor`: `--group <MAC>` receives one engineered multicast group
+  (repeatable), including one outside the IEC range.
 - Fuzz targets `log_record`, `obtain_engine`, `scl_edit`.
+- **Interop against three other stacks in both roles**, each a container image built by the
+  test from a pinned, checksum-verified release (testcontainers; Docker is the only
+  prerequisite): libiec61850 1.6.2.1 on the station bus and — GOOSE and SV, both directions —
+  the process bus; IEC61850bean 1.9.0 and csp0924's crates 0.4.0 on the station bus.
 - Tests: live GOOSE/SV over a veth pair on Linux (both receive paths), SetFile against
   libiec61850's `file-tool` and through the Wireshark oracle, `RedbLog` against `MemoryLog` by
   proptest and across a killed process, every OpenSCD file round-tripping byte for byte.
@@ -73,10 +79,14 @@ receives files, the log survives a restart, and SCL can be edited without being 
 - `Error::Service` names its class ("definition (class 2)").
 - `scripts/fetch-specs.sh` is now `scripts/fetch-references.sh`, writing to
   `$IEC61850_REFERENCE`; it also fetches `SCL_BaseSimpleTypes.xsd`.
+- The interop tests no longer read a libiec61850 checkout (`IEC61850_LIBIEC61850` is gone);
+  `IEC61850_REQUIRE_INTEROP=1` makes a skip a failure, `IEC61850_SKIP_INTEROP=1` skips the peers.
 - Releases publish through crates.io Trusted Publishing.
 
 ### Fixed
 
+- ⚠ An empty session selector is left out of the session CONNECT/ACCEPT instead of being sent
+  with length zero; IEC61850bean refused every association with this crate because of it.
 - ⚠ `ServiceError` answers used the wrong `errorClass` tags: `definition` is 2 and `service` 4
   (they went out as 4 and 5); `resource` (3) and `file` (11) added.
 - ⚠ A deeply nested SCL file overflowed the loader's stack; `roxmltree` ≥ 0.21.2 parses

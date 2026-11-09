@@ -229,13 +229,15 @@ cargo run --example supervised_subscriber  # a GOOSE subscription's health, publ
   decode and re-encode byte for byte; a 165-packet MMS association decodes through all six OSI
   layers (653 of 656 encodings byte-identical — the rest are the peer's non-minimal lengths).
 - **Wireshark** dissects every PDU this crate emits on both buses, asserted field by field.
-- **libiec61850 in both roles**, in CI: its client against this server and this client against
-  its server — browse, read, types, all four control models, arrays, reports, logs.
+- **Three other stacks in both roles**, in CI: libiec61850 (browse, read, types, all four
+  control models, arrays, reports, logs, `SetFile`), IEC61850bean and csp0924's crates — and
+  libiec61850's GOOSE and SV publishers and subscribers in both directions. Each peer is a
+  container built from a pinned, checksummed release; Docker is the only prerequisite.
 - **Loopback:** client and server run against each other from an SCL file.
 - **Adversarial simulation** of publisher and subscriber under loss, reordering, duplication,
   replay and partition, across 512 seeds in CI.
 - **Zero steady-state allocations**, asserted by a counting allocator.
-- **Ten fuzz targets**, `#![forbid(unsafe_code)]`, and `unwrap`/`expect`/`panic`/indexing
+- **Thirteen fuzz targets**, `#![forbid(unsafe_code)]`, and `unwrap`/`expect`/`panic`/indexing
   denied by lint; every fuzzer crash is kept as a named regression test.
 - **OpenSCD's SCL files** load and every data-set member resolves.
 
@@ -244,13 +246,9 @@ What this does not prove: [Verification](https://hupe1980.github.io/iec61850-rs/
 ## Develop
 
 ```bash
-cargo test --all-features                     # captures and tshark tests skip if absent
+cargo test --all-features                     # captures, tshark and Docker tests skip if absent
 
-# The interop oracle: libiec61850 in both roles. Skips unless it is built and pointed at.
-git clone --depth 1 https://github.com/mz-automation/libiec61850 /tmp/libiec61850
-make -C /tmp/libiec61850 -j examples
-make -C /tmp/libiec61850/examples/server_example_logging   # not in their `examples` target
-IEC61850_LIBIEC61850=/tmp/libiec61850 cargo test --all-features --test interop
+cargo test --all-features --test interop     # needs Docker; builds the peer images on first use
 
 SIM_SEED=42 cargo test --test simulation      # replay one simulation seed
 cargo +nightly fuzz run mms_association -- -max_total_time=60

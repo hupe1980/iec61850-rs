@@ -128,7 +128,7 @@ a non-advancing `sqNum` breaks the replay case. A publisher restarting in the mi
 
 ## Fuzzing
 
-Ten `cargo-fuzz` targets, each run for 60 seconds on every push:
+Thirteen `cargo-fuzz` targets, each run for 60 seconds on every push:
 
 | Target | Exercises |
 |---|---|
@@ -142,6 +142,9 @@ Ten `cargo-fuzz` targets, each run for 60 seconds on every push:
 | `mms_stack` | every OSI layer and MMS from arbitrary bytes, with the MMS encoder required to be a fixed point; decoded reports, `Oper` and `LastApplError` values must re-encode to themselves |
 | `mms_association` | the association state machine in both roles, fed seven octets at a time: no panic, a closed association never asks to be woken, `abort` is terminal |
 | `mms_server` | arbitrary requests into the ACSI server on two associations; every answer must encode and every report must decode |
+| `obtain_engine` | the server's `SetFile` transfer engine against arbitrary client answers, timeouts and limits |
+| `log_record` | decoding a stored log record: no panic, no allocation by a claimed length |
+| `scl_edit` | the SCL editing DOM: an unedited document is its input, an accepted edit leaves well-formed XML, undo restores the input exactly |
 
 Each input a fuzzer has crashed on is committed under `fuzz/regressions/`, named after the bug,
 and replayed by `cargo test --test regressions` through the same entry points.
@@ -192,7 +195,7 @@ before allocating. Event queues are bounded and count what they drop.
 ## Other gates
 
 Every push runs `rustfmt`, `clippy` with warnings denied, a `no_std` build for
-`thumbv7em-none-eabihf`, the MSRV (1.85) check, and a build and doctest of every feature on its
+`thumbv7em-none-eabihf`, the MSRV (1.90) check, and a build and doctest of every feature on its
 own — `std`, `goose`, `sv`, `mms`, `scl`, `pcap`, `client`, `server`, `cli` — and with none.
 Documentation is built with warnings denied on the all-features build docs.rs serves.
 

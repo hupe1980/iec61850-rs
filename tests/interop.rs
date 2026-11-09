@@ -178,7 +178,8 @@ fn this_client_drives_a_libiec61850_server() {
     assert_eq!(spec.component_names(), ["mag", "q", "t"], "{spec:?}");
     let sets = c.data_set_directory("simpleIOGenericIO").expect("GetDataSetDirectory");
     assert!(sets.iter().any(|s| s == "LLN0$Events"), "{sets:?}");
-    assert!(!c.data_set_members("simpleIOGenericIO", "LLN0$Events").expect("members").is_empty());
+    let members = c.data_set_members("simpleIOGenericIO", "LLN0$Events").expect("members");
+    assert!(!members.is_empty(), "{members:?}");
     let rcb = c
         .enable_rcb("simpleIOGenericIO/LLN0$RP$EventsRCB01", Fc::RP, &RcbSettings::new().with_useful_fields().with_trg_ops(TrgOps::EVENTS))
         .expect("SetURCBValues");
