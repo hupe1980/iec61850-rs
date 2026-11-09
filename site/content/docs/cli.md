@@ -159,6 +159,7 @@ serving; ^C to stop
 | `--files` | — | Serve this directory through the MMS file services, read-only and sandboxed |
 | `--writable` | off | Also allow `FileDelete` in that directory |
 | `--edition` | from the file | `1`, `2` or `2.1` |
+| `--log-db` | in memory | Keep the logs in this file across restarts (a directory of `<IED>.redb` files when serving several IEDs) |
 
 The edition is the file's own: `2003` is Edition 1, `2007B` Edition 2, `2007B4` and later
 Edition 2.1. An Edition 1 server's report control blocks have no `ResvTms` and no `Owner`.

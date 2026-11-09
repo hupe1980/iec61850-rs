@@ -580,7 +580,17 @@ impl Acsi {
     /// The store has to know the same logs the model declares —
     /// [`Logs::log_references`](super::Logs::log_references) is the list to build one from.
     pub fn set_log_store(&mut self, store: Box<dyn super::LogStore>) {
-        self.logs.set_store(store);
+        self.logs.set_store(&mut self.ied, store);
+    }
+
+    /// The logs the model declares, as full references.
+    pub fn log_references(&self) -> &[String] {
+        self.logs.log_references()
+    }
+
+    /// How many log entries the store has refused to keep since the server started.
+    pub const fn failed_log_appends(&self) -> u64 {
+        self.logs.failed_appends()
     }
 
     /// Set the default page budget from what this server offers, leaving room for the PDU's
@@ -1030,34 +1040,34 @@ impl Acsi {
         let error = tracking::error_of(result);
         // A control service: the attribute names it, and `operTm` turns an operate into a
         // time-activated one — which the standard tracks as a service of its own.
-        if let Some((object, attribute)) = Controls::split(reference) {
-            if self.ied.node_at(reference).is_some() {
-                let service = match attribute {
-                    "SBO" => ServiceType::Select,
-                    "SBOw" => ServiceType::SelectWithValue,
-                    "Cancel" => ServiceType::Cancel,
-                    _ => ServiceType::Operate,
-                };
-                return Tracked { cdc: TrackingCdc::Cts, obj_ref: String::from(object), service, error, originator };
-            }
+        if let Some((object, attribute)) = Controls::split(reference)
+            && self.ied.node_at(reference).is_some()
+        {
+            let service = match attribute {
+                "SBO" => ServiceType::Select,
+                "SBOw" => ServiceType::SelectWithValue,
+                "Cancel" => ServiceType::Cancel,
+                _ => ServiceType::Operate,
+            };
+            return Tracked { cdc: TrackingCdc::Cts, obj_ref: String::from(object), service, error, originator };
         }
         // A control block attribute, whose functional constraint says which block it is and
         // therefore which tracking class records it.
-        if let Some((block, attribute)) = reference.rsplit_once(tree::SEP) {
-            if let Some(b) = self.ied.block(block) {
-                let fc = block.split_once('/').map(|(_, item)| tree::split_item(item).1).unwrap_or_default();
-                let service = if b.kind == super::ied::BlockKind::SettingGroup {
-                    match attribute {
-                        "ActSG" => ServiceType::SelectActiveSG,
-                        "EditSG" => ServiceType::SelectEditSG,
-                        "CnfEdit" => ServiceType::ConfirmEditSGValues,
-                        _ => ServiceType::GetSGCBValues,
-                    }
-                } else {
-                    tracking::set_service(fc)
-                };
-                return Tracked { cdc: tracking::class_for(fc), obj_ref: String::from(block), service, error, originator };
-            }
+        if let Some((block, attribute)) = reference.rsplit_once(tree::SEP)
+            && let Some(b) = self.ied.block(block)
+        {
+            let fc = block.split_once('/').map(|(_, item)| tree::split_item(item).1).unwrap_or_default();
+            let service = if b.kind == super::ied::BlockKind::SettingGroup {
+                match attribute {
+                    "ActSG" => ServiceType::SelectActiveSG,
+                    "EditSG" => ServiceType::SelectEditSG,
+                    "CnfEdit" => ServiceType::ConfirmEditSGValues,
+                    _ => ServiceType::GetSGCBValues,
+                }
+            } else {
+                tracking::set_service(fc)
+            };
+            return Tracked { cdc: tracking::class_for(fc), obj_ref: String::from(block), service, error, originator };
         }
         // Everything else. A setting under `SE` is `SetEditSGValue`, which IEC 61850-7-2
         // §15.3.2.9.3 puts in the *common* tracker rather than the setting-group one.
@@ -1075,12 +1085,12 @@ impl Acsi {
         // is running. The value only reaches the store once the engine has agreed to it.
         // A control is a *service* on a structured variable under `CO`: a select, an operate
         // or a cancel, each with its own rules about who may do it and in what order.
-        if let Some((object, attribute)) = Controls::split(reference) {
-            if self.ied.node_at(reference).is_some() {
-                let object = String::from(object);
-                let at = self.now(now);
-                return self.controls.write(assoc, &mut self.ied, &object, attribute, &value, at);
-            }
+        if let Some((object, attribute)) = Controls::split(reference)
+            && self.ied.node_at(reference).is_some()
+        {
+            let object = String::from(object);
+            let at = self.now(now);
+            return self.controls.write(assoc, &mut self.ied, &object, attribute, &value, at);
         }
         // Everything else is a *value*, and which values a client may write is not a matter
         // of taste: `ST` and `MX` are what the process reports and a server that accepts a
@@ -1107,22 +1117,22 @@ impl Acsi {
             }
             _ => {}
         }
-        if let Some((block, attribute)) = reference.rsplit_once(tree::SEP) {
-            if self.reports.has(block) {
-                self.reports.on_write(assoc, &mut self.ied, block, attribute, &value, now)?;
-                let result = self.ied.write_leaf(reference, value);
-                if result.is_ok() && matches!(attribute, "RptEna" | "Resv" | "ResvTms") {
-                    self.publish_owner(assoc, block);
-                }
-                if result.is_ok() && attribute == "RptEna" && self.reports.owner(block) == Some(assoc) {
-                    // Enabling a buffered block hands over whatever it kept while nobody was
-                    // listening, resuming after the `EntryID` the client wrote if it wrote one.
-                    let after = self.ied.value(&alloc::format!("{block}$EntryID")).and_then(entry_id_of);
-                    let replay = self.reports.drain_buffer(&mut self.ied, block, after);
-                    self.deferred.extend(replay);
-                }
-                return result;
+        if let Some((block, attribute)) = reference.rsplit_once(tree::SEP)
+            && self.reports.has(block)
+        {
+            self.reports.on_write(assoc, &mut self.ied, block, attribute, &value, now)?;
+            let result = self.ied.write_leaf(reference, value);
+            if result.is_ok() && matches!(attribute, "RptEna" | "Resv" | "ResvTms") {
+                self.publish_owner(assoc, block);
             }
+            if result.is_ok() && attribute == "RptEna" && self.reports.owner(block) == Some(assoc) {
+                // Enabling a buffered block hands over whatever it kept while nobody was
+                // listening, resuming after the `EntryID` the client wrote if it wrote one.
+                let after = self.ied.value(&alloc::format!("{block}$EntryID")).and_then(entry_id_of);
+                let replay = self.reports.drain_buffer(&mut self.ied, block, after);
+                self.deferred.extend(replay);
+            }
+            return result;
         }
         self.write_value(reference, value)
     }
@@ -1362,7 +1372,7 @@ impl Acsi {
             return Answer::NOT_FOUND;
         }
         let limit = self.cfg.max_log_entries;
-        let (entries, more) = match (request.after, request.start) {
+        let page = match (request.after, request.start) {
             // `QueryLogAfterEntry` — both halves of the resume point matter.
             (Some(after), _) => {
                 let id = <[u8; 8]>::try_from(after.entry_id).map_or(0, u64::from_be_bytes);
@@ -1385,7 +1395,12 @@ impl Acsi {
                 self.logs.by_time(&reference, from, to, limit)
             }
         };
-        Answer::Journal { entries, more }
+        match page {
+            Ok(super::LogPage { entries, more }) => Answer::Journal { entries, more },
+            Err(super::LogError::UnknownLog) => Answer::NOT_FOUND,
+            // The store could not answer: `resource`, `mass-storage-unavailable` (ISO 9506-2).
+            Err(_) => Answer::Error { class: error_class::RESOURCE, code: 3 },
+        }
     }
 }
 

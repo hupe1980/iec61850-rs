@@ -72,10 +72,10 @@ impl SettingGroups {
             for (reference, per_group, fallback) in settings_of(ied, &block.domain) {
                 for group in 1..=count {
                     let value = per_group.iter().find(|(g, _)| *g == group).and_then(|(_, text)| ied.parse_text(&reference, text)).or_else(|| fallback.clone());
-                    if let Some(v) = value {
-                        if let Some(slot) = values.get_mut(&group) {
-                            slot.insert(reference.clone(), v);
-                        }
+                    if let Some(v) = value
+                        && let Some(slot) = values.get_mut(&group)
+                    {
+                        slot.insert(reference.clone(), v);
                     }
                 }
             }

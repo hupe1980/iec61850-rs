@@ -2,7 +2,7 @@
 name = "iec61850-rs"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 description = "IEC 61850 in Rust: GOOSE, Sampled Values, an MMS client and server over the full OSI station-bus stack, and SCL. Panic-free, sans-IO, no_std-capable."
 repository = "https://github.com/hupe1980/iec61850-rs"
@@ -42,14 +42,19 @@ client = ["std", "mms"]
 # A blocking MMS server over TCP: the association in the server role, the IED model from SCL
 # as the served namespace, and the ACSI services above it. No runtime.
 server = ["std", "mms", "scl"]
+# A durable `LogStore` on redb: the server's log survives a restart.
+log-redb = ["server", "dep:redb"]
 # The `ied` command-line tool.
-cli = ["std", "pcap", "scl", "goose", "sv", "mms", "client", "server"]
+cli = ["std", "pcap", "scl", "goose", "sv", "mms", "client", "server", "log-redb"]
 
 [dependencies]
 roxmltree = { version = "0.21", optional = true }
+redb = { version = "4.5", optional = true }
 
 [dev-dependencies]
 proptest = "1.11"
+# The log-store tests write rows past the store to prove a corrupt one is refused.
+redb = "4.5"
 
 [lints.rust]
 # The library itself carries `#![forbid(unsafe_code)]` in `src/lib.rs`, which is the actual
@@ -157,6 +162,11 @@ required-features = ["client", "scl"]
 name = "mms_server"
 path = "tests/mms_server.rs"
 required-features = ["client", "server"]
+
+[[test]]
+name = "log_store"
+path = "tests/log_store.rs"
+required-features = ["client", "log-redb"]
 
 # Examples state the features they use, so `cargo test --no-default-features` does not try to
 # build a GOOSE example without the GOOSE codec.

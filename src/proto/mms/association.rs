@@ -467,15 +467,15 @@ impl Association {
 
     /// Time passed: expire the handshake and any request that went unanswered.
     pub fn on_timeout(&mut self, now: Instant) {
-        if let Some(deadline) = self.connect_deadline {
-            if now >= deadline {
-                match self.state {
-                    // A release this end asked for and the peer never confirmed is still a
-                    // release: reporting it as a handshake timeout would name the wrong end.
-                    State::Releasing => return self.close(CloseReason::Released),
-                    State::Established | State::Closed => {}
-                    _ => return self.close(CloseReason::ConnectTimeout),
-                }
+        if let Some(deadline) = self.connect_deadline
+            && now >= deadline
+        {
+            match self.state {
+                // A release this end asked for and the peer never confirmed is still a
+                // release: reporting it as a handshake timeout would name the wrong end.
+                State::Releasing => return self.close(CloseReason::Released),
+                State::Established | State::Closed => {}
+                _ => return self.close(CloseReason::ConnectTimeout),
             }
         }
         if self.cfg.request_timeout_ms == 0 {

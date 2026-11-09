@@ -387,10 +387,10 @@ impl Ied {
     /// server: it writes process data through [`Ied::write_leaf`], which is what a
     /// [`Txn`](crate::server::Txn) does, and is the only path that may touch `ST` and `MX`.
     pub fn client_write_allowed(&self, reference: &str) -> core::result::Result<(), i64> {
-        if let Some((block, attribute)) = reference.rsplit_once(tree::SEP) {
-            if let Some(b) = self.block(block) {
-                return if writable_block_attribute(b.kind, attribute) { Ok(()) } else { Err(DATA_ACCESS_DENIED) };
-            }
+        if let Some((block, attribute)) = reference.rsplit_once(tree::SEP)
+            && let Some(b) = self.block(block)
+        {
+            return if writable_block_attribute(b.kind, attribute) { Ok(()) } else { Err(DATA_ACCESS_DENIED) };
         }
         match self.node_at(reference) {
             Some(node) => match node.fc {
@@ -641,10 +641,10 @@ fn seed_node(domain: &str, item: &str, node: &Variable, out: &mut Vec<(String, V
 fn engineered_of(model: &IedModel, ld: &str, ln: &str, do_path: &str, object: &crate::model::DataObject, out: &mut Vec<(String, Value)>) {
     fn walk(model: &IedModel, prefix: &str, a: &crate::model::DataAttribute, out: &mut Vec<(String, Value)>) {
         let path = alloc::format!("{prefix}${}", a.name);
-        if let Some(text) = &a.value {
-            if let Some(v) = parse_engineered(model, a, text) {
-                out.push((path.clone(), v));
-            }
+        if let Some(text) = &a.value
+            && let Some(v) = parse_engineered(model, a, text)
+        {
+            out.push((path.clone(), v));
         }
         for c in &a.children {
             walk(model, &path, c, out);

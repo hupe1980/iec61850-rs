@@ -31,6 +31,8 @@ mod control;
 mod files;
 mod ied;
 mod log;
+#[cfg(feature = "log-redb")]
+mod log_redb;
 mod net;
 mod rcb;
 mod sg;
@@ -47,7 +49,9 @@ pub use ied::{
     Block, BlockKind, DATA_ACCESS_DENIED, DATA_ACCESS_NON_EXISTENT, DATA_ACCESS_TYPE_INCONSISTENT, DATA_ACCESS_VALUE_INVALID, DataSetMember, Ied,
     ServedDataSet, accepts, default_value,
 };
-pub use log::{DEFAULT_LOG_CAPACITY, Entry, LogBounds, LogStore, Logs, MemoryLog, NewEntry};
+pub use log::{DEFAULT_LOG_CAPACITY, Entry, LogBounds, LogError, LogPage, LogStore, Logs, MemoryLog, NewEntry, check_log_store};
+#[cfg(feature = "log-redb")]
+pub use log_redb::{RedbLog, SyncPolicy, decode_record};
 pub use net::{Server, ServerConfig, ServerHandle, Txn};
 pub use rcb::{DEFAULT_BUFFER, Engine, Outgoing};
 pub use sg::SettingGroups;

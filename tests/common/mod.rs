@@ -768,15 +768,16 @@ mod mms_server {
         if fire_gi {
             send_report(s, ReasonCode::NONE.with_general_interrogation(true));
         }
-        if let Some((attribute, request)) = control {
-            if attribute == "Oper" && s.behaviour.enhanced_control {
-                if s.behaviour.stale_termination {
-                    let mut other = request.clone();
-                    other.ctl_num = request.ctl_num.wrapping_add(100);
-                    send_termination(s, &other, None);
-                }
-                send_termination(s, &request, s.behaviour.refuse_control);
+        if let Some((attribute, request)) = control
+            && attribute == "Oper"
+            && s.behaviour.enhanced_control
+        {
+            if s.behaviour.stale_termination {
+                let mut other = request.clone();
+                other.ctl_num = request.ctl_num.wrapping_add(100);
+                send_termination(s, &other, None);
             }
+            send_termination(s, &request, s.behaviour.refuse_control);
         }
     }
 

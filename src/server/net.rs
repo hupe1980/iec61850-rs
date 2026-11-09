@@ -189,13 +189,16 @@ impl Server {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_file_store(store);
     }
 
-    /// Keep the log entries in `store` instead of the default bounded in-memory one.
-    ///
-    /// The default is right for a simulator and wrong for a device that must survive a
-    /// restart; a durable store is a backend, not a redesign, because the trigger evaluation
-    /// and the two ACSI queries sit above the trait rather than inside it.
+    /// Keep the log entries in `store` instead of the default bounded in-memory one — e.g. a
+    /// `RedbLog` (feature `log-redb`) to survive a restart. What the store already holds is
+    /// published in the log control blocks at once.
     pub fn set_log_store(&mut self, store: Box<dyn super::LogStore>) {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_log_store(store);
+    }
+
+    /// The logs the model declares, as full references — the list a store is opened for.
+    pub fn log_references(&self) -> Vec<String> {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.log_references().to_vec()
     }
 
     /// Replace the wall clock every absolute timestamp is read from.

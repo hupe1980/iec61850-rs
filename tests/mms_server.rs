@@ -2141,7 +2141,7 @@ fn a_goose_subscription_is_supervised_by_the_lgos_the_file_declares() {
 
     // A poll that changes nothing writes nothing, so a supervision loop does not make every
     // report control block fire once a second.
-    assert!(handle.txn().supervise(LGOS, &SubscriptionStatus::from_goose(&sub)).commit().is_empty());
+    assert_eq!(handle.txn().supervise(LGOS, &SubscriptionStatus::from_goose(&sub)).commit(), Vec::<Result<(), i64>>::new());
     assert!(c.next_report(Duration::from_millis(150)).expect("poll").is_none(), "an unchanged status is not an event");
 
     // Which LGOS supervises which subscription is **engineering**, so it comes out of the
@@ -2177,7 +2177,7 @@ fn a_log_is_served_out_of_whatever_store_the_application_supplies() {
     use std::sync::{Arc, Mutex};
 
     use iec61850_rs::common::EntryTime;
-    use iec61850_rs::server::{Entry, LogBounds, LogStore, MemoryLog, NewEntry};
+    use iec61850_rs::server::{Entry, LogBounds, LogError, LogPage, LogStore, MemoryLog, NewEntry};
 
     /// A store that keeps everything and counts what it was asked, so the test can see that
     /// the engine really does go through it rather than round it.
@@ -2191,32 +2191,48 @@ fn a_log_is_served_out_of_whatever_store_the_application_supplies() {
     #[derive(Debug, Clone, Default)]
     struct Shared(Arc<Mutex<Counting>>);
 
+    impl Shared {
+        fn lock(&self) -> Result<std::sync::MutexGuard<'_, Counting>, LogError> {
+            self.0.lock().map_err(|_| LogError::Storage("poisoned".into()))
+        }
+    }
+
     impl LogStore for Shared {
-        fn append(&mut self, _log: &str, entry: NewEntry) -> Option<LogBounds> {
-            let mut g = self.0.lock().ok()?;
+        fn append(&mut self, _log: &str, entry: NewEntry) -> Result<LogBounds, LogError> {
+            let mut g = self.lock()?;
             g.appends += 1;
             let entry_id = g.entries.len() as u64 + 1;
             g.entries.push(Entry { entry_id, occurred: entry.occurred, values: entry.values, reason: entry.reason });
-            let oldest = g.entries.first().map(|e| (e.entry_id, e.occurred))?;
-            Some(LogBounds { oldest, newest: (entry_id, entry.occurred) })
+            let oldest = g.entries.first().map(|e| (e.entry_id, e.occurred)).ok_or(LogError::UnknownLog)?;
+            Ok(LogBounds { oldest, newest: (entry_id, entry.occurred) })
         }
 
-        fn by_time(&self, _log: &str, from: Option<EntryTime>, to: Option<EntryTime>, limit: usize) -> (Vec<Entry>, bool) {
-            let Ok(mut g) = self.0.lock() else { return (Vec::new(), false) };
+        fn by_time(&self, _log: &str, from: Option<EntryTime>, to: Option<EntryTime>, limit: usize) -> Result<LogPage, LogError> {
+            let mut g = self.lock()?;
             g.queries += 1;
-            let all: Vec<Entry> =
+            let entries =
                 g.entries.iter().filter(|e| from.is_none_or(|f| e.occurred >= f) && to.is_none_or(|t| e.occurred <= t)).take(limit).cloned().collect();
-            (all, false)
+            Ok(LogPage { entries, more: false })
         }
 
-        fn after_entry(&self, _log: &str, entry_id: u64, _at: EntryTime, limit: usize) -> (Vec<Entry>, bool) {
-            let Ok(mut g) = self.0.lock() else { return (Vec::new(), false) };
+        fn after_entry(&self, _log: &str, entry_id: u64, _at: EntryTime, limit: usize) -> Result<LogPage, LogError> {
+            let mut g = self.lock()?;
             g.queries += 1;
-            (g.entries.iter().filter(|e| e.entry_id > entry_id).take(limit).cloned().collect(), false)
+            Ok(LogPage { entries: g.entries.iter().filter(|e| e.entry_id > entry_id).take(limit).cloned().collect(), more: false })
         }
 
-        fn len(&self, _log: &str) -> usize {
-            self.0.lock().map(|g| g.entries.len()).unwrap_or_default()
+        fn bounds(&self, _log: &str) -> Result<Option<LogBounds>, LogError> {
+            let g = self.lock()?;
+            Ok(g.entries.first().zip(g.entries.last()).map(|(o, n)| LogBounds { oldest: (o.entry_id, o.occurred), newest: (n.entry_id, n.occurred) }))
+        }
+
+        fn len(&self, _log: &str) -> Result<usize, LogError> {
+            Ok(self.lock()?.entries.len())
+        }
+
+        fn purge(&mut self, _log: &str) -> Result<(), LogError> {
+            self.lock()?.entries.clear();
+            Ok(())
         }
     }
 
@@ -2255,6 +2271,6 @@ fn a_log_is_served_out_of_whatever_store_the_application_supplies() {
     // A log the model declares but nothing has written to is an **empty** log, not a missing
     // one: the model decides what exists, the store decides what is in it.
     let empty = MemoryLog::for_logs(["IED1LD0/LLN0$GeneralLog".to_string()], 8);
-    assert_eq!(empty.len("IED1LD0/LLN0$GeneralLog"), 0);
+    assert_eq!(empty.len("IED1LD0/LLN0$GeneralLog"), Ok(0));
     c.release().unwrap();
 }

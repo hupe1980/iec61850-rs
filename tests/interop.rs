@@ -350,6 +350,61 @@ fn this_client_drives_a_libiec61850_server() {
     c.release().expect("orderly release");
 }
 
+/// **Their client, our server, either log store**: libiec61850's `client_example_log` enables
+/// the log, reads the control block positionally — `OldEntrTm` as element 3, `OldEnt` as element
+/// 5 — and resumes from there with `QueryLogAfter`. It runs against this server serving their
+/// logging model once with the in-memory store and once with the redb one, and gets the same
+/// entries from both.
+#[test]
+fn libiec61850s_log_client_reads_this_servers_log_from_either_store() {
+    let Some(root) = libiec61850() else { return };
+    let Some(client) = tool(&root, "examples/iec61850_client_example_log/client_example_log") else { return };
+    // Their client names the IED `TestIED`; their model names it `simpleIO`. Same model.
+    let xml = model(&root, "examples/server_example_logging/simpleIO_direct_control.cid").replace("\"simpleIO\"", "\"TestIED\"");
+
+    let received = |store: Option<Box<dyn iec61850_rs::server::LogStore>>| -> usize {
+        let ied = Ied::from_scl(&xml, None).expect("their model");
+        let mut server = Server::bind("127.0.0.1:0", ied).expect("bind");
+        if let Some(store) = store {
+            server.set_log_store(store);
+        }
+        let addr = server.local_addr().expect("addr");
+        let handle = server.handle();
+        std::thread::spawn(move || {
+            let _ = server.accept_one();
+        });
+        let child = Command::new(&client)
+            .args([addr.ip().to_string(), addr.port().to_string()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn their client");
+        // It enables the log, then waits a second for something to happen; make it happen.
+        std::thread::sleep(Duration::from_millis(400));
+        for (i, state) in [true, false, true].into_iter().enumerate() {
+            handle.txn().set(&format!("TestIEDGenericIO/GGIO1$ST$SPCSO{}$stVal", i + 1), Value::Boolean(state)).commit();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let out = child.wait_with_output().expect("their client finishes");
+        let out = String::from_utf8_lossy(&out.stdout);
+        let line = out.lines().find(|l| l.starts_with("Received")).unwrap_or_else(|| panic!("no 'Received' line in:\n{out}"));
+        line.split_whitespace().nth(1).and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{line}"))
+    };
+
+    let memory = received(None);
+    // QueryLogAfter resumes *after* OldEnt, so three entries come back as two.
+    assert_eq!(memory, 2, "their client reads the entries after the oldest one");
+    #[cfg(feature = "log-redb")]
+    {
+        let path = std::env::temp_dir().join(format!("iec61850-interop-log-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let logs = vec![String::from("TestIEDGenericIO/LLN0$EventLog")];
+        let store = iec61850_rs::server::RedbLog::open(&path, logs, 100).expect("open");
+        assert_eq!(received(Some(Box::new(store))), memory, "the redb store answers their client exactly as the memory store does");
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 /// **Our client, their server**: the log services, which is where the two stacks disagree
 /// about a *name* and about how much of a range a query has to carry.
 #[test]

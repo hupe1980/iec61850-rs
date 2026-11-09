@@ -107,6 +107,8 @@ COMMANDS:
     --files <DIR>       serve this directory through the MMS file services, read-only
     --writable          also allow `FileDelete` on that directory
     --edition <1|2|2.1> serve as this edition, overriding the file's own schema version
+    --log-db <PATH>     keep the logs in a file that survives a restart (a directory of
+                        <IED>.redb files when the SCD has several IEDs)
                         (Edition 1 has no ResvTms and no Owner on a report control block)
 
 `scl validate` options:
@@ -770,6 +772,7 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
             "--files" => o.files = Some(value()?.to_string()),
             "--writable" => o.writable = true,
             "--edition" => o.edition = Some(parse_edition(value()?)?),
+            "--log-db" => o.log_db = Some(value()?.to_string()),
             other => return Err(format!("unknown option `{other}`")),
         }
     }
@@ -809,6 +812,20 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
             let store = DirectoryStore::new(dir);
             server.set_file_store(Box::new(if o.writable { store.writable() } else { store }));
         }
+        if let Some(path) = &o.log_db {
+            // One file per server: redb locks a file to one store. With several IEDs the path is
+            // a directory holding `<IED>.redb`.
+            let path = if names.len() == 1 {
+                std::path::PathBuf::from(path)
+            } else {
+                std::fs::create_dir_all(path).map_err(|e| format!("{path}: {e}"))?;
+                std::path::Path::new(path).join(format!("{name}.redb"))
+            };
+            let store = iec61850_rs::server::RedbLog::open(&path, server.log_references(), iec61850_rs::server::DEFAULT_LOG_CAPACITY)
+                .map_err(|e| format!("{name}: {e}"))?;
+            println!("  log in {}", path.display());
+            server.set_log_store(Box::new(store));
+        }
         let addr = server.local_addr().map_err(|e| e.to_string())?;
         println!("{name} on {addr} — {} — logical device(s) {}", edition_name(edition), devices.join(", "));
         if !trackers.is_empty() {
@@ -844,21 +861,23 @@ struct SimOptions {
     writable: bool,
     /// `None` takes the edition from the file, which is where an IED's edition is declared.
     edition: Option<Edition>,
+    /// Keep the logs in this redb file (one IED) or directory (several).
+    log_db: Option<String>,
 }
 
 impl Default for SimOptions {
     fn default() -> SimOptions {
         // Loopback and port 102: the standard port needs privileges, and a simulator that
         // binds every interface by default is a simulator someone finds on a substation LAN.
-        SimOptions { ied: None, bind: String::from("127.0.0.1"), port: 102, files: None, writable: false, edition: None }
+        SimOptions { ied: None, bind: String::from("127.0.0.1"), port: 102, files: None, writable: false, edition: None, log_db: None }
     }
 }
 
 fn split_leading<'a>(args: &'a [&'a str]) -> (Option<&'a str>, &'a [&'a str]) {
-    if let Some((first, rest)) = args.split_first() {
-        if !first.starts_with("--") {
-            return (Some(*first), rest);
-        }
+    if let Some((first, rest)) = args.split_first()
+        && !first.starts_with("--")
+    {
+        return (Some(*first), rest);
     }
     (None, args)
 }
@@ -1286,7 +1305,7 @@ fn mms_options(args: &[&str]) -> Result<MmsOptions, String> {
 
 fn parse_hex(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim_start_matches("0x");
-    if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!("`{s}` is not an even number of hex digits"));
     }
     (0..s.len() / 2).map(|i| u8::from_str_radix(s.get(i * 2..i * 2 + 2).unwrap_or(""), 16).map_err(|e| e.to_string())).collect()

@@ -485,17 +485,17 @@ fn check_sample_rate(
     }
     // A stream whose data set has no fixed-width layout cannot be published at all: the
     // ASDU length would change from sample to sample.
-    if let Some(name) = cb.dat_set.as_deref() {
-        if let Some(ds) = model.data_set(ln, name) {
-            if !ds.members.is_empty() && model.sv_sample_len(&ld.name, ds).is_none() {
-                error(
-                    report,
-                    FindingCode::SampleRate,
-                    at,
-                    alloc::format!("datSet `{name}` has no fixed-width sampled-value layout, so the ASDU has no constant length"),
-                );
-            }
-        }
+    if let Some(name) = cb.dat_set.as_deref()
+        && let Some(ds) = model.data_set(ln, name)
+        && !ds.members.is_empty()
+        && model.sv_sample_len(&ld.name, ds).is_none()
+    {
+        error(
+            report,
+            FindingCode::SampleRate,
+            at,
+            alloc::format!("datSet `{name}` has no fixed-width sampled-value layout, so the ASDU has no constant length"),
+        );
     }
 }
 

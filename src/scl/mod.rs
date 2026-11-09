@@ -817,7 +817,7 @@ fn hex_octets(text: &str) -> Option<Vec<u8>> {
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let padded = if text.len() % 2 == 0 { String::from(text) } else { alloc::format!("0{text}") };
+    let padded = if text.len().is_multiple_of(2) { String::from(text) } else { alloc::format!("0{text}") };
     let mut out = Vec::with_capacity(padded.len() / 2);
     let bytes = padded.as_bytes();
     for i in (0..bytes.len()).step_by(2) {

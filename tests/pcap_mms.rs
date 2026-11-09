@@ -399,7 +399,7 @@ fn the_capture_s_reports_are_not_mistaken_for_iec_61850_reports() {
                     Unsolicited::CommandTermination(_) => panic!("this capture carries no controls"),
                     Unsolicited::Other { name, values, .. } => {
                         assert!(name.starts_with("KIRKLAND/") || name.starts_with("BELLEVUE/"), "unexpected report name {name}");
-                        assert!(!values.is_empty());
+                        assert_ne!(values, [] as [iec61850_rs::proto::data::Value; 0]);
                     }
                 }
             }

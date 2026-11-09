@@ -620,6 +620,34 @@ fn sim_serves_an_engineering_file_as_a_real_server() {
     assert!(ty.ok && ty.stdout.contains("general"), "{}{}", ty.stdout, ty.stderr);
 }
 
+/// `--log-db` keeps the logs in a file: the server opens it before it serves, and a log read on
+/// the running server is answered out of it.
+#[test]
+fn sim_keeps_its_log_in_the_file_it_is_given() {
+    use std::io::{BufRead, BufReader};
+
+    let dir = tempdir("sim-log");
+    let scl = dir.join("relay.icd");
+    std::fs::write(&scl, include_str!("fixtures/relay.icd")).expect("write the file");
+    let db = dir.join("relay-log.redb");
+
+    let mut child = Command::new(ied())
+        .args(["sim", scl.to_str().unwrap(), "--port", "0", "--log-db", db.to_str().unwrap()])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sim");
+    let stdout = child.stdout.take().expect("stdout");
+    let lines: Vec<String> = BufReader::new(stdout).lines().map_while(Result::ok).take_while(|l| !l.starts_with("serving")).collect();
+    let addr = lines.iter().find(|l| l.contains(" on ")).and_then(|l| l.split_whitespace().nth(2)).expect("the address").to_string();
+    let log = run(&["mms", "log", &addr, "IED1LD0/LLN0$GeneralLog", "--lcb", "IED1LD0/LLN0.lcb01"]);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(lines.iter().any(|l| l.contains("log in") && l.contains("relay-log.redb")), "{lines:?}");
+    assert!(db.is_file(), "the log file exists");
+    assert!(log.ok, "{}{}", log.stdout, log.stderr);
+}
+
 const SIM_RELAY: &str = r#"<?xml version="1.0"?>
 <SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">
   <Header id="sim"/>

@@ -312,15 +312,27 @@ Log entries use the same trigger evaluation as reports. The log control block tr
 When the file's `reasonCode` asks for it (the SCL default), an entry records why it was made, as
 a variable under the reserved name `ReasonCode`; the client returns it as `LogEntry::reason`.
 
-Entries live in a `LogStore`. The default is a bounded in-memory ring; supply your own for
-durability:
+Entries live in a `LogStore`. The default, `MemoryLog`, is a bounded in-memory ring. With the
+`log-redb` feature, `RedbLog` keeps them in a file that survives a restart:
 
 ```rust
-server.set_log_store(Box::new(MyFlashRing::new()));
+use iec61850_rs::server::RedbLog;
+
+let logs = server.log_references();
+server.set_log_store(Box::new(RedbLog::open("relay-log.redb", logs, 10_000)?));
 ```
 
-The trait is `append` plus the two queries. The `EntryID` belongs to the store, which must keep
-it ordered across restarts.
+Each append is one transaction — entry, counter and eviction together — and is on disk before it
+returns (`SyncPolicy::Deferred` plus `RedbLog::sync` trades that for fewer flushes). A restarted
+server publishes `OldEnt`/`NewEnt` from the file before it logs anything new, and `EntryID`s keep
+counting up. The file is created readable by its owner only, and is locked to one store; a file
+of another format version is refused, not migrated. `ied sim --log-db` does the same from the
+command line.
+
+A store of your own implements the trait (`append`, `by_time`, `after_entry`, `bounds`, `len`,
+`purge`, all fallible) and should pass `check_log_store`, the contract both shipped stores pass.
+A query the store cannot answer is refused with `resource`/`mass-storage-unavailable`; an entry
+it cannot keep moves no bound and is counted in `Acsi::failed_log_appends`.
 
 ## Supervising what this IED subscribes to
 
@@ -366,8 +378,7 @@ select expiry or time-activated command.
 
 ## Limits
 
-Not implemented: `ObtainFile` (ACSI `SetFile`) and TLS (IEC 62351-3). `GoEna`/`SvEna` drive no publisher. The default `LogStore` is
-in memory.
+Not implemented: `ObtainFile` (ACSI `SetFile`) and TLS (IEC 62351-3). `GoEna`/`SvEna` drive no publisher.
 
 The server is tested against this crate's client, Wireshark and libiec61850's client — see
 [Verification](@/docs/verification.md).
