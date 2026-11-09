@@ -137,6 +137,7 @@ mod tests {
         lying.extend_from_slice(&u32::MAX.to_le_bytes()); // captured length
         lying.extend_from_slice(&u32::MAX.to_le_bytes());
         lying.extend_from_slice(&[1, 2, 3]);
-        assert!(Capture::parse(&lying).unwrap().frames.is_empty());
+        let frames = Capture::parse(&lying).unwrap().frames;
+        assert!(frames.is_empty(), "{frames:?}");
     }
 }

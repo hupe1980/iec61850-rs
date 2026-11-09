@@ -30,8 +30,8 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant as StdInstant};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Duration;
 
 use super::acsi::{Acsi, AcsiConfig, AssocId};
 use super::ied::Ied;
@@ -58,9 +58,8 @@ pub struct ServerConfig {
     ///
     /// Reports and command terminations are produced by whichever thread committed the change
     /// and drained by the connection thread, so a client that stops reading its socket makes
-    /// that queue grow — an unbounded one is a remote memory exhaustion with a protocol in
-    /// front of it, which is the defect the [`FileStore`](super::FileStore) trait was reshaped to
-    /// remove for one service at a time. When the queue fills, the **association is closed**: a buffered report control
+    /// that queue grow, and an unbounded one is a remote memory exhaustion. When the queue
+    /// fills, the **association is closed**: a buffered report control
     /// block keeps its entries and the client resumes from its `EntryID` when it comes back,
     /// which is precisely what `BR` is for, and dropping reports silently instead would leave
     /// a SCADA client believing it had seen everything.
@@ -87,6 +86,35 @@ struct Shared {
     /// reports and command terminations. Bounded; see [`ServerConfig::outbound_queue`].
     outbound: BTreeMap<AssocId, Outbound>,
     next_assoc: AssocId,
+    /// Wakes the process-bus publisher thread when a commit may have produced a frame.
+    wake: Option<Arc<Wake>>,
+}
+
+/// A flag and the condition variable the publisher thread sleeps on.
+#[derive(Debug, Default)]
+struct Wake {
+    pending: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Wake {
+    fn notify(&self) {
+        *self.pending.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.cv.notify_one();
+    }
+
+    /// Sleep until notified or until `timeout` (`None`: until notified) has passed.
+    fn wait(&self, timeout: Option<Duration>) {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if !*pending {
+            pending = match timeout {
+                Some(t) if t.is_zero() => pending,
+                Some(t) => self.cv.wait_timeout(pending, t).unwrap_or_else(PoisonError::into_inner).0,
+                None => self.cv.wait(pending).unwrap_or_else(PoisonError::into_inner),
+            };
+        }
+        *pending = false;
+    }
 }
 
 /// One association's outbound queue, and the flag that says it overflowed.
@@ -112,9 +140,7 @@ impl Outbound {
 /// Nanoseconds on a monotonic origin shared by every association of this process, so that a
 /// report's gathering window means the same thing whichever thread closes it.
 fn now_nanos() -> u64 {
-    use std::sync::OnceLock;
-    static EPOCH: OnceLock<StdInstant> = OnceLock::new();
-    EPOCH.get_or_init(StdInstant::now).elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+    crate::common::monotonic_now().0
 }
 
 /// A blocking IEC 61850 server.
@@ -123,6 +149,23 @@ pub struct Server {
     listener: TcpListener,
     shared: Arc<Mutex<Shared>>,
     cfg: ServerConfig,
+    /// A process-bus sink registered with [`Server::publish_to`], waiting for the server to
+    /// start serving: its thread is spawned then, not when it is registered.
+    process_bus: Mutex<Option<ProcessBusStart>>,
+}
+
+/// Where the process-bus thread hands its frames.
+type FrameSink = Box<dyn FnMut(&[u8]) + Send>;
+
+/// What the process-bus thread needs, held until [`Server::run`] or [`Server::accept_one`].
+struct ProcessBusStart {
+    sink: FrameSink,
+}
+
+impl core::fmt::Debug for ProcessBusStart {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ProcessBusStart")
+    }
 }
 
 /// A handle the application updates the model through, and asks what the server is doing.
@@ -156,7 +199,12 @@ impl Server {
         let listener = TcpListener::bind(target).map_err(|e| Error::Io(format!("{addr}: {e}")))?;
         let mut acsi = Acsi::with_config(ied, cfg.acsi.clone());
         acsi.set_max_pdu(cfg.association.max_pdu as usize);
-        Ok(Server { listener, shared: Arc::new(Mutex::new(Shared { acsi, outbound: BTreeMap::new(), next_assoc: 1 })), cfg: cfg.clone() })
+        Ok(Server {
+            listener,
+            shared: Arc::new(Mutex::new(Shared { acsi, outbound: BTreeMap::new(), next_assoc: 1, wake: None })),
+            cfg: cfg.clone(),
+            process_bus: Mutex::new(None),
+        })
     }
 
     /// The address the server is listening on, which is how a caller learns the port it got
@@ -190,13 +238,16 @@ impl Server {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_file_store(store);
     }
 
-    /// Keep the log entries in `store` instead of the default bounded in-memory one.
-    ///
-    /// The default is right for a simulator and wrong for a device that must survive a
-    /// restart; a durable store is a backend, not a redesign, because the trigger evaluation
-    /// and the two ACSI queries sit above the trait rather than inside it.
+    /// Keep the log entries in `store` instead of the default bounded in-memory one — e.g. a
+    /// `RedbLog` (feature `log-redb`) to survive a restart. What the store already holds is
+    /// published in the log control blocks at once.
     pub fn set_log_store(&mut self, store: Box<dyn super::LogStore>) {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_log_store(store);
+    }
+
+    /// The logs the model declares, as full references — the list a store is opened for.
+    pub fn log_references(&self) -> Vec<String> {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.log_references().to_vec()
     }
 
     /// Replace the wall clock every absolute timestamp is read from.
@@ -209,8 +260,75 @@ impl Server {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_clock(clock);
     }
 
+    /// Publish this IED's GOOSE and sampled values on `link` (feature `net`).
+    ///
+    /// The `GoCB`s and `MSVCB`s the file declares publish once a client — or the application, with
+    /// [`Txn::set`] — writes `GoEna`/`SvEna`. Frames go out from one thread that wakes on the
+    /// publishers' deadlines and whenever a frame is queued, so a state change is on the wire
+    /// without waiting for a timer. The source address is the link's.
+    ///
+    /// No thread is started here: the process-bus thread starts with [`Server::run`] (or the
+    /// first [`Server::accept_one`]). Open every link, register it, call
+    /// [`crate::net::drop_capabilities`], then serve — Linux capabilities are per thread, and a
+    /// thread spawned before the drop would keep them.
+    #[cfg(feature = "net")]
+    pub fn publish_on(&mut self, link: crate::net::Link) -> Result<()> {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_source_mac(link.mac());
+        self.publish_to(move |frame| {
+            let _ = link.send(frame);
+        })
+    }
+
+    /// Hand this IED's GOOSE and sampled-value frames to `sink` as they become due, from one
+    /// thread — the same seam [`Server::publish_on`] uses for a live interface, for anything
+    /// else that takes frames: a capture file, a test, another transport. Frames carry the
+    /// source address set with [`Server::set_source_mac`] (all zeros by default).
+    ///
+    /// Like [`Server::publish_on`], the thread starts when the server starts serving.
+    pub fn publish_to(&mut self, sink: impl FnMut(&[u8]) + Send + 'static) -> Result<()> {
+        *self.process_bus.lock().unwrap_or_else(PoisonError::into_inner) = Some(ProcessBusStart { sink: Box::new(sink) });
+        Ok(())
+    }
+
+    /// Start the process-bus thread for a registered sink, once.
+    fn start_process_bus(&self) -> Result<()> {
+        let Some(ProcessBusStart { mut sink }) = self.process_bus.lock().unwrap_or_else(PoisonError::into_inner).take() else { return Ok(()) };
+        let wake = Arc::new(Wake::default());
+        let bus = {
+            let mut guard = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.wake = Some(Arc::clone(&wake));
+            guard.acsi.process_bus()
+        };
+        {
+            let notify = Arc::clone(&wake);
+            bus.lock().unwrap_or_else(PoisonError::into_inner).set_notify(super::process_bus::Notify(Arc::new(move || notify.notify())));
+        }
+        std::thread::Builder::new()
+            .name(String::from("process-bus"))
+            .spawn(move || publish_loop(&bus, &wake, &mut *sink))
+            .map_err(|e| Error::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    /// GOOSE and sampled-value frames lost because the publishing thread could not keep up —
+    /// zero on a healthy server.
+    pub fn frames_dropped(&self) -> u64 {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.frames_dropped()
+    }
+
+    /// The source address of published GOOSE and sampled-value frames.
+    pub fn set_source_mac(&mut self, mac: crate::common::MacAddr) {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_source_mac(mac);
+    }
+
+    /// The system frequency for sampled-value blocks whose `smpRate` counts samples per period.
+    pub fn set_nominal_hz(&mut self, hz: u32) {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_nominal_hz(hz);
+    }
+
     /// Accept associations for ever, one thread each.
     pub fn run(&self) -> Result<()> {
+        self.start_process_bus()?;
         loop {
             self.accept_one()?;
         }
@@ -221,6 +339,7 @@ impl Server {
     /// Returns as soon as the connection is handed over, so a test can accept a known number
     /// of clients without a background accept loop it then has to stop.
     pub fn accept_one(&self) -> Result<()> {
+        self.start_process_bus()?;
         let (stream, _) = self.listener.accept().map_err(|e| Error::Io(e.to_string()))?;
         let shared = Arc::clone(&self.shared);
         let cfg = self.cfg.clone();
@@ -253,6 +372,12 @@ impl Server {
 }
 
 impl ServerHandle {
+    /// GOOSE and sampled-value frames lost because the publishing thread could not keep up —
+    /// zero on a healthy server.
+    pub fn frames_dropped(&self) -> u64 {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.frames_dropped()
+    }
+
     /// Begin a transaction. Nothing is visible to a client until [`Txn::commit`].
     pub fn txn(&self) -> Txn<'_> {
         Txn { handle: self, writes: Vec::new() }
@@ -316,9 +441,8 @@ impl ServerHandle {
 /// A batch of model updates that becomes visible all at once.
 ///
 /// The application never locks anything: writes are collected here and [`Txn::commit`]
-/// publishes them to reporting and logging together. That is the whole update model — what
-/// was wrong with a lock-and-unlock discipline is not its granularity but that forgetting it
-/// tears a report across two states of the model.
+/// publishes them to reporting and logging together, so a report never straddles two states
+/// of the model — which a lock-and-unlock discipline allows the moment a caller forgets it.
 #[derive(Debug)]
 pub struct Txn<'a> {
     handle: &'a ServerHandle,
@@ -384,6 +508,41 @@ fn peer_identity(stream: &TcpStream) -> Vec<u8> {
 fn publish(shared: &mut Shared, now: Instant) {
     let due = shared.acsi.commit(now);
     dispatch(shared, due);
+    if let Some(w) = &shared.wake {
+        w.notify();
+    }
+}
+
+/// The process-bus thread: run the publishers' timers, hand what they produced to `sink`
+/// outside the lock, and sleep until the next deadline or until a commit queues a frame.
+///
+/// It takes only the publishers' own lock, never the server's: a commit that is appending to
+/// a durable log (an `fsync`) cannot delay a sampled value that is due.
+fn publish_loop(bus: &Arc<Mutex<super::process_bus::Publishers>>, wake: &Wake, sink: &mut dyn FnMut(&[u8])) {
+    // One reusable buffer per frame of a tick: after the first ticks nothing is allocated.
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let (count, next) = {
+            let mut pubs = bus.lock().unwrap_or_else(PoisonError::into_inner);
+            pubs.on_timeout(Instant(now_nanos()));
+            let mut count = 0;
+            pubs.drain(|f| {
+                if let Some(buf) = frames.get_mut(count) {
+                    buf.clear();
+                    buf.extend_from_slice(f);
+                } else {
+                    frames.push(f.to_vec());
+                }
+                count += 1;
+            });
+            (count, pubs.next_timeout())
+        };
+        for frame in frames.iter().take(count) {
+            sink(frame);
+        }
+        let wait = next.map(|t| Duration::from_nanos(t.0.saturating_sub(now_nanos())));
+        wake.wait(wait);
+    }
 }
 
 /// Hand each PDU to the association it belongs to.
@@ -391,6 +550,28 @@ fn dispatch(shared: &Shared, due: Vec<(AssocId, Vec<u8>)>) {
     for (assoc, pdu) in due {
         if let Some(out) = shared.outbound.get(&assoc) {
             out.send(pdu);
+        }
+    }
+}
+
+/// Issue the next request of a transfer toward the client (an `ObtainFile`'s `FileOpen`,
+/// `FileRead` or `FileClose`), if one is due. It is issued and the loop goes on: the answer
+/// arrives as an event like any other, so a client that answers slowly holds its own transfer
+/// and nothing else.
+fn issue_transfer_calls(shared: &Arc<Mutex<Shared>>, assoc: &mut Association, id: AssocId, now: Instant) {
+    let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
+    loop {
+        let issued = match guard.acsi.obtain_call(id) {
+            None => return,
+            Some(call) => assoc.call(now, &call),
+        };
+        if let Ok(invoke) = issued {
+            guard.acsi.obtain_issued(id, invoke);
+        } else {
+            if let Some(bytes) = guard.acsi.obtain_failed(id, None) {
+                let _ = assoc.send_encoded(&bytes);
+            }
+            return;
         }
     }
 }
@@ -433,12 +614,34 @@ fn serve(
             match event {
                 AssociationEvent::Request { invoke_id, pdu } => requests.push((invoke_id, pdu)),
                 AssociationEvent::Closed(_) => closed = true,
+                // The answers to the requests this server issued toward the client — the
+                // `FileOpen`/`FileRead`/`FileClose` of an `ObtainFile`. The last one ends the
+                // transfer and answers the client's `ObtainFile`.
+                AssociationEvent::Response { invoke_id, pdu } => {
+                    let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    let answer = match Mms::parse(&pdu, &limits) {
+                        Ok(mms) => guard.acsi.obtain_response(id, invoke_id, &mms),
+                        Err(_) => guard.acsi.obtain_failed(id, Some(invoke_id)),
+                    };
+                    drop(guard);
+                    if let Some(bytes) = answer {
+                        let _ = assoc.send_encoded(&bytes);
+                    }
+                }
+                AssociationEvent::Timeout { invoke_id } | AssociationEvent::Malformed { invoke_id: Some(invoke_id), .. } => {
+                    let answer = shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.obtain_failed(id, Some(invoke_id));
+                    if let Some(bytes) = answer {
+                        let _ = assoc.send_encoded(&bytes);
+                    }
+                }
                 // What the peer agreed to accept sizes two things the ACSI layer would
                 // otherwise guess at: a `GetNameList` page and a report. ISO 9506 negotiates
                 // *down*, so the server's own configured size is an upper bound, not an
                 // agreement, and a report larger than this is segmented rather than dropped.
                 AssociationEvent::Established(n) => {
-                    shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_association_max_pdu(id, n.max_pdu);
+                    let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    guard.acsi.set_association_max_pdu(id, n.max_pdu);
+                    guard.acsi.set_authenticated(id, n.authenticated);
                 }
                 // A response, a timeout or an undecodable PDU on a server association: none
                 // of them is a request, and none of them is a reason to drop the client.
@@ -449,15 +652,22 @@ fn serve(
         for (invoke_id, pdu) in requests {
             let answer = {
                 let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
-                match Mms::parse(&pdu, &limits) {
+                let answer = match Mms::parse(&pdu, &limits) {
                     Ok(Mms::ConfirmedRequest { service, .. }) => guard.acsi.request(id, now, &service),
                     // Not a confirmed request, or not a PDU at all — which ISO 9506 answers
                     // with a reject naming the *PDU*, not with a service error naming a
                     // service that was never called.
                     _ => super::acsi::Answer::INVALID_PDU,
+                };
+                // An `ObtainFile` is answered when the file has arrived, not now.
+                if matches!(answer, super::acsi::Answer::Deferred) {
+                    guard.acsi.obtain_bind(id, invoke_id);
                 }
+                answer
             };
-            if let Ok(bytes) = answer.encode(invoke_id) {
+            if let Ok(bytes) = answer.encode(invoke_id)
+                && !bytes.is_empty()
+            {
                 let _ = assoc.send_encoded(&bytes);
             }
             // A commit may have happened inside the request — a control that changed a
@@ -465,6 +675,8 @@ fn serve(
             let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
             publish(&mut guard, now);
         }
+
+        issue_transfer_calls(shared, &mut assoc, id, now);
 
         loop {
             match outbound.try_recv() {

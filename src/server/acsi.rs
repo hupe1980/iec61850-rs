@@ -42,6 +42,27 @@ struct Peer {
     identity: Vec<u8>,
     /// The largest MMS PDU it agreed to accept.
     max_pdu: usize,
+    /// Whether it presented the server's ACSE password.
+    authenticated: bool,
+}
+
+/// Who may change this server's files: receive one (ACSI `SetFile`, MMS `ObtainFile`), replace
+/// one, or delete one (`FileDelete`).
+///
+/// A client that can write files into an IED can replace its settings, so the default is that
+/// nobody can. The store must be writable as well (`DirectoryStore::writable`); a writable store
+/// alone authorises nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FileWritePolicy {
+    /// Nobody. The default.
+    #[default]
+    Off,
+    /// Only an association that presented the server's ACSE password
+    /// (`AssociationConfig::password`).
+    Authenticated,
+    /// Any association.
+    Anyone,
 }
 
 /// The octets a `GetNameList` page may fill inside a PDU of `max_pdu`.
@@ -55,6 +76,7 @@ fn page_budget(max_pdu: usize) -> usize {
 /// while the association is open, which is all any ownership rule needs.
 pub type AssocId = u64;
 use crate::proto::data::Value;
+use crate::proto::mms::file::FileName;
 use crate::proto::mms::reject::{self, Reject, RejectReason};
 use crate::proto::mms::typespec::TypeSpec;
 use crate::proto::mms::{
@@ -165,6 +187,20 @@ pub enum Answer {
         /// The integer that choice carries.
         code: i64,
     },
+    /// No answer yet: the request is answered later (an `ObtainFile` is answered when the file
+    /// has been fetched). Encodes to nothing.
+    Deferred,
+    /// `ObtainFile`: the file is stored.
+    ObtainFile,
+    /// `ObtainFile` refused or failed: the `ServiceError`, and which side failed.
+    ObtainFileError {
+        /// The `errorClass` choice tag.
+        class: u32,
+        /// The code inside it.
+        code: i64,
+        /// `obtain_file_error::SOURCE_FILE` or `DESTINATION_FILE`.
+        side: i64,
+    },
     /// The PDU could not be acted on at all, which ISO 9506 answers with a **reject** rather
     /// than a service error: an unrecognised service, an argument that did not decode, or
     /// octets that are not a PDU.
@@ -196,13 +232,19 @@ struct FileHandle {
 }
 
 /// `errorClass` choice tags of ISO 9506 `ServiceError`.
+///
+/// The numbers are the context tags of ISO 9506-2's `errorClass` ✅ (Wireshark's `mms.asn`).
 pub mod error_class {
-    /// `access(7)` — the object could not be accessed.
+    /// `definition [2]` — the request names something that is not defined, or not consistently.
+    pub const DEFINITION: u32 = 2;
+    /// `resource [3]` — the server lacks the memory, storage or capability to answer.
+    pub const RESOURCE: u32 = 3;
+    /// `service [4]` — the service, or this form of it, is not supported here.
+    pub const SERVICE: u32 = 4;
+    /// `access [7]` — the object could not be accessed.
     pub const ACCESS: u32 = 7;
-    /// `service(5)` — the service itself is not supported here.
-    pub const SERVICE: u32 = 5;
-    /// `definition(4)` — the request names something that is not defined.
-    pub const DEFINITION: u32 = 4;
+    /// `file [11]` — a file service failed.
+    pub const FILE: u32 = 11;
 }
 
 impl Answer {
@@ -230,6 +272,19 @@ impl Answer {
             // which is strictly worse than a reject it cannot attribute.
             let original_invoke_id = u32::try_from(invoke_id).ok().map(i64::from);
             return Reject { original_invoke_id, reason: *reason }.to_vec();
+        }
+        if let Answer::Deferred = self {
+            return Ok(Vec::new());
+        }
+        if let Answer::ObtainFileError { class, code, side } = self {
+            let body = crate::proto::mms::ServiceError::encode_obtain_file(crate::ber::Tag::context_constructed(2), *class, *code, *side)?;
+            let mut e = Encoder::new();
+            e.constructed(crate::ber::Tag::context_constructed(2), |e| {
+                e.integer(crate::ber::Tag::context(0), invoke_id)?;
+                e.raw(&body);
+                Ok(())
+            })?;
+            return Ok(e.into_vec());
         }
         // A service error is a `confirmed-ErrorPDU`, not a response with an error in it.
         if let Answer::Error { class, code } = self {
@@ -336,6 +391,7 @@ impl Answer {
             },
             Answer::FileRead { data, more } => ConfirmedResponse::FileRead { data, more_follows: *more },
             Answer::FileClose => ConfirmedResponse::FileClose,
+            Answer::ObtainFile => ConfirmedResponse::ObtainFile,
             Answer::FileDelete => ConfirmedResponse::FileDelete,
             Answer::Journal { entries, more } => {
                 let mut out = Vec::with_capacity(entries.len());
@@ -357,7 +413,9 @@ impl Answer {
             // Both are whole PDUs of their own and were returned above. An `Err` rather
             // than an `unreachable!` keeps the crate's "no panics" rule literal even on a
             // branch nothing can reach.
-            Answer::Error { .. } | Answer::Reject(_) => return Err(Error::InvalidValue("an error or reject answer is encoded before the service match")),
+            Answer::Error { .. } | Answer::Reject(_) | Answer::Deferred | Answer::ObtainFileError { .. } => {
+                return Err(Error::InvalidValue("an error or reject answer is encoded before the service match"));
+            }
         };
         Mms::ConfirmedResponse { invoke_id, service }.to_vec()
     }
@@ -398,6 +456,13 @@ pub struct AcsiConfig {
     /// thing a client asking the question can act on. Anything claimed here is a claim: a
     /// capability listed and not implemented is a request that gets a reject.
     pub capabilities: Vec<String>,
+    /// Who may change this server's files — receive one with `SetFile`, replace one, delete one
+    /// with `FileDelete`. Off by default.
+    pub file_write: FileWritePolicy,
+    /// How many files may be received at once, server-wide (one per association).
+    pub max_obtains: usize,
+    /// How long one file may take to arrive, in milliseconds, before the transfer is abandoned.
+    pub obtain_timeout_ms: u64,
 }
 
 impl Default for AcsiConfig {
@@ -417,6 +482,9 @@ impl Default for AcsiConfig {
             vmd_logical_status: vmd_logical::STATE_CHANGES_ALLOWED,
             vmd_physical_status: vmd_physical::OPERATIONAL,
             capabilities: alloc::vec![String::from("IEC 61850-8-1:2011+AMD1:2020")],
+            file_write: FileWritePolicy::Off,
+            max_obtains: 2,
+            obtain_timeout_ms: 30_000,
         }
     }
 }
@@ -436,6 +504,10 @@ pub struct Acsi {
     tracking: Tracking,
     /// The logs it keeps.
     logs: Logs,
+    /// The GOOSE and sampled-value publishers its `GoCB`s and `MSVCB`s drive, behind a lock of
+    /// their own: a process-bus thread ticks and drains them without waiting for this
+    /// struct's owner — in particular not for a durable log append inside [`Acsi::commit`].
+    publishers: std::sync::Arc<std::sync::Mutex<super::process_bus::Publishers>>,
     /// Where its files come from. `NoFiles` by default: an IED that has none should say so
     /// rather than expose a filesystem by accident.
     files: Box<dyn FileStore>,
@@ -465,6 +537,8 @@ pub struct Acsi {
     /// floor of the `BinaryTime` epoch, and makes `QueryLogByTime` match nothing. The clock is
     /// a trait so a test can pin it and a PTP- or SNTP-disciplined source can replace it.
     clock: Box<dyn Clock + Send + Sync>,
+    /// The files being received (`ObtainFile`).
+    obtains: super::obtain::Obtains,
 }
 
 impl Acsi {
@@ -479,13 +553,17 @@ impl Acsi {
         let mut groups = SettingGroups::new(&ied);
         let logs = Logs::new(&ied);
         let tracking = Tracking::new(&ied);
+        let controls = Controls::new();
+        let obtains = super::obtain::Obtains::new(cfg.max_obtains, cfg.obtain_timeout_ms);
+        let publishers = std::sync::Arc::new(std::sync::Mutex::new(super::process_bus::Publishers::new(&ied)));
         let mut acsi = Acsi {
             ied,
             reports,
-            controls: Controls::new(),
+            controls,
             groups: SettingGroups::default(),
             tracking,
             logs,
+            publishers,
             files: Box::new(NoFiles),
             handles: Vec::new(),
             next_frsm: 1,
@@ -494,6 +572,7 @@ impl Acsi {
             deferred: Vec::new(),
             peers: BTreeMap::new(),
             clock: Box::new(SystemClock),
+            obtains,
         };
         // The engineered active group is in force from the moment the server starts, not from
         // the first time a client writes `ActSG`.
@@ -512,7 +591,7 @@ impl Acsi {
     }
 
     /// Both clocks at once — the monotonic instant the caller drove this with, and this
-    /// server's wall-clock reading (D33). They travel together so a signature cannot let one
+    /// server's wall-clock reading. They travel together so a signature cannot let one
     /// stand in for the other.
     fn now(&self, mono: Instant) -> Now {
         Now::new(mono, self.clock.now())
@@ -521,7 +600,7 @@ impl Acsi {
     /// This server's wall clock, for a timestamp that leaves the process.
     ///
     /// Every absolute time a server publishes comes from here rather than from the monotonic
-    /// instant its timers run on (D33), including the `t` a supervision logical node stamps
+    /// instant its timers run on, including the `t` a supervision logical node stamps
     /// its status with.
     pub fn wall_clock(&self) -> crate::common::UtcTime {
         self.clock.now()
@@ -572,7 +651,17 @@ impl Acsi {
     /// The store has to know the same logs the model declares —
     /// [`Logs::log_references`](super::Logs::log_references) is the list to build one from.
     pub fn set_log_store(&mut self, store: Box<dyn super::LogStore>) {
-        self.logs.set_store(store);
+        self.logs.set_store(&mut self.ied, store);
+    }
+
+    /// The logs the model declares, as full references.
+    pub fn log_references(&self) -> &[String] {
+        self.logs.log_references()
+    }
+
+    /// How many log entries the store has refused to keep since the server started.
+    pub const fn failed_log_appends(&self) -> u64 {
+        self.logs.failed_appends()
     }
 
     /// Set the default page budget from what this server offers, leaving room for the PDU's
@@ -647,7 +736,8 @@ impl Acsi {
             ConfirmedRequest::FileOpen { name, position } => self.file_open(assoc, &name.display(), *position),
             ConfirmedRequest::FileRead(frsm_id) => self.file_read(assoc, *frsm_id),
             ConfirmedRequest::FileClose(frsm_id) => self.file_close(assoc, *frsm_id),
-            ConfirmedRequest::FileDelete(name) => self.file_delete(&name.display()),
+            ConfirmedRequest::FileDelete(name) => self.file_delete(assoc, &name.display()),
+            ConfirmedRequest::ObtainFile { source_server, source, destination } => self.obtain_file(assoc, now, source_server.is_some(), source, destination),
             ConfirmedRequest::ReadJournal(request) => {
                 let answer = self.read_journal(request);
                 self.track_log_query(assoc, now, request, &answer);
@@ -665,6 +755,9 @@ impl Acsi {
     /// `RptEna` being per-block rather than per-server.
     pub fn commit(&mut self, now: Instant) -> Vec<(AssocId, Vec<u8>)> {
         let dirty = self.ied.take_dirty();
+        // The process bus first: a state change is a GOOSE before it is a report.
+        let utc = self.clock.now();
+        self.pubs().on_commit(&self.ied, &dirty, now, utc);
         let wall = self.now(now).entry();
         // Logging first: a log entry records what the model held at the moment of the change,
         // and the report engine writes counters back into the model as it publishes.
@@ -677,6 +770,7 @@ impl Acsi {
 
     /// Time passed: emit whatever a gathering window or an integrity period has made due.
     pub fn on_timeout(&mut self, now: Instant) -> Vec<(AssocId, Vec<u8>)> {
+        self.pubs().on_timeout(now);
         self.controls.on_timeout(&mut self.ied, now);
         // An edit reservation nobody released: `ResvTms` is what ends it.
         self.groups.on_timeout(&mut self.ied, now);
@@ -688,7 +782,15 @@ impl Acsi {
         // nothing else will collect it: `commit` only runs when the model changes, and an
         // abandoned select changes nothing.
         out.extend(self.controls.take_pending().into_iter().map(|Termination { assoc, pdu }| Outgoing { assoc, pdu }));
-        out.into_iter().map(|Outgoing { assoc, pdu }| (assoc, pdu)).collect()
+        let mut out: Vec<(AssocId, Vec<u8>)> = out.into_iter().map(|Outgoing { assoc, pdu }| (assoc, pdu)).collect();
+        // A client that stalls a transfer fails its own `ObtainFile`, and nothing else.
+        for finished in self.obtains.on_timeout(now) {
+            let assoc = finished.0;
+            if let Some(pdu) = Self::obtain_answer(finished) {
+                out.push((assoc, pdu));
+            }
+        }
+        out
     }
 
     /// When the server next needs [`Acsi::on_timeout`].
@@ -696,7 +798,50 @@ impl Acsi {
         // Both layers own deadlines: a report's gathering window or integrity period, and a
         // selection expiry or a time-activated command. Reporting only one of them is how an
         // event loop sleeps through the other.
-        [self.reports.next_timeout(), self.controls.next_timeout(), self.groups.next_timeout()].into_iter().flatten().min()
+        [self.reports.next_timeout(), self.controls.next_timeout(), self.groups.next_timeout(), self.obtains.next_timeout(), self.pubs().next_timeout()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// The source address GOOSE and sampled values are published from: the hardware address of
+    /// the interface they go out on.
+    pub fn set_source_mac(&mut self, mac: crate::common::MacAddr) {
+        self.pubs().set_source(mac);
+    }
+
+    /// The system frequency for a sampled-value block whose `smpRate` counts samples per
+    /// period (default 50 Hz).
+    pub fn set_nominal_hz(&mut self, hz: u32) {
+        self.pubs().set_nominal_hz(hz);
+    }
+
+    /// Hand every GOOSE and sampled-value frame produced since the last call to `send`, oldest
+    /// first. Frames wait in a bounded outbox ([`Acsi::frames_dropped`] counts what it could not
+    /// take); the slots are reused, so nothing is allocated.
+    pub fn drain_frames(&mut self, send: impl FnMut(&[u8])) {
+        self.pubs().drain(send);
+    }
+
+    /// `GoCB`s and `MSVCB`s currently publishing.
+    pub fn publishing(&self) -> usize {
+        self.pubs().enabled()
+    }
+
+    /// GOOSE and sampled-value frames lost because nothing drained them in time — zero on a
+    /// healthy server.
+    pub fn frames_dropped(&self) -> u64 {
+        self.pubs().dropped()
+    }
+
+    /// The publishers' own handle, for a thread that ticks and drains them without this
+    /// struct's lock.
+    pub(crate) fn process_bus(&self) -> std::sync::Arc<std::sync::Mutex<super::process_bus::Publishers>> {
+        std::sync::Arc::clone(&self.publishers)
+    }
+
+    fn pubs(&self) -> std::sync::MutexGuard<'_, super::process_bus::Publishers> {
+        self.publishers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// An association opened, and this is what it calls itself.
@@ -705,7 +850,81 @@ impl Acsi {
     /// has one enabled — the peer's network address, in the octets the transport reports.
     pub fn on_association_opened(&mut self, assoc: AssocId, identity: Vec<u8>) {
         let max_pdu = self.cfg.name_list_budget.saturating_add(100);
-        self.peers.insert(assoc, Peer { identity, max_pdu });
+        self.peers.insert(assoc, Peer { identity, max_pdu, authenticated: false });
+    }
+
+    /// Whether `assoc` presented the server's ACSE password, which the association decided.
+    pub fn set_authenticated(&mut self, assoc: AssocId, authenticated: bool) {
+        if let Some(peer) = self.peers.get_mut(&assoc) {
+            peer.authenticated = authenticated;
+        }
+    }
+
+    // ---- ObtainFile: the requests this server issues toward a client ------------------
+
+    /// The `ObtainFile` `assoc` just sent, whose answer was [`Answer::Deferred`], was `invoke`.
+    pub fn obtain_bind(&mut self, assoc: AssocId, invoke: i64) {
+        self.obtains.bind(assoc, invoke);
+    }
+
+    /// The request to issue toward the client on `assoc` now, if a transfer needs one.
+    pub fn obtain_call(&self, assoc: AssocId) -> Option<ConfirmedRequest<'_>> {
+        self.obtains.next_call(assoc)
+    }
+
+    /// The request [`Acsi::obtain_call`] named went out as `invoke`.
+    pub fn obtain_issued(&mut self, assoc: AssocId, invoke: i64) {
+        self.obtains.issued(assoc, invoke);
+    }
+
+    /// The client answered `invoke`; the encoded answer to its `ObtainFile` when that ends the
+    /// transfer.
+    pub fn obtain_response(&mut self, assoc: AssocId, invoke: i64, pdu: &Mms<'_>) -> Option<Vec<u8>> {
+        let finished = self.obtains.on_response(assoc, invoke, pdu)?;
+        Self::obtain_answer(finished)
+    }
+
+    /// A request toward the client could not be issued, timed out or was answered with octets
+    /// that do not decode; the encoded answer to its `ObtainFile`.
+    pub fn obtain_failed(&mut self, assoc: AssocId, invoke: Option<i64>) -> Option<Vec<u8>> {
+        let finished = self.obtains.failed(assoc, invoke)?;
+        Self::obtain_answer(finished)
+    }
+
+    fn obtain_answer((_, invoke, outcome): super::obtain::Finished) -> Option<Vec<u8>> {
+        let answer = match outcome {
+            super::obtain::Outcome::Stored => Answer::ObtainFile,
+            super::obtain::Outcome::Failed(f) => Answer::ObtainFileError { class: f.class, code: f.code, side: f.side },
+        };
+        answer.encode(invoke).ok()
+    }
+
+    /// `ObtainFile`: check who asks, what for and where to, then start fetching. Everything
+    /// that can be refused is refused here, before a single request goes toward the client.
+    fn obtain_file(&mut self, assoc: AssocId, now: Instant, third_party: bool, source: &FileName<'_>, destination: &FileName<'_>) -> Answer {
+        use super::obtain::Refusal;
+        use crate::proto::mms::file_error;
+        let refuse = |f: Refusal| Answer::ObtainFileError { class: f.class, code: f.code, side: f.side };
+        if !self.may_write_files(assoc) {
+            return refuse(Refusal::destination(file_error::FILE_ACCESS_DENIED));
+        }
+        // Fetching from a third party on a client's word would make this server a relay.
+        if third_party {
+            return refuse(Refusal::source(file_error::FILE_ACCESS_DENIED));
+        }
+        if let Err(f) = self.obtains.admit(assoc) {
+            return refuse(f);
+        }
+        let Ok(source) = crate::proto::mms::file::FileNameBuf::from_path(&source.display()) else {
+            return refuse(Refusal::source(file_error::FILENAME_SYNTAX_ERROR));
+        };
+        match self.files.create(&destination.display()) {
+            Ok(writer) => {
+                self.obtains.start(assoc, source, writer, now);
+                Answer::Deferred
+            }
+            Err(e) => refuse(Refusal::from_store(e)),
+        }
     }
 
     /// An association ended: release everything it owned.
@@ -718,7 +937,7 @@ impl Acsi {
         let held = self.reports.held_by(assoc);
         self.reports.on_association_closed(&mut self.ied, assoc, now);
         // `Owner` names a client, so it has to stop naming one that has gone — but a
-        // `ResvTms` reservation deliberately outlives its association (D44), and while it does
+        // `ResvTms` reservation deliberately outlives its association, and while it does
         // the block is still that client's. So the answer is recomputed rather than cleared:
         // an operator asking who holds the block gets the truth in both cases.
         for block in held {
@@ -738,6 +957,8 @@ impl Acsi {
         self.peers.remove(&assoc);
         self.controls.on_association_closed(assoc);
         self.groups.on_association_closed(assoc);
+        // A file half received from a client that has gone is discarded, never stored.
+        self.obtains.on_closed(assoc);
         // A file handle is a server-side resource; an association that goes away without
         // closing its handles must not leak them.
         self.handles.retain(|h| h.assoc != assoc);
@@ -874,7 +1095,7 @@ impl Acsi {
     ///
     /// The specific half is the query's own parameters under §14.1's rule — the service
     /// parameter with a lower-case first letter — and only the leaves the file declares are
-    /// written ⚠ (the `OTS` attribute table is paywalled, R2).
+    /// written ⚠ (the `OTS` attribute table is paywalled).
     fn track_log_query(&mut self, assoc: AssocId, now: Instant, request: &crate::proto::mms::ReadJournal<'_>, answer: &Answer) {
         use crate::proto::mms::journal::{RangeStart, RangeStop};
         if self.tracking.is_empty() {
@@ -968,7 +1189,7 @@ impl Acsi {
             };
             // Tracked here rather than inside `write_reference`, because *every* write goes
             // through this one loop and a hook per branch is a hook somebody forgets to add
-            // to the next branch (D32's rule: one decision about one question).
+            // to the next branch.
             self.track_write(assoc, now, reference, decoded_for_tracking.as_ref(), &result);
             out.push(result);
         }
@@ -1022,34 +1243,34 @@ impl Acsi {
         let error = tracking::error_of(result);
         // A control service: the attribute names it, and `operTm` turns an operate into a
         // time-activated one — which the standard tracks as a service of its own.
-        if let Some((object, attribute)) = Controls::split(reference) {
-            if self.ied.node_at(reference).is_some() {
-                let service = match attribute {
-                    "SBO" => ServiceType::Select,
-                    "SBOw" => ServiceType::SelectWithValue,
-                    "Cancel" => ServiceType::Cancel,
-                    _ => ServiceType::Operate,
-                };
-                return Tracked { cdc: TrackingCdc::Cts, obj_ref: String::from(object), service, error, originator };
-            }
+        if let Some((object, attribute)) = Controls::split(reference)
+            && self.ied.node_at(reference).is_some()
+        {
+            let service = match attribute {
+                "SBO" => ServiceType::Select,
+                "SBOw" => ServiceType::SelectWithValue,
+                "Cancel" => ServiceType::Cancel,
+                _ => ServiceType::Operate,
+            };
+            return Tracked { cdc: TrackingCdc::Cts, obj_ref: String::from(object), service, error, originator };
         }
         // A control block attribute, whose functional constraint says which block it is and
         // therefore which tracking class records it.
-        if let Some((block, attribute)) = reference.rsplit_once(tree::SEP) {
-            if let Some(b) = self.ied.block(block) {
-                let fc = block.split_once('/').map(|(_, item)| tree::split_item(item).1).unwrap_or_default();
-                let service = if b.kind == super::ied::BlockKind::SettingGroup {
-                    match attribute {
-                        "ActSG" => ServiceType::SelectActiveSG,
-                        "EditSG" => ServiceType::SelectEditSG,
-                        "CnfEdit" => ServiceType::ConfirmEditSGValues,
-                        _ => ServiceType::GetSGCBValues,
-                    }
-                } else {
-                    tracking::set_service(fc)
-                };
-                return Tracked { cdc: tracking::class_for(fc), obj_ref: String::from(block), service, error, originator };
-            }
+        if let Some((block, attribute)) = reference.rsplit_once(tree::SEP)
+            && let Some(b) = self.ied.block(block)
+        {
+            let fc = block.split_once('/').map(|(_, item)| tree::split_item(item).1).unwrap_or_default();
+            let service = if b.kind == super::ied::BlockKind::SettingGroup {
+                match attribute {
+                    "ActSG" => ServiceType::SelectActiveSG,
+                    "EditSG" => ServiceType::SelectEditSG,
+                    "CnfEdit" => ServiceType::ConfirmEditSGValues,
+                    _ => ServiceType::GetSGCBValues,
+                }
+            } else {
+                tracking::set_service(fc)
+            };
+            return Tracked { cdc: tracking::class_for(fc), obj_ref: String::from(block), service, error, originator };
         }
         // Everything else. A setting under `SE` is `SetEditSGValue`, which IEC 61850-7-2
         // §15.3.2.9.3 puts in the *common* tracker rather than the setting-group one.
@@ -1067,12 +1288,12 @@ impl Acsi {
         // is running. The value only reaches the store once the engine has agreed to it.
         // A control is a *service* on a structured variable under `CO`: a select, an operate
         // or a cancel, each with its own rules about who may do it and in what order.
-        if let Some((object, attribute)) = Controls::split(reference) {
-            if self.ied.node_at(reference).is_some() {
-                let object = String::from(object);
-                let at = self.now(now);
-                return self.controls.write(assoc, &mut self.ied, &object, attribute, &value, at);
-            }
+        if let Some((object, attribute)) = Controls::split(reference)
+            && self.ied.node_at(reference).is_some()
+        {
+            let object = String::from(object);
+            let at = self.now(now);
+            return self.controls.write(assoc, &mut self.ied, &object, attribute, &value, at);
         }
         // Everything else is a *value*, and which values a client may write is not a matter
         // of taste: `ST` and `MX` are what the process reports and a server that accepts a
@@ -1099,22 +1320,31 @@ impl Acsi {
             }
             _ => {}
         }
-        if let Some((block, attribute)) = reference.rsplit_once(tree::SEP) {
-            if self.reports.has(block) {
-                self.reports.on_write(assoc, &mut self.ied, block, attribute, &value, now)?;
-                let result = self.ied.write_leaf(reference, value);
-                if result.is_ok() && matches!(attribute, "RptEna" | "Resv" | "ResvTms") {
-                    self.publish_owner(assoc, block);
-                }
-                if result.is_ok() && attribute == "RptEna" && self.reports.owner(block) == Some(assoc) {
-                    // Enabling a buffered block hands over whatever it kept while nobody was
-                    // listening, resuming after the `EntryID` the client wrote if it wrote one.
-                    let after = self.ied.value(&alloc::format!("{block}$EntryID")).and_then(entry_id_of);
-                    let replay = self.reports.drain_buffer(&mut self.ied, block, after);
-                    self.deferred.extend(replay);
-                }
-                return result;
+        // Enabling a `GoCB` or `MSVCB` starts a publisher, which needs a data set the file says
+        // how to publish; a block that cannot is refused here rather than enabled and silent.
+        if let Some((block, attribute)) = reference.rsplit_once(tree::SEP)
+            && matches!(attribute, "GoEna" | "SvEna")
+            && value == Value::Boolean(true)
+            && self.pubs().refusal(block).is_some()
+        {
+            return Err(super::ied::DATA_ACCESS_VALUE_INVALID);
+        }
+        if let Some((block, attribute)) = reference.rsplit_once(tree::SEP)
+            && self.reports.has(block)
+        {
+            self.reports.on_write(assoc, &mut self.ied, block, attribute, &value, now)?;
+            let result = self.ied.write_leaf(reference, value);
+            if result.is_ok() && matches!(attribute, "RptEna" | "Resv" | "ResvTms") {
+                self.publish_owner(assoc, block);
             }
+            if result.is_ok() && attribute == "RptEna" && self.reports.owner(block) == Some(assoc) {
+                // Enabling a buffered block hands over whatever it kept while nobody was
+                // listening, resuming after the `EntryID` the client wrote if it wrote one.
+                let after = self.ied.value(&alloc::format!("{block}$EntryID")).and_then(entry_id_of);
+                let replay = self.reports.drain_buffer(&mut self.ied, block, after);
+                self.deferred.extend(replay);
+            }
+            return result;
         }
         self.write_value(reference, value)
     }
@@ -1265,7 +1495,13 @@ impl Acsi {
         let (mut matched, mut deleted) = (0u32, 0u32);
         for name in names {
             let ObjectName::DomainSpecific { domain, item } = name else { continue };
-            let (exists, removed) = self.ied.delete_data_set(&alloc::format!("{domain}/{item}"));
+            let reference = alloc::format!("{domain}/{item}");
+            // A data set a publisher is sending must outlive the stream.
+            if self.pubs().publishes_data_set(&self.ied, &reference) {
+                matched += 1;
+                continue;
+            }
+            let (exists, removed) = self.ied.delete_data_set(&reference);
             matched += u32::from(exists);
             deleted += u32::from(removed);
             if removed {
@@ -1340,7 +1576,21 @@ impl Acsi {
         if self.handles.len() == before { Answer::NOT_FOUND } else { Answer::FileClose }
     }
 
-    fn file_delete(&mut self, path: &str) -> Answer {
+    /// Whether `assoc` may change files, under [`AcsiConfig::file_write`].
+    fn may_write_files(&self, assoc: AssocId) -> bool {
+        match self.cfg.file_write {
+            FileWritePolicy::Off => false,
+            FileWritePolicy::Authenticated => self.peers.get(&assoc).is_some_and(|p| p.authenticated),
+            FileWritePolicy::Anyone => true,
+        }
+    }
+
+    fn file_delete(&mut self, assoc: AssocId, path: &str) -> Answer {
+        // A writable store is not permission: deleting changes the server's files, which the
+        // same policy as receiving one governs.
+        if !self.may_write_files(assoc) {
+            return Answer::DENIED;
+        }
         if self.files.delete(path) { Answer::FileDelete } else { Answer::DENIED }
     }
 
@@ -1354,7 +1604,7 @@ impl Acsi {
             return Answer::NOT_FOUND;
         }
         let limit = self.cfg.max_log_entries;
-        let (entries, more) = match (request.after, request.start) {
+        let page = match (request.after, request.start) {
             // `QueryLogAfterEntry` — both halves of the resume point matter.
             (Some(after), _) => {
                 let id = <[u8; 8]>::try_from(after.entry_id).map_or(0, u64::from_be_bytes);
@@ -1377,7 +1627,12 @@ impl Acsi {
                 self.logs.by_time(&reference, from, to, limit)
             }
         };
-        Answer::Journal { entries, more }
+        match page {
+            Ok(super::LogPage { entries, more }) => Answer::Journal { entries, more },
+            Err(super::LogError::UnknownLog) => Answer::NOT_FOUND,
+            // The store could not answer: `resource`, `mass-storage-unavailable` (ISO 9506-2).
+            Err(_) => Answer::Error { class: error_class::RESOURCE, code: 3 },
+        }
     }
 }
 

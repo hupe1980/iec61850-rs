@@ -1,6 +1,6 @@
-//! Real GOOSE traffic (two SEL IEDs, `specs/pcap/goose-mdehus.pcap`) against the codec
+//! Real GOOSE traffic (two SEL IEDs, `pcap/goose-mdehus.pcap` in the reference corpus) against the codec
 //! and the subscriber state machine. Ground truth was taken with `tshark -T fields`.
-//! Skips when `specs/` is absent.
+//! Skips when the reference corpus is absent.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
@@ -12,7 +12,7 @@ use iec61850_rs::proto::goose::{GoosePdu, GoosePduView, Subscriber, SubscriberCo
 
 #[test]
 fn decodes_every_goose_frame_like_wireshark() {
-    let Some(path) = common::spec("pcap/goose-mdehus.pcap") else { return };
+    let Some(path) = common::reference("pcap/goose-mdehus.pcap") else { return };
     let frames = common::read_pcap(&path);
     let mut n = 0;
     let mut sq_351 = Vec::new();
@@ -53,7 +53,7 @@ fn decodes_every_goose_frame_like_wireshark() {
 
 #[test]
 fn subscriber_sees_one_state_and_retransmissions() {
-    let Some(path) = common::spec("pcap/goose-mdehus.pcap") else { return };
+    let Some(path) = common::reference("pcap/goose-mdehus.pcap") else { return };
     let frames = common::read_pcap(&path);
     let key = SubscriptionKey { dst: MacAddr::parse("01-0c-cd-01-00-03").unwrap(), appid: 3, gocb_ref: "SEL_351_1CFG/LLN0$GO$NewGOOSEMessage".into() };
     let mut sub = Subscriber::new(SubscriberConfig::new(key));

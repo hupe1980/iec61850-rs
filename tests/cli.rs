@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 /// The `ied` binary built alongside this test.
@@ -32,6 +32,44 @@ fn tempdir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("iec61850-cli-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
+}
+
+/// Every subcommand answers `--help` with its own usage, and an option is never taken for a
+/// file name: `ied mu --help` once wrote a capture called `--help`.
+#[test]
+fn every_subcommand_answers_help_and_no_option_becomes_a_file() {
+    let dir = tempdir("help");
+    let commands: [&[&str]; 12] = [
+        &["mu"],
+        &["sim"],
+        &["goose", "sniff"],
+        &["goose", "publish"],
+        &["sv", "monitor"],
+        &["pcap", "info"],
+        &["scl", "validate"],
+        &["scl", "show"],
+        &["scl", "subs"],
+        &["mms", "sniff"],
+        &["mms", "read"],
+        &["mms", "report"],
+    ];
+    for command in commands {
+        for flag in ["--help", "-h"] {
+            let args: Vec<&str> = command.iter().copied().chain([flag]).collect();
+            let out = Command::new(ied()).args(&args).current_dir(&dir).output().expect("run ied");
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{args:?} failed");
+            assert!(text.contains(&format!("ied {}", command.join(" "))), "{args:?} printed no usage line for itself:\n{text}");
+        }
+    }
+    let mu = Command::new(ied()).args(["mu", "--frames", "--help"]).current_dir(&dir).output().expect("run ied");
+    assert!(mu.status.success());
+    assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "--help wrote a file");
+    let refused = run(&["pcap", "info", "--nope"]);
+    assert!(!refused.ok && refused.stderr.contains("expected a file name"), "{}", refused.stderr);
+    let refused = run(&["mu", "--frames", "3"]);
+    assert!(!refused.ok && refused.stderr.contains("usage: ied mu"), "{}", refused.stderr);
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -110,7 +148,7 @@ fn generated_frames_dissect_cleanly_in_wireshark() {
 
 #[test]
 fn goose_sniff_reads_a_real_capture() {
-    let Some(capture) = common::spec("pcap/goose-mdehus.pcap") else { return };
+    let Some(capture) = common::reference("pcap/goose-mdehus.pcap") else { return };
     let o = run(&["goose", "sniff", capture.to_str().unwrap()]);
     assert!(o.ok, "{}", o.stderr);
     assert!(o.stdout.contains("16 GOOSE frames"), "{}", o.stdout);
@@ -177,7 +215,7 @@ fn mms_sniff_reads_a_real_association() {
     // The reference capture is an ICCP association — MMS over ACSE over presentation over
     // session over COTP over TPKT. Decoding it end to end is the check that the whole OSI
     // stack works on traffic nobody here produced.
-    let Some(capture) = common::spec("pcap/mms.pcap") else { return };
+    let Some(capture) = common::reference("pcap/mms.pcap") else { return };
     let o = run(&["mms", "sniff", capture.to_str().unwrap()]);
     assert!(o.ok, "{}", o.stderr);
     // The handshake, layer by layer.
@@ -258,11 +296,7 @@ fn scl_subs_resolves_a_subscriber_against_its_publishers() {
 
 #[test]
 fn scl_validate_reports_dangling_types_from_the_openscd_corpus() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/fixtures/openscd");
-    let file = dir.join("valid2007B4.scd");
-    if !file.is_file() {
-        return;
-    }
+    let Some(file) = common::reference("fixtures/openscd/valid2007B4.scd") else { return };
     let o = run(&["scl", "validate", file.to_str().unwrap()]);
     // The corpus is known to reference types it does not define; the tool must name them
     // rather than either crashing or silently accepting.
@@ -624,6 +658,34 @@ fn sim_serves_an_engineering_file_as_a_real_server() {
     assert!(ty.ok && ty.stdout.contains("general"), "{}{}", ty.stdout, ty.stderr);
 }
 
+/// `--log-db` keeps the logs in a file: the server opens it before it serves, and a log read on
+/// the running server is answered out of it.
+#[test]
+fn sim_keeps_its_log_in_the_file_it_is_given() {
+    use std::io::{BufRead, BufReader};
+
+    let dir = tempdir("sim-log");
+    let scl = dir.join("relay.icd");
+    std::fs::write(&scl, include_str!("fixtures/relay.icd")).expect("write the file");
+    let db = dir.join("relay-log.redb");
+
+    let mut child = Command::new(ied())
+        .args(["sim", scl.to_str().unwrap(), "--port", "0", "--log-db", db.to_str().unwrap()])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sim");
+    let stdout = child.stdout.take().expect("stdout");
+    let lines: Vec<String> = BufReader::new(stdout).lines().map_while(Result::ok).take_while(|l| !l.starts_with("serving")).collect();
+    let addr = lines.iter().find(|l| l.contains(" on ")).and_then(|l| l.split_whitespace().nth(2)).expect("the address").to_string();
+    let log = run(&["mms", "log", &addr, "IED1LD0/LLN0$GeneralLog", "--lcb", "IED1LD0/LLN0.lcb01"]);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(lines.iter().any(|l| l.contains("log in") && l.contains("relay-log.redb")), "{lines:?}");
+    assert!(db.is_file(), "the log file exists");
+    assert!(log.ok, "{}{}", log.stdout, log.stderr);
+}
+
 const SIM_RELAY: &str = r#"<?xml version="1.0"?>
 <SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">
   <Header id="sim"/>
@@ -641,3 +703,177 @@ const SIM_RELAY: &str = r#"<?xml version="1.0"?>
     <DAType id="AV_T"><BDA name="f" bType="FLOAT32"/></DAType>
   </DataTypeTemplates>
 </SCL>"#;
+
+// --- `ied scl edit` ---------------------------------------------------------------------------
+
+const EDIT_FIXTURE: &str = include_str!("fixtures/edit.scd");
+
+/// A scratch directory per test, so parallel tests do not share files.
+fn scratch_file(name: &str, text: &str) -> (PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!("ied-scl-edit-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("bay.scd");
+    std::fs::write(&file, text).unwrap();
+    (dir, file.to_str().unwrap().to_string())
+}
+
+#[test]
+fn scl_edit_renames_to_stdout_and_leaves_the_file_alone() {
+    let (dir, file) = scratch_file("stdout", EDIT_FIXTURE);
+    let o = run(&["scl", "edit", &file, "rename-ied", "Pub", "Bay1"]);
+    assert!(o.ok, "{}", o.stderr);
+    assert!(o.stderr.contains("5 change(s)"), "{}", o.stderr);
+    assert_eq!(o.stdout.lines().count(), EDIT_FIXTURE.lines().count());
+    assert!(o.stdout.contains("<IED name=\"Bay1\">") && o.stdout.contains("<Val>Bay1LD0/LLN0$GO$gcb1</Val>"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), EDIT_FIXTURE);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn scl_edit_refuses_input_above_the_size_limit() {
+    let (dir, file) = scratch_file("size", EDIT_FIXTURE);
+    let o = run(&["scl", "edit", &file, "rename-ied", "Pub", "Bay1", "--max-size", "100"]);
+    assert!(!o.ok && o.stderr.contains("limit") && o.stdout.is_empty(), "{}", o.stderr);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn scl_edit_refuses_an_edit_that_adds_a_validation_error_unless_forced() {
+    let second = "\t\t\t\t<GSE ldInst=\"LD0\" cbName=\"gcb2\">\n\t\t\t\t\t<Address>\n\t\t\t\t\t\t<P type=\"MAC-Address\">01-0C-CD-01-00-01</P>\n\t\t\t\t\t\t<P type=\"APPID\">0002</P>\n\t\t\t\t\t</Address>\n\t\t\t\t</GSE>\n\t\t\t</ConnectedAP>\n\t\t\t<ConnectedAP iedName=\"Sub\"";
+    let text = EDIT_FIXTURE.replacen("\t\t\t</ConnectedAP>\n\t\t\t<ConnectedAP iedName=\"Sub\"", second, 1).replacen(
+        "\t\t\t\t\t\t</GSEControl>",
+        "\t\t\t\t\t\t</GSEControl>\n\t\t\t\t\t\t<GSEControl name=\"gcb2\" datSet=\"ds1\" appID=\"g2\" confRev=\"1\"/>",
+        1,
+    );
+    let (dir, file) = scratch_file("finding", &text);
+    let out = dir.join("out.scd");
+    let out = out.to_str().unwrap();
+    let o = run(&["scl", "edit", &file, "gse", "Pub", "LD0", "gcb2", "--appid", "0001", "-o", out]);
+    assert!(!o.ok && o.stderr.contains("DuplicateStream"), "{}", o.stderr);
+    assert!(!std::path::Path::new(out).exists(), "nothing is written");
+    let o = run(&["scl", "edit", &file, "gse", "Pub", "LD0", "gcb2", "--appid", "0001", "-o", out, "--force"]);
+    assert!(o.ok, "{}", o.stderr);
+    // The whole address is written: the VLAN fields the block lacked are added after APPID.
+    let written = std::fs::read_to_string(out).unwrap();
+    assert!(
+        written
+            .contains("<P type=\"APPID\">0001</P>\n\t\t\t\t\t\t<P type=\"VLAN-ID\">000</P>\n\t\t\t\t\t\t<P type=\"VLAN-PRIORITY\">4</P>\n\t\t\t\t\t</Address>"),
+        "{written}"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn scl_edit_in_place_is_atomic() {
+    let (dir, file) = scratch_file("inplace", EDIT_FIXTURE);
+    let o = run(&["scl", "edit", &file, "ap-address", "Pub", "AP1", "IP", "10.0.0.9", "--in-place"]);
+    assert!(o.ok, "{}", o.stderr);
+    assert!(std::fs::read_to_string(&file).unwrap().contains("<P type=\"IP\">10.0.0.9</P>"));
+    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert_eq!(left.len(), 1, "no temporary file is left behind: {left:?}");
+
+    // A write that cannot happen leaves the original byte for byte.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let before = std::fs::read(&file).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let o = run(&["scl", "edit", &file, "ap-address", "Pub", "AP1", "IP", "10.0.0.10", "--in-place"]);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!o.ok && o.stderr.contains("unchanged"), "{}", o.stderr);
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn scl_edit_dry_run_prints_a_diff_and_writes_nothing() {
+    let (dir, file) = scratch_file("dry", EDIT_FIXTURE);
+    let o = run(&["scl", "edit", &file, "rename-ied", "Sub", "Hmi", "--dry-run", "--in-place"]);
+    assert!(o.ok, "{}", o.stderr);
+    let removed = o.stdout.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
+    let added = o.stdout.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
+    assert_eq!((removed, added), (4, 4), "{}", o.stdout);
+    assert!(o.stdout.contains("+\t\t\t\t\t\t\t<IEDName>Hmi</IEDName>"), "{}", o.stdout);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), EDIT_FIXTURE);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn scl_edit_records_who_and_why_in_the_header_history() {
+    let (dir, file) = scratch_file("history", EDIT_FIXTURE);
+    let o = run(&["scl", "edit", &file, "ap-address", "Pub", "AP1", "IP", "10.0.0.9", "--who", "alice", "--why", "new subnet"]);
+    assert!(o.ok, "{}", o.stderr);
+    let items: Vec<_> = o.stdout.lines().filter(|l| l.contains("<Hitem ")).collect();
+    assert_eq!(items.len(), 1, "{}", o.stdout);
+    assert!(
+        items[0].contains("version=\"1\" revision=\"A\"") && items[0].contains("who=\"alice\" what=\"set IP of Pub/AP1\" why=\"new subnet\""),
+        "{}",
+        items[0]
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn scl_edit_reports_a_failed_edit_and_writes_nothing() {
+    let (dir, file) = scratch_file("fail", EDIT_FIXTURE);
+    for args in [vec!["rename-ied", "Nobody", "X"], vec!["rename-ied", "Pub", "Sub"], vec!["frobnicate"], vec!["rename-ied", "Pub"]] {
+        let mut full = vec!["scl", "edit", file.as_str()];
+        full.extend(&args);
+        full.push("--in-place");
+        let o = run(&full);
+        assert!(!o.ok, "{args:?} should fail");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), EDIT_FIXTURE, "{args:?}");
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// `ied mms put` sends a file to `ied sim --writable`, which stores it.
+#[test]
+fn put_sends_a_file_to_a_writable_simulator() {
+    use std::io::{BufRead, BufReader};
+
+    let dir = tempdir("put");
+    let scl = dir.join("relay.icd");
+    std::fs::write(&scl, include_str!("fixtures/relay.icd")).expect("write the file");
+    let store = dir.join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    let local = dir.join("settings.xml");
+    std::fs::write(&local, b"<settings/>").unwrap();
+
+    let mut child = Command::new(ied())
+        .args(["sim", scl.to_str().unwrap(), "--port", "0", "--files", store.to_str().unwrap(), "--writable", "--password", "s3cret"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sim");
+    let stdout = child.stdout.take().expect("stdout");
+    let lines: Vec<String> = BufReader::new(stdout).lines().map_while(Result::ok).take_while(|l| !l.starts_with("serving")).collect();
+    let addr = lines.iter().find(|l| l.contains(" on ")).and_then(|l| l.split_whitespace().nth(2)).expect("the address").to_string();
+    let refused = run(&["mms", "put", &addr, local.to_str().unwrap(), "settings.xml"]);
+    let sent = run(&["mms", "put", &addr, local.to_str().unwrap(), "settings.xml", "--password", "s3cret"]);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(!refused.ok, "no password, no association: {}", refused.stdout);
+    assert!(sent.ok, "{}{}", sent.stdout, sent.stderr);
+    assert_eq!(std::fs::read(store.join("settings.xml")).unwrap(), b"<settings/>");
+}
+
+/// `ied sim` refuses a `--files` directory that would expose the served SCL file or the log.
+#[test]
+fn sim_refuses_a_file_store_that_would_expose_its_own_files() {
+    let dir = tempdir("sim-guard");
+    let scl = dir.join("relay.icd");
+    std::fs::write(&scl, include_str!("fixtures/relay.icd")).unwrap();
+    let store = dir.join("store");
+    std::fs::create_dir_all(&store).unwrap();
+
+    let o = run(&["sim", scl.to_str().unwrap(), "--port", "0", "--files", dir.to_str().unwrap()]);
+    assert!(!o.ok && o.stderr.contains("would expose the SCL file"), "{}", o.stderr);
+
+    let log = store.join("relay.redb");
+    let o = run(&["sim", scl.to_str().unwrap(), "--port", "0", "--files", store.to_str().unwrap(), "--log-db", log.to_str().unwrap()]);
+    assert!(!o.ok && o.stderr.contains("would expose the log"), "{}", o.stderr);
+    assert!(!log.exists(), "refused before anything is opened");
+    std::fs::remove_dir_all(&dir).ok();
+}

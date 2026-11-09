@@ -88,11 +88,11 @@ const FUZZ_MODEL: &str = r#"<?xml version="1.0"?>
 fn every_goose_regression_still_decodes_without_panicking() {
     for file in corpus("goose_frame") {
         let data = std::fs::read(&file).unwrap();
-        if let Ok(frame) = iec61850_rs::proto::ethernet::Frame::parse(&data) {
-            if let Ok(pdu) = iec61850_rs::proto::goose::GoosePduView::parse(frame.apdu) {
-                let _ = pdu.all_data_owned(&Limits::DEFAULT);
-                let _ = pdu.member_count_matches();
-            }
+        if let Ok(frame) = iec61850_rs::proto::ethernet::Frame::parse(&data)
+            && let Ok(pdu) = iec61850_rs::proto::goose::GoosePduView::parse(frame.apdu)
+        {
+            let _ = pdu.all_data_owned(&Limits::DEFAULT);
+            let _ = pdu.member_count_matches();
         }
     }
 }
@@ -138,11 +138,11 @@ fn mms_stack(data: &[u8]) {
             if pdu.write(&mut re).is_ok() {
                 let _ = Tpdu::parse(&re);
             }
-            if let Tpdu::Data { eot, payload } = pdu {
-                if let Ok(Some(tsdu)) = reassembler.push(eot, payload) {
-                    decode_session(tsdu);
-                    reassembler.take();
-                }
+            if let Tpdu::Data { eot, payload } = pdu
+                && let Ok(Some(tsdu)) = reassembler.push(eot, payload)
+            {
+                decode_session(tsdu);
+                reassembler.take();
             }
         }
     }
@@ -155,22 +155,22 @@ fn mms_stack(data: &[u8]) {
         let re = m.to_vec().unwrap();
         let again = Mms::parse(&re, &Limits::DEFAULT).unwrap();
         assert_eq!(again.to_vec().unwrap(), re, "the MMS encoder must be a fixed point");
-        if let Mms::Unconfirmed(Unconfirmed::InformationReport { results, .. }) = &m {
-            if let Ok(report) = Report::parse(results, &Limits::DEFAULT) {
-                let values = report.to_values().expect("a decoded report must re-encode");
-                assert_eq!(Report::from_values(&values).unwrap(), report, "the report codec must be a fixed point");
-            }
+        if let Mms::Unconfirmed(Unconfirmed::InformationReport { results, .. }) = &m
+            && let Ok(report) = Report::parse(results, &Limits::DEFAULT)
+        {
+            let values = report.to_values().expect("a decoded report must re-encode");
+            assert_eq!(Report::from_values(&values).unwrap(), report, "the report codec must be a fixed point");
         }
     }
-    if let Ok(values) = iec61850_rs::proto::data::decode_all(data, &Limits::DEFAULT) {
-        if let Some(v) = values.first() {
-            if let Ok(r) = ControlRequest::from_value(v) {
-                assert_eq!(ControlRequest::from_value(&r.to_value()).unwrap(), r, "the control codec must be a fixed point");
-            }
-            if let Ok(e) = LastApplError::from_value(v) {
-                assert_eq!(LastApplError::from_value(&e.to_value()).unwrap(), e);
-            }
-            let _ = Report::from_values(&values);
+    if let Ok(values) = iec61850_rs::proto::data::decode_all(data, &Limits::DEFAULT)
+        && let Some(v) = values.first()
+    {
+        if let Ok(r) = ControlRequest::from_value(v) {
+            assert_eq!(ControlRequest::from_value(&r.to_value()).unwrap(), r, "the control codec must be a fixed point");
         }
+        if let Ok(e) = LastApplError::from_value(v) {
+            assert_eq!(LastApplError::from_value(&e.to_value()).unwrap(), e);
+        }
+        let _ = Report::from_values(&values);
     }
 }

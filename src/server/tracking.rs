@@ -17,10 +17,10 @@
 //!   block's attributes with a lower-case first letter — `rptID` for `RptID`, `actSG` for
 //!   `ActSG` — so the engine copies, for each attribute the *file* declares on the tracker,
 //!   the same-named attribute of the block in `objRef`. One rule instead of nine tables, and a
-//!   file that declares half a tracker gets half a tracker (D41). The rule has exactly one
+//!   file that declares half a tracker gets half a tracker. The rule has exactly one
 //!   exception, `gi` for `GI`, and [`block_attribute`] is where it lives.
 //! - **The ordinals come from the file.** The `serviceType` and `errorCode` names are IEC
-//!   61850-7-2's ✅ and their numbers IEC 61850-8-1's, behind the paywall (R2), so the server
+//!   61850-7-2's ✅ and their numbers IEC 61850-8-1's, behind the paywall, so the server
 //!   resolves a name against the file's own `EnumType` and falls back to the standard's list
 //!   order only when there is none.
 //!
@@ -157,7 +157,7 @@ impl Tracking {
     ///
     /// Only leaves the tracker actually declares are copied, and only when the block has one:
     /// a file whose `BTS` type omits `resvTms` gets a tracker without it rather than a server
-    /// that answers `object-non-existent` for half of what it publishes (D41).
+    /// that answers `object-non-existent` for half of what it publishes.
     fn mirror(ied: &mut Ied, tracker: &str, obj_ref: &str) {
         let names: Vec<String> = ied.leaves_of(tracker).iter().filter_map(|l| l.rsplit_once(tree_sep()).map(|(_, n)| String::from(n))).collect();
         for name in names {
@@ -219,8 +219,8 @@ fn write(ied: &mut Ied, tracker: &str, attribute: &str, value: Value) {
 
 /// The ordinal an enumeration name has **in this file**, or the standard's list position.
 ///
-/// The names are IEC 61850-7-2's ✅ and the numbers are IEC 61850-8-1's, which is paywalled
-/// (R2). A file that declares the `EnumType` has already answered the question, and answering
+/// The names are IEC 61850-7-2's ✅ and the numbers are IEC 61850-8-1's, which is paywalled.
+/// A file that declares the `EnumType` has already answered the question, and answering
 /// it a second way is how a server ends up disagreeing with its own engineering document.
 fn enum_ordinal(ied: &Ied, tracker: &str, attribute: &str, name: &str, fallback: i64) -> i64 {
     let reference = alloc::format!("{tracker}{}{attribute}", tree_sep());

@@ -485,17 +485,17 @@ fn check_sample_rate(
     }
     // A stream whose data set has no fixed-width layout cannot be published at all: the
     // ASDU length would change from sample to sample.
-    if let Some(name) = cb.dat_set.as_deref() {
-        if let Some(ds) = model.data_set(ln, name) {
-            if !ds.members.is_empty() && model.sv_sample_len(&ld.name, ds).is_none() {
-                error(
-                    report,
-                    FindingCode::SampleRate,
-                    at,
-                    alloc::format!("datSet `{name}` has no fixed-width sampled-value layout, so the ASDU has no constant length"),
-                );
-            }
-        }
+    if let Some(name) = cb.dat_set.as_deref()
+        && let Some(ds) = model.data_set(ln, name)
+        && !ds.members.is_empty()
+        && model.sv_sample_len(&ld.name, ds).is_none()
+    {
+        error(
+            report,
+            FindingCode::SampleRate,
+            at,
+            alloc::format!("datSet `{name}` has no fixed-width sampled-value layout, so the ASDU has no constant length"),
+        );
     }
 }
 
@@ -710,7 +710,8 @@ mod tests {
         assert_eq!(r.findings.iter().filter(|f| f.code == FindingCode::DuplicateTypeMember).count(), 1);
 
         // The same file with one declaration is clean.
-        assert!(validate(&scl(GOOD_GSE, GOOD_CB), 50, Edition::Ed2_1).unwrap().findings.is_empty());
+        let v = validate(&scl(GOOD_GSE, GOOD_CB), 50, Edition::Ed2_1).unwrap().findings;
+        assert!(v.is_empty(), "{v:?}");
     }
 
     #[test]

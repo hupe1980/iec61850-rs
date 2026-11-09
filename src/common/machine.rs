@@ -31,9 +31,20 @@ impl Instant {
     }
 }
 
+/// The process's monotonic clock as an [`Instant`]: nanoseconds since the first call.
+///
+/// One epoch for the whole process, so the server, the CLI and a live link agree on what an
+/// instant means. Only the I/O edges read it; the cores take `now` as an argument.
+#[cfg(feature = "std")]
+pub fn monotonic_now() -> Instant {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    Instant(EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
+}
+
 /// The two clocks a server needs at once, carried together so they cannot be swapped.
 ///
-/// There are exactly two kinds of time here and they answer different questions (D33):
+/// There are exactly two kinds of time here and they answer different questions:
 /// [`Now::mono`] is a monotonic [`Instant`] and is what every deadline, window and duration is
 /// measured on; [`Now::wall`] is an absolute [`UtcTime`] and is what every *published*
 /// timestamp carries — a report's `TimeOfEntry`, a log entry, an `SGCB`'s `LActTm`, the status

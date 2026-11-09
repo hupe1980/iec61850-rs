@@ -106,6 +106,26 @@ pub enum DecodeReason {
     NotProcessBusFrame,
 }
 
+/// The ISO 9506-2 name of a `ServiceError`'s `errorClass` tag ✅ (`mms.asn`).
+pub const fn service_error_class(class: u32) -> Option<&'static str> {
+    Some(match class {
+        0 => "vmd-state",
+        1 => "application-reference",
+        2 => "definition",
+        3 => "resource",
+        4 => "service",
+        5 => "service-preempt",
+        6 => "time-resolution",
+        7 => "access",
+        8 => "initiate",
+        9 => "conclude",
+        10 => "cancel",
+        11 => "file",
+        12 => "others",
+        _ => return None,
+    })
+}
+
 /// The ISO 9506-2 name of a `DataAccessError` code ✅ (`mms.asn`).
 ///
 /// A bare number is the most common thing a user of an IEC 61850 client is left holding, and
@@ -149,7 +169,10 @@ impl fmt::Display for Error {
             Error::InvalidValue(what) => write!(f, "invalid value: {what}"),
             Error::Scl(msg) => write!(f, "SCL: {msg}"),
             Error::Io(msg) => write!(f, "transport: {msg}"),
-            Error::Service { class, code } => write!(f, "MMS service error: class {class}, code {code}"),
+            Error::Service { class, code } => match service_error_class(*class) {
+                Some(name) => write!(f, "MMS service error: {name} (class {class}), code {code}"),
+                None => write!(f, "MMS service error: class {class}, code {code}"),
+            },
             Error::DataAccess(code) => match data_access_reason(*code) {
                 Some(name) => write!(f, "MMS data access error {code} ({name})"),
                 None => write!(f, "MMS data access error {code}"),

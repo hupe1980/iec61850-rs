@@ -60,7 +60,7 @@ struct Rcb {
     next_entry: u64,
     /// Whether the buffer dropped anything since the last report went out.
     overflowed: bool,
-    /// `SqNum` of the next report. Server-owned (D39) and **reset when the block is
+    /// `SqNum` of the next report. Server-owned (a client may not write it) and **reset when the block is
     /// enabled** (IEC 61850-7-2 §17.2.2), so a client that re-enables a block sees a
     /// sequence that starts again rather than one that carries a previous client's count.
     seq: u32,
@@ -594,7 +594,7 @@ fn assemble(
     // `segmentation` belongs to the **segmenter**, not to the configuration. SCL's `<OptFields>`
     // has the attribute and a file may set it, but a report that fits in one PDU carries no
     // `SubSeqNum` to go with it — and a flag promising a field that is not there is the one
-    // thing the decoder may not forgive (D28). [`segments`] sets it on the segments it makes.
+    // thing the decoder may not forgive. [`segments`] sets it on the segments it makes.
     let opt_flds = opt_flds.with_segmentation(false);
     // A member is included only when there is a *value* for it. A placeholder in a report is
     // a number the client will act on, so the inclusion bit string and the entries are built
@@ -646,10 +646,10 @@ pub const MIN_SEGMENT_BUDGET: usize = 512;
 /// the `segmentation` flag has to be set in the `OptFlds` the segments publish even when the
 /// control block's own `OptFlds` does not ask for it: it is the only thing that tells the
 /// client's decoder that the two values after `ConfRev` are a segment number and a flag
-/// rather than the inclusion bit string (D28).
+/// rather than the inclusion bit string.
 ///
-/// The alternative — dropping a report that does not fit — is what this server did before,
-/// and it is invisible: no error reaches the client, and the data set simply never reports.
+/// Dropping a report that does not fit instead would be invisible: no error reaches the
+/// client, and the data set simply never reports.
 fn segments(report: &Report, budget: usize) -> Vec<Vec<u8>> {
     match encode(report) {
         Ok(whole) if whole.len() <= budget => return alloc::vec![whole],
@@ -952,7 +952,8 @@ mod tests {
     /// A report with nothing in it is not a report, and no amount of splitting makes it one.
     #[test]
     fn an_empty_report_produces_nothing() {
-        assert!(segments(&report(0, &Value::Boolean(true)), 8).is_empty());
+        let v = segments(&report(0, &Value::Boolean(true)), 8);
+        assert!(v.is_empty(), "{v:?}");
     }
 
     /// The `AccessResult`s of an encoded `InformationReport`, as values.

@@ -571,6 +571,58 @@ fn an_application_hook_refuses_with_the_cause_it_chooses() {
     c.release().unwrap();
 }
 
+/// A refusal's `AddCause` goes out as the hook gave it, whatever edition is served.
+#[test]
+fn a_refusal_carries_its_add_cause_unmapped_at_every_edition() {
+    use iec61850_rs::client::{AddCause, ControlModel};
+    use iec61850_rs::common::Edition;
+    use iec61850_rs::model::IedModel;
+    use iec61850_rs::proto::data::Dbpos;
+    use iec61850_rs::server::Stage;
+
+    fn refused(edition: Edition, hook_cause: AddCause) -> AddCause {
+        let ied = Ied::with_edition(IedModel::from_scl(RELAY, Some("IED1")).expect("model"), edition).expect("ied");
+        let mut server = Server::bind("127.0.0.1:0", ied).expect("bind");
+        server.on_control(Box::new(move |event| if event.stage == Stage::Operate { Err(hook_cause) } else { Ok(()) }));
+        let addr = server.local_addr().unwrap().to_string();
+        std::thread::spawn(move || server.accept_one());
+        let mut c = Client::connect(&addr).expect("associate");
+        let e = c.control("IED1LD0/CSWI1.Pos").model(ControlModel::DirectNormal).execute(&Value::dbpos(Dbpos::On)).unwrap_err();
+        c.release().unwrap();
+        match e {
+            iec61850_rs::Error::ControlRejected { add_cause } => AddCause::from_code(add_cause),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    // Every cause goes out as it is, at every edition: which values Edition 1 defines is not
+    // established by any public source, and libiec61850 does not map either.
+    for edition in [Edition::Ed1, Edition::Ed2, Edition::Ed2_1] {
+        for cause in [AddCause::BlockedByInterlocking, AddCause::LockedByOtherClient, AddCause::ObjectAlreadySelected, AddCause::Other(40)] {
+            assert_eq!(refused(edition, cause), cause, "{cause:?} at {edition:?}");
+        }
+    }
+}
+
+/// The `errorClass` tags the server answers with are ISO 9506-2's: `definition [2]`,
+/// `resource [3]`, `service [4]`, `access [7]`, `file [11]` (Wireshark's `mms.asn`).
+#[test]
+fn service_error_classes_are_the_iso_9506_tags() {
+    use iec61850_rs::common::service_error_class;
+    use iec61850_rs::server::error_class;
+    for (class, name) in [
+        (error_class::DEFINITION, "definition"),
+        (error_class::RESOURCE, "resource"),
+        (error_class::SERVICE, "service"),
+        (error_class::ACCESS, "access"),
+        (error_class::FILE, "file"),
+    ] {
+        assert_eq!(service_error_class(class), Some(name));
+    }
+    let shown = iec61850_rs::Error::Service { class: 2, code: 0 }.to_string();
+    assert!(shown.contains("definition"), "{shown}");
+}
+
 /// A relay whose overcurrent pickup is a setting with four groups.
 const SETTINGS: &str = r#"<?xml version="1.0"?>
 <SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">
@@ -915,7 +967,7 @@ mod arrays {
     fn a_write_with_an_index_changes_one_element() {
         let (addr, handle) = spawn();
         let mut c = Client::connect(&addr).expect("associate");
-        // `MX` is a measurand and a client may not write one (D39), so this goes through the
+        // `MX` is a measurand and a client may not write one, so this goes through the
         // application's own path — which is the point of the test: the *reference* addresses
         // one element, whichever side writes it.
         handle.txn().set("IED1LD0/MHAI1$MX$HA$phsAHar(5)$cVal$ang$f", Value::Float32(-1.5)).commit();
@@ -988,7 +1040,7 @@ mod service_tracking {
         assert!(handle.read("IED1LD0/LLN0$SR$UrcbTrk$originatorID").is_some());
 
         // A **refused** service is the case tracking exists for. `SqNum` is the server's to
-        // count (D39), so writing it is an access violation — and the tracker says so.
+        // count, so writing it is an access violation — and the tracker says so.
         assert!(c.write("IED1LD0/LLN0$RP$urcb$SqNum", Fc::RP, &Value::Unsigned(9)).is_err());
         assert_eq!(ordinal(&handle, "UrcbTrk", "errorCode"), Some(2), "access-violation, as the file numbers it");
         c.release().unwrap();
@@ -1229,8 +1281,12 @@ mod publisher_control_blocks {
         assert_eq!(c.read("IED1LD0/LLN0$MS$msvMU$MsvID", Fc::MS).unwrap().as_str().map(str::to_owned), Some(String::from("MU01")));
         assert_eq!(c.read("IED1LD0/LLN0$US$usvMU$UsvID", Fc::US).unwrap().as_str().map(str::to_owned), Some(String::from("MU02")));
 
-        // Only the enable flag is a client's to write (D39) — the rest is engineering.
-        c.write("IED1LD0/LLN0$US$usvMU$SvEna", Fc::US, &Value::Boolean(true)).expect("SvEna is writable");
+        // Only the enable flag is a client's to write — the rest is engineering.
+        // `SvEna` passes the write policy; enabling it is refused with `object-value-invalid`
+        // (11), not `object-access-denied` (3), because this server cannot publish a unicast
+        // stream — saying so beats accepting the enable and sending nothing.
+        let enable = c.write("IED1LD0/LLN0$US$usvMU$SvEna", Fc::US, &Value::Boolean(true));
+        assert!(matches!(enable, Err(iec61850_rs::Error::DataAccess(11))), "{enable:?}");
         assert!(c.write("IED1LD0/LLN0$US$usvMU$SmpRate", Fc::US, &Value::Unsigned(96)).is_err(), "SmpRate is not");
         c.release().unwrap();
     }
@@ -1297,16 +1353,15 @@ fn the_vmd_answers_for_itself() {
 
 /// A `Cancel` for a request that is not outstanding is *answered*, not ignored.
 ///
-/// Before this it fell through to the unconfirmed catch-all and nothing was sent back, which
-/// is the reject defect (D35) on a different PDU: the peer waits out its whole request
-/// timeout for a reply that was never coming.
+/// A cancel that goes unanswered leaves the peer waiting out its whole request timeout for a
+/// reply that was never coming.
 #[test]
 fn a_cancel_for_a_finished_request_is_refused_rather_than_swallowed() {
     use iec61850_rs::common::{Instant, Limits};
     use iec61850_rs::proto::mms::association::{Association, AssociationConfig};
     use iec61850_rs::proto::mms::{Mms, ServiceError, service_error};
 
-    // Sans-IO, both roles, no socket: the association is its own test peer (D25).
+    // Sans-IO, both roles, no socket: the association is its own test peer.
     let mut client = Association::client(AssociationConfig::default());
     let mut server = Association::server(AssociationConfig::default());
     let mut now = Instant::ZERO;
@@ -1465,8 +1520,8 @@ mod functionally_constrained_data {
     }
 
     /// A report longer than what the client said it would accept is **segmented**, not
-    /// dropped. Before this the server encoded it whole, the association refused to frame it,
-    /// and the client waited for a report that was never sent and never reported missing.
+    /// dropped: a report the association cannot frame is never sent and never reported
+    /// missing.
     #[test]
     fn a_report_too_large_for_the_negotiated_pdu_is_split_into_segments() {
         let (addr, handle) = spawn(1);
@@ -1572,7 +1627,7 @@ mod report_engine {
         };
         assert_eq!(report.time_of_entry, Some(wall));
         assert_eq!(report.time_of_entry.map(EntryTime::to_unix_millis), Some(WALL_MS));
-        assert_ne!(report.time_of_entry, Some(EntryTime::default()), "1984-01-01 is what the monotonic instant used to produce");
+        assert_ne!(report.time_of_entry, Some(EntryTime::default()), "1984-01-01 would mean the monotonic instant was published");
     }
 
     /// IEC 61850-8-1 reports every `InformationReport` under the VMD-specific name `RPT`;
@@ -1582,7 +1637,7 @@ mod report_engine {
     #[test]
     fn a_report_is_reported_under_the_name_the_mapping_gives_it() {
         let (mut ied, mut engine) = enabled();
-        // Exactly what an engineer writes in the SCD, and what used to break the encoding.
+        // Exactly what an engineer writes in the SCD.
         ied.write_leaf(&format!("{BLOCK}$RptID"), Value::VisibleString("Trip report".into())).expect("write RptID");
         ied.take_dirty();
         ied.write_leaf(MEMBER, Value::Boolean(true)).expect("write");
@@ -1602,10 +1657,9 @@ mod report_engine {
     }
 
     /// The engine writes `SqNum`, `EntryID` and `TimeOfEntry` back into the model as it
-    /// publishes. It used to clear the *whole* dirty set afterwards to stop those counters
-    /// triggering another report — which also threw away any application write that had
-    /// landed in between. With more than one association that is a race, and the write is
-    /// lost from the report **and** from the log.
+    /// publishes, and those counters must not trigger another report — but clearing the
+    /// *whole* dirty set to stop them would throw away an application write that landed in
+    /// between, losing it from the report **and** from the log.
     #[test]
     fn publishing_a_report_does_not_swallow_a_write_that_has_not_been_committed() {
         let (mut ied, mut engine) = enabled();
@@ -1654,10 +1708,9 @@ mod controls {
         r.to_value()
     }
 
-    /// The status timestamp an operate writes is a **date**. It used to be the monotonic
-    /// instant reinterpreted as a Unix time, which put every operated breaker's `Pos.t` a few
-    /// microseconds after 1970-01-01 — the same defect as the report engine's `TimeOfEntry`,
-    /// in a fourth place (D33).
+    /// The status timestamp an operate writes is a **date** from the wall clock, not the
+    /// monotonic instant reinterpreted as a Unix time (which would put `Pos.t` just after
+    /// 1970-01-01).
     #[test]
     fn an_operate_stamps_the_status_with_the_wall_clock() {
         let (mut ied, mut controls) = (model(), Controls::default());
@@ -1669,8 +1722,8 @@ mod controls {
     }
 
     /// IEC 61850-7-2 time-activated operate: an `operTm` in the future arms the command
-    /// instead of running it. The server used to ignore `operTm` and operate immediately —
-    /// which is the one behaviour a time-activated command must not have.
+    /// instead of running it; operating immediately is the one behaviour a time-activated
+    /// command must not have.
     #[test]
     fn an_operate_with_a_future_oper_tm_waits_for_it() {
         let (mut ied, mut controls) = (model(), Controls::default());
@@ -2088,7 +2141,7 @@ fn a_goose_subscription_is_supervised_by_the_lgos_the_file_declares() {
 
     // A poll that changes nothing writes nothing, so a supervision loop does not make every
     // report control block fire once a second.
-    assert!(handle.txn().supervise(LGOS, &SubscriptionStatus::from_goose(&sub)).commit().is_empty());
+    assert_eq!(handle.txn().supervise(LGOS, &SubscriptionStatus::from_goose(&sub)).commit(), Vec::<Result<(), i64>>::new());
     assert!(c.next_report(Duration::from_millis(150)).expect("poll").is_none(), "an unchanged status is not an event");
 
     // Which LGOS supervises which subscription is **engineering**, so it comes out of the
@@ -2115,7 +2168,7 @@ fn a_goose_subscription_is_supervised_by_the_lgos_the_file_declares() {
 }
 
 /// The log's entries live behind a trait, so an IED that must survive a restart replaces a
-/// backend rather than the engine (D5).
+/// backend rather than the engine.
 ///
 /// This is the seam, exercised: a store of the caller's own is written to by the trigger
 /// evaluation and read back by both ACSI queries, with nothing above the trait changed.
@@ -2124,7 +2177,7 @@ fn a_log_is_served_out_of_whatever_store_the_application_supplies() {
     use std::sync::{Arc, Mutex};
 
     use iec61850_rs::common::EntryTime;
-    use iec61850_rs::server::{Entry, LogBounds, LogStore, MemoryLog, NewEntry};
+    use iec61850_rs::server::{Entry, LogBounds, LogError, LogPage, LogStore, MemoryLog, NewEntry};
 
     /// A store that keeps everything and counts what it was asked, so the test can see that
     /// the engine really does go through it rather than round it.
@@ -2138,32 +2191,48 @@ fn a_log_is_served_out_of_whatever_store_the_application_supplies() {
     #[derive(Debug, Clone, Default)]
     struct Shared(Arc<Mutex<Counting>>);
 
+    impl Shared {
+        fn lock(&self) -> Result<std::sync::MutexGuard<'_, Counting>, LogError> {
+            self.0.lock().map_err(|_| LogError::Storage("poisoned".into()))
+        }
+    }
+
     impl LogStore for Shared {
-        fn append(&mut self, _log: &str, entry: NewEntry) -> Option<LogBounds> {
-            let mut g = self.0.lock().ok()?;
+        fn append(&mut self, _log: &str, entry: NewEntry) -> Result<LogBounds, LogError> {
+            let mut g = self.lock()?;
             g.appends += 1;
             let entry_id = g.entries.len() as u64 + 1;
             g.entries.push(Entry { entry_id, occurred: entry.occurred, values: entry.values, reason: entry.reason });
-            let oldest = g.entries.first().map(|e| (e.entry_id, e.occurred))?;
-            Some(LogBounds { oldest, newest: (entry_id, entry.occurred) })
+            let oldest = g.entries.first().map(|e| (e.entry_id, e.occurred)).ok_or(LogError::UnknownLog)?;
+            Ok(LogBounds { oldest, newest: (entry_id, entry.occurred) })
         }
 
-        fn by_time(&self, _log: &str, from: Option<EntryTime>, to: Option<EntryTime>, limit: usize) -> (Vec<Entry>, bool) {
-            let Ok(mut g) = self.0.lock() else { return (Vec::new(), false) };
+        fn by_time(&self, _log: &str, from: Option<EntryTime>, to: Option<EntryTime>, limit: usize) -> Result<LogPage, LogError> {
+            let mut g = self.lock()?;
             g.queries += 1;
-            let all: Vec<Entry> =
+            let entries =
                 g.entries.iter().filter(|e| from.is_none_or(|f| e.occurred >= f) && to.is_none_or(|t| e.occurred <= t)).take(limit).cloned().collect();
-            (all, false)
+            Ok(LogPage { entries, more: false })
         }
 
-        fn after_entry(&self, _log: &str, entry_id: u64, _at: EntryTime, limit: usize) -> (Vec<Entry>, bool) {
-            let Ok(mut g) = self.0.lock() else { return (Vec::new(), false) };
+        fn after_entry(&self, _log: &str, entry_id: u64, _at: EntryTime, limit: usize) -> Result<LogPage, LogError> {
+            let mut g = self.lock()?;
             g.queries += 1;
-            (g.entries.iter().filter(|e| e.entry_id > entry_id).take(limit).cloned().collect(), false)
+            Ok(LogPage { entries: g.entries.iter().filter(|e| e.entry_id > entry_id).take(limit).cloned().collect(), more: false })
         }
 
-        fn len(&self, _log: &str) -> usize {
-            self.0.lock().map(|g| g.entries.len()).unwrap_or_default()
+        fn bounds(&self, _log: &str) -> Result<Option<LogBounds>, LogError> {
+            let g = self.lock()?;
+            Ok(g.entries.first().zip(g.entries.last()).map(|(o, n)| LogBounds { oldest: (o.entry_id, o.occurred), newest: (n.entry_id, n.occurred) }))
+        }
+
+        fn len(&self, _log: &str) -> Result<usize, LogError> {
+            Ok(self.lock()?.entries.len())
+        }
+
+        fn purge(&mut self, _log: &str) -> Result<(), LogError> {
+            self.lock()?.entries.clear();
+            Ok(())
         }
     }
 
@@ -2202,6 +2271,435 @@ fn a_log_is_served_out_of_whatever_store_the_application_supplies() {
     // A log the model declares but nothing has written to is an **empty** log, not a missing
     // one: the model decides what exists, the store decides what is in it.
     let empty = MemoryLog::for_logs(["IED1LD0/LLN0$GeneralLog".to_string()], 8);
-    assert_eq!(empty.len("IED1LD0/LLN0$GeneralLog"), 0);
+    assert_eq!(empty.len("IED1LD0/LLN0$GeneralLog"), Ok(0));
     c.release().unwrap();
+}
+
+/// ACSI `SetFile` (MMS `ObtainFile`): the server reads a file from the client on the same
+/// association, and the store takes it only whole, only where it may, and only from a client
+/// the policy admits.
+mod set_file {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant as StdInstant};
+
+    use iec61850_rs::Error;
+    use iec61850_rs::client::{Client, ClientConfig};
+    use iec61850_rs::proto::mms::association::{Association, AssociationConfig, AssociationEvent};
+    use iec61850_rs::proto::mms::file::{FileAttributes, FileNameBuf};
+    use iec61850_rs::proto::mms::{ConfirmedRequest, ConfirmedResponse, Mms, file_error};
+    use iec61850_rs::server::{AcsiConfig, DirectoryStore, FileWritePolicy, Ied, Server, ServerConfig};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("iec61850-setfile-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("SETTINGS")).expect("create");
+        dir
+    }
+
+    /// A server on `store` with `policy`, accepting `clients` associations.
+    fn serve(store: DirectoryStore, policy: FileWritePolicy, password: Option<&str>, tune: impl FnOnce(&mut AcsiConfig), clients: usize) -> String {
+        let mut acsi = AcsiConfig { file_write: policy, ..AcsiConfig::default() };
+        tune(&mut acsi);
+        let mut cfg = ServerConfig { acsi, ..ServerConfig::default() };
+        cfg.association.password = password.map(String::from);
+        let mut server = Server::bind_with("127.0.0.1:0", Ied::from_scl(super::RELAY, Some("IED1")).expect("load"), &cfg).expect("bind");
+        server.set_file_store(Box::new(store));
+        let addr = server.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for _ in 0..clients {
+                if server.accept_one().is_err() {
+                    return;
+                }
+            }
+        });
+        addr
+    }
+
+    fn code(e: &Error) -> Option<(u32, i64)> {
+        match e {
+            Error::Service { class, code } => Some((*class, *code)),
+            _ => None,
+        }
+    }
+
+    /// Nothing named `.iec61850-incoming-*` (or anything else hidden) is left in `dir`.
+    fn no_leftovers(dir: &Path) {
+        let left: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with('.')).collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+    }
+
+    /// A writable store is not permission: `FileDelete` obeys the same policy as `SetFile`.
+    #[test]
+    fn file_delete_obeys_the_file_write_policy() {
+        let dir = scratch("delete");
+        let victim = dir.join("SETTINGS/victim.xml");
+        for (policy, password, login, allowed) in [
+            (FileWritePolicy::Off, None, None, false),
+            (FileWritePolicy::Authenticated, None, None, false),
+            (FileWritePolicy::Authenticated, Some("s3cret"), Some("s3cret"), true),
+            (FileWritePolicy::Anyone, None, None, true),
+        ] {
+            std::fs::write(&victim, b"keep").unwrap();
+            let addr = serve(DirectoryStore::new(&dir).writable(), policy, password, |_| {}, 1);
+            let mut cfg = ClientConfig::default();
+            cfg.association.password = login.map(String::from);
+            let mut c = Client::connect_with(&addr, &cfg).expect("associate");
+            let deleted = c.delete_file("SETTINGS/victim.xml");
+            assert_eq!(deleted.is_ok(), allowed, "{policy:?}: {deleted:?}");
+            assert_eq!(victim.exists(), !allowed, "{policy:?}");
+            c.release().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The server's own files — its log, its SCL file — are invisible to clients even when they
+    /// lie under the store's root, and cannot be replaced by `SetFile`.
+    #[test]
+    fn a_hidden_file_is_not_listed_read_deleted_or_replaced() {
+        let dir = scratch("hidden");
+        std::fs::write(dir.join("SETTINGS/server.redb"), b"log").unwrap();
+        std::fs::write(dir.join("SETTINGS/public.xml"), b"pub").unwrap();
+        let store = DirectoryStore::new(&dir).writable().allow_overwrite().hiding(dir.join("SETTINGS/server.redb"));
+        let addr = serve(store, FileWritePolicy::Anyone, None, |_| {}, 1);
+        let mut c = Client::connect(&addr).unwrap();
+        let names: Vec<String> = c.file_directory(None).unwrap().into_iter().map(|f| f.name).collect();
+        assert!(names.iter().any(|n| n == "SETTINGS/public.xml"), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("server.redb")), "{names:?}");
+        assert!(c.read_file("SETTINGS/server.redb", 1 << 20).is_err());
+        assert!(c.delete_file("SETTINGS/server.redb").is_err());
+        assert!(c.set_file("SETTINGS/server.redb", b"evil").is_err());
+        assert_eq!(std::fs::read(dir.join("SETTINGS/server.redb")).unwrap(), b"log", "untouched");
+        c.release().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_client_sends_a_file_and_the_server_stores_it_byte_for_byte() {
+        let dir = scratch("happy");
+        let addr = serve(DirectoryStore::new(&dir).writable(), FileWritePolicy::Anyone, None, |_| {}, 1);
+        let body: Vec<u8> = (0..20_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let mut c = Client::connect(&addr).expect("associate");
+        c.set_file("SETTINGS/new.xml", &body).expect("SetFile");
+        assert_eq!(std::fs::read(dir.join("SETTINGS/new.xml")).unwrap(), body, "byte for byte, over many FileReads");
+        // …and the server serves it back.
+        assert_eq!(c.read_file("SETTINGS/new.xml", 1 << 20).unwrap(), body);
+        c.release().unwrap();
+        no_leftovers(&dir.join("SETTINGS"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_destination_the_store_should_not_take_is_refused() {
+        let dir = scratch("refuse");
+        std::fs::write(dir.join("SETTINGS/existing.xml"), b"keep").unwrap();
+
+        // The default: nobody may send a file.
+        let addr = serve(DirectoryStore::new(&dir).writable(), FileWritePolicy::Off, None, |_| {}, 1);
+        let mut c = Client::connect(&addr).unwrap();
+        assert_eq!(code(&c.set_file("SETTINGS/x", b"x").unwrap_err()), Some((11, file_error::FILE_ACCESS_DENIED)));
+        c.release().unwrap();
+
+        // A read-only store under an open policy.
+        let addr = serve(DirectoryStore::new(&dir), FileWritePolicy::Anyone, None, |_| {}, 1);
+        let mut c = Client::connect(&addr).unwrap();
+        assert_eq!(code(&c.set_file("SETTINGS/x", b"x").unwrap_err()), Some((11, file_error::FILE_ACCESS_DENIED)));
+        c.release().unwrap();
+
+        let addr = serve(DirectoryStore::new(&dir).writable().with_limits(100, 1 << 20), FileWritePolicy::Anyone, None, |_| {}, 1);
+        let mut c = Client::connect(&addr).unwrap();
+        for bad in ["../escape", "/etc/escape", "SETTINGS/.hidden", "SETTINGS/../escape", "C:/escape"] {
+            assert_eq!(code(&c.set_file(bad, b"x").unwrap_err()), Some((11, file_error::FILENAME_SYNTAX_ERROR)), "{bad}");
+        }
+        assert_eq!(code(&c.set_file("SETTINGS/existing.xml", b"new").unwrap_err()), Some((11, file_error::DUPLICATE_FILENAME)));
+        assert_eq!(code(&c.set_file("SETTINGS/big", &[0u8; 101]).unwrap_err()), Some((11, file_error::INSUFFICIENT_SPACE)));
+        // The association is still good after every refusal.
+        c.set_file("SETTINGS/small", &[1u8; 100]).expect("within the limit");
+        c.release().unwrap();
+        assert_eq!(std::fs::read(dir.join("SETTINGS/existing.xml")).unwrap(), b"keep");
+        assert!(!dir.parent().unwrap().join("escape").exists() && !Path::new("/etc/escape").exists());
+        no_leftovers(&dir.join("SETTINGS"));
+
+        // With overwrite allowed, the existing file is replaced whole.
+        let addr = serve(DirectoryStore::new(&dir).writable().allow_overwrite(), FileWritePolicy::Anyone, None, |_| {}, 1);
+        let mut c = Client::connect(&addr).unwrap();
+        c.set_file("SETTINGS/existing.xml", b"replaced").unwrap();
+        c.release().unwrap();
+        assert_eq!(std::fs::read(dir.join("SETTINGS/existing.xml")).unwrap(), b"replaced");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_an_authenticated_association_may_send_a_file_under_authenticated() {
+        let dir = scratch("auth");
+        // A server with no password authenticates nobody, so `Authenticated` admits nobody.
+        let addr = serve(DirectoryStore::new(&dir).writable(), FileWritePolicy::Authenticated, None, |_| {}, 1);
+        let mut c = Client::connect(&addr).unwrap();
+        assert_eq!(code(&c.set_file("SETTINGS/x", b"x").unwrap_err()), Some((11, file_error::FILE_ACCESS_DENIED)));
+        c.release().unwrap();
+
+        // With a password, a client without it cannot even associate; one with it may send.
+        let addr = serve(DirectoryStore::new(&dir).writable(), FileWritePolicy::Authenticated, Some("s3cret"), |_| {}, 3);
+        assert!(Client::connect(&addr).is_err(), "no password, no association");
+        let mut wrong = ClientConfig::default();
+        wrong.association.password = Some(String::from("guess"));
+        assert!(Client::connect_with(&addr, &wrong).is_err(), "a wrong password is refused too");
+        let mut right = ClientConfig::default();
+        right.association.password = Some(String::from("s3cret"));
+        let mut c = Client::connect_with(&addr, &right).expect("the right password associates");
+        c.set_file("SETTINGS/authorised.xml", b"ok").expect("authenticated SetFile");
+        c.release().unwrap();
+        assert_eq!(std::fs::read(dir.join("SETTINGS/authorised.xml")).unwrap(), b"ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A raw association that sends `ObtainFile`, answers the server's `FileOpen` with a large
+    /// size, and then never answers again. Returns when the server answers the `ObtainFile`,
+    /// with that answer and how long it took.
+    fn stall(addr: &str) -> (Vec<u8>, Duration) {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let epoch = StdInstant::now();
+        let now = || iec61850_rs::common::Instant(u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        let mut a = Association::client(AssociationConfig::default());
+        a.start(now()).unwrap();
+        let mut buf = vec![0u8; 8192];
+        let mut obtain = None;
+        let mut started = None;
+        loop {
+            while let Some(p) = a.poll_transmit() {
+                stream.write_all(p).unwrap();
+            }
+            match stream.read(&mut buf) {
+                Ok(0) => panic!("the server closed the association"),
+                Ok(n) => a.on_bytes(now(), &buf[..n]),
+                Err(_) => a.on_timeout(now()),
+            }
+            while let Some(e) = a.poll_event() {
+                match e {
+                    AssociationEvent::Established(_) => {
+                        let source = FileNameBuf::from_path("slow.bin").unwrap();
+                        let dest = FileNameBuf::from_path("SETTINGS/slow.bin").unwrap();
+                        obtain = Some(
+                            a.call(now(), &ConfirmedRequest::ObtainFile { source_server: None, source: source.as_name(), destination: dest.as_name() })
+                                .unwrap(),
+                        );
+                        started = Some(StdInstant::now());
+                    }
+                    AssociationEvent::Request { invoke_id, pdu } => {
+                        // Answer the open, then go silent.
+                        if let Ok(Mms::ConfirmedRequest { service: ConfirmedRequest::FileOpen { .. }, .. }) =
+                            Mms::parse(&pdu, &iec61850_rs::common::Limits::DEFAULT)
+                        {
+                            let open = ConfirmedResponse::FileOpen { frsm_id: 1, attributes: FileAttributes { size: 1000, last_modified: None } };
+                            a.respond(invoke_id, &open).unwrap();
+                        }
+                    }
+                    AssociationEvent::Response { invoke_id, pdu } if Some(invoke_id) == obtain => {
+                        return (pdu, started.map_or(Duration::ZERO, |s| s.elapsed()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_client_that_stalls_fails_only_its_own_transfer() {
+        let dir = scratch("stall");
+        let addr = serve(
+            DirectoryStore::new(&dir).writable(),
+            FileWritePolicy::Anyone,
+            None,
+            |c| {
+                c.obtain_timeout_ms = 600;
+                c.max_obtains = 1;
+            },
+            3,
+        );
+        let staller = {
+            let addr = addr.clone();
+            std::thread::spawn(move || stall(&addr))
+        };
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Meanwhile another client is served promptly — and the one transfer slot is taken.
+        let mut other = Client::connect(&addr).unwrap();
+        for _ in 0..10 {
+            let t = StdInstant::now();
+            other.read("IED1LD0/MMXU1.TotW.mag.f", iec61850_rs::Fc::MX).expect("read during the stalled transfer");
+            assert!(t.elapsed() < Duration::from_millis(300), "a read took {:?} while another client stalled", t.elapsed());
+        }
+        assert_eq!(code(&other.set_file("SETTINGS/second", b"x").unwrap_err()), Some((11, file_error::FILE_BUSY)), "max_obtains is 1");
+
+        let (answer, took) = staller.join().unwrap();
+        let parsed = Mms::parse(&answer, &iec61850_rs::common::Limits::DEFAULT).unwrap();
+        assert!(matches!(parsed, Mms::ConfirmedError { .. }), "the stalled ObtainFile is answered with an error: {parsed:?}");
+        assert!(took >= Duration::from_millis(500) && took < Duration::from_secs(5), "after obtain_timeout_ms, not before and not never: {took:?}");
+        // The slot is free again, and nothing was left behind.
+        other.set_file("SETTINGS/after", b"y").expect("the slot is free once the stalled transfer ended");
+        other.release().unwrap();
+        assert!(!dir.join("SETTINGS/slow.bin").exists());
+        no_leftovers(&dir.join("SETTINGS"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A client that disappears in the middle of a transfer leaves no file and no temporary.
+    #[test]
+    fn a_transfer_whose_association_closes_leaves_nothing() {
+        use std::io::{Read, Write};
+        let dir = scratch("closed");
+        let addr = serve(DirectoryStore::new(&dir).writable(), FileWritePolicy::Anyone, None, |_| {}, 1);
+        {
+            let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+            stream.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            let epoch = StdInstant::now();
+            let now = || iec61850_rs::common::Instant(u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            let mut a = Association::client(AssociationConfig::default());
+            a.start(now()).unwrap();
+            let mut buf = vec![0u8; 8192];
+            let deadline = StdInstant::now() + Duration::from_secs(5);
+            let mut reached_read = false;
+            'talk: while StdInstant::now() < deadline {
+                while let Some(p) = a.poll_transmit() {
+                    stream.write_all(p).unwrap();
+                }
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => a.on_bytes(now(), &buf[..n]),
+                    Err(_) => a.on_timeout(now()),
+                }
+                while let Some(e) = a.poll_event() {
+                    match e {
+                        AssociationEvent::Established(_) => {
+                            let source = FileNameBuf::from_path("gone.bin").unwrap();
+                            let dest = FileNameBuf::from_path("SETTINGS/gone.bin").unwrap();
+                            a.call(now(), &ConfirmedRequest::ObtainFile { source_server: None, source: source.as_name(), destination: dest.as_name() })
+                                .unwrap();
+                        }
+                        AssociationEvent::Request { invoke_id, pdu } => {
+                            if let Ok(Mms::ConfirmedRequest { service: ConfirmedRequest::FileOpen { .. }, .. }) =
+                                Mms::parse(&pdu, &iec61850_rs::common::Limits::DEFAULT)
+                            {
+                                a.respond(
+                                    invoke_id,
+                                    &ConfirmedResponse::FileOpen { frsm_id: 1, attributes: FileAttributes { size: 100, last_modified: None } },
+                                )
+                                .unwrap();
+                            }
+                            if let Ok(Mms::ConfirmedRequest { service: ConfirmedRequest::FileRead(_), .. }) =
+                                Mms::parse(&pdu, &iec61850_rs::common::Limits::DEFAULT)
+                            {
+                                // Half the file, then the connection drops.
+                                a.respond(invoke_id, &ConfirmedResponse::FileRead { data: &[7u8; 50], more_follows: true }).unwrap();
+                                while let Some(p) = a.poll_transmit() {
+                                    stream.write_all(p).unwrap();
+                                }
+                                reached_read = true;
+                                break 'talk;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert!(reached_read, "the server never reached FileRead, so nothing was tested");
+        } // dropped: the TCP connection closes mid-transfer
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!dir.join("SETTINGS/gone.bin").exists(), "a half-received file was published");
+        no_leftovers(&dir.join("SETTINGS"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An `ObtainFile` naming a third party as the source is refused before any request goes out.
+    #[test]
+    fn a_third_party_source_is_refused_before_anything_is_sent() {
+        use iec61850_rs::common::Instant;
+        use iec61850_rs::proto::mms::obtain_file_error;
+        use iec61850_rs::server::{Acsi, Answer};
+        let dir = scratch("third");
+        let cfg = AcsiConfig { file_write: FileWritePolicy::Anyone, ..AcsiConfig::default() };
+        let mut acsi = Acsi::with_config(Ied::from_scl(super::RELAY, Some("IED1")).unwrap(), cfg);
+        acsi.set_file_store(Box::new(DirectoryStore::new(&dir).writable()));
+        let source = FileNameBuf::from_path("payload").unwrap();
+        let dest = FileNameBuf::from_path("SETTINGS/payload").unwrap();
+        let answer = acsi.request(
+            1,
+            Instant::ZERO,
+            &ConfirmedRequest::ObtainFile { source_server: Some(&[0xa2, 0x02, 0x06, 0x00]), source: source.as_name(), destination: dest.as_name() },
+        );
+        assert_eq!(answer, Answer::ObtainFileError { class: 11, code: file_error::FILE_ACCESS_DENIED, side: obtain_file_error::SOURCE_FILE });
+        assert!(acsi.obtain_call(1).is_none(), "no request toward anyone");
+        no_leftovers(&dir.join("SETTINGS"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A server that asks this client for a different file during `set_file` is refused, and
+    /// gets no octet of anything but the file that was offered.
+    #[test]
+    fn a_server_asking_for_another_file_gets_nothing() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            let epoch = StdInstant::now();
+            let now = || iec61850_rs::common::Instant(u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            let mut a = Association::server(AssociationConfig::default());
+            let mut buf = vec![0u8; 8192];
+            let mut obtain = None;
+            let mut probes = Vec::new();
+            let mut answers = Vec::new();
+            let deadline = StdInstant::now() + Duration::from_secs(5);
+            while StdInstant::now() < deadline && answers.len() < 2 {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => a.on_bytes(now(), &buf[..n]),
+                    Err(_) => a.on_timeout(now()),
+                }
+                while let Some(e) = a.poll_event() {
+                    match e {
+                        AssociationEvent::Request { invoke_id, pdu } => {
+                            if let Ok(Mms::ConfirmedRequest { service: ConfirmedRequest::ObtainFile { .. }, .. }) =
+                                Mms::parse(&pdu, &iec61850_rs::common::Limits::DEFAULT)
+                            {
+                                obtain = Some(invoke_id);
+                                // Ask for a file the client never offered, then for one by a sneaky path.
+                                for name in ["/etc/passwd", "../offered.bin"] {
+                                    let n = FileNameBuf::from_path(name).unwrap();
+                                    probes.push(a.call(now(), &ConfirmedRequest::FileOpen { name: n.as_name(), position: 0 }).unwrap());
+                                }
+                            }
+                        }
+                        AssociationEvent::Response { invoke_id, pdu } if probes.contains(&invoke_id) => answers.push(pdu),
+                        _ => {}
+                    }
+                }
+                while let Some(p) = a.poll_transmit() {
+                    stream.write_all(p).unwrap();
+                }
+            }
+            // End the client's SetFile with a refusal so the call returns.
+            if let Some(invoke) = obtain {
+                let refusal = iec61850_rs::proto::mms::ServiceError::encode(iec61850_rs::ber::Tag::context_constructed(2), 11, file_error::OTHER).unwrap();
+                let error = iec61850_rs::ber::Cursor::new(&refusal).next_required().unwrap();
+                a.send(&Mms::ConfirmedError { invoke_id: invoke, modifier_position: None, error }).unwrap();
+                while let Some(p) = a.poll_transmit() {
+                    stream.write_all(p).unwrap();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            answers
+        });
+        let mut c = Client::connect(&addr).expect("associate");
+        let result = c.set_file("offered.bin", b"the only file on offer");
+        assert!(result.is_err(), "the server refused at the end");
+        let answers = server.join().unwrap();
+        assert_eq!(answers.len(), 2, "both probes were answered");
+        for pdu in answers {
+            let parsed = Mms::parse(&pdu, &iec61850_rs::common::Limits::DEFAULT).unwrap();
+            assert!(matches!(parsed, Mms::ConfirmedError { .. }), "a probe was served: {parsed:?}");
+        }
+    }
 }

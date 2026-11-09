@@ -1,17 +1,18 @@
 [package]
 name = "iec61850-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
+authors = ["hupe1980"]
 license = "MIT OR Apache-2.0"
-description = "IEC 61850 in Rust: GOOSE, Sampled Values, an MMS client over the whole OSI station-bus stack, and SCL — memory-safe, sans-IO cores, no async runtime, process-bus grade."
+description = "IEC 61850 in Rust: GOOSE and Sampled Values on capture files and live interfaces, an MMS client and server over the full OSI stack, and SCL loading and editing. Panic-free, sans-IO, no_std-capable."
 repository = "https://github.com/hupe1980/iec61850-rs"
 keywords = ["iec61850", "goose", "sampled-values", "mms", "substation"]
 categories = ["network-programming", "embedded", "no-std"]
 readme = "README.md"
-# Only the library, its tests and the two licences are published. The site, the internal
-# notes, the downloaded standards material and the fuzz harness are not part of the crate.
-exclude = ["specs/", "concepts/", "fuzz/", "site/", ".github/", "scripts/"]
+# Git-ignored files are never packaged; of the tracked ones, the site, the fuzz harness, CI and
+# the scripts are left out too.
+exclude = ["fuzz/", "site/", ".github/", "scripts/"]
 
 [lib]
 name = "iec61850_rs"
@@ -24,35 +25,44 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["std", "goose", "sv", "mms", "scl", "pcap", "client", "server"]
-# The crate is `no_std` + `alloc` everywhere: the codecs, the state machines and the model
-# all need an allocator, and there is no configuration in which they do not, so `alloc` is
-# not a feature that can be switched off. `std` adds file and socket-facing surface.
+# The crate is `no_std` + `alloc` everywhere; `alloc` is not optional. `std` adds the file- and
+# socket-facing surface.
 std = []
 # Process-bus codecs, publisher scheduler and subscriber state machines (no_std + alloc).
 goose = []
 sv = []
-# The OSI stack of IEC 61850-8-1 (TPKT, COTP, session, presentation, ACSE) and the MMS PDUs
-# that ride on it. Codecs and framing only — the client and server state machines are next.
+# The OSI stack of IEC 61850-8-1 (TPKT, COTP, session, presentation, ACSE), the MMS PDUs and
+# the sans-IO association state machine in both roles (no_std + alloc).
 mms = []
 # SCL loading into an IED model descriptor (needs std).
 scl = ["std", "dep:roxmltree"]
 # Reading and writing classic pcap files (needs std).
 pcap = ["std"]
-# A blocking MMS client over TCP: the association state machine plus a socket, no runtime
-# and no dependency. The sans-IO core is what an async wrapper would be written against.
+# A blocking MMS client over TCP: the association state machine plus a socket, no runtime.
 client = ["std", "mms"]
-# A blocking MMS server over TCP: the same association state machine in the server role, the
-# IED model from SCL as the served namespace, and the ACSI services above it. Sans-IO core,
-# blocking socket, no runtime and no dependency — the mirror of `client`.
+# A blocking MMS server over TCP: the association in the server role, the IED model from SCL
+# as the served namespace, and the ACSI services above it. No runtime.
 server = ["std", "mms", "scl"]
+# A durable `LogStore` on redb: the server's log survives a restart.
+log-redb = ["server", "dep:redb"]
+# GOOSE and SV on a live interface: raw Ethernet through `rawether` (Linux AF_PACKET, macOS
+# and FreeBSD BPF), with the IEC 61850 presets.
+net = ["std", "dep:rawether"]
 # The `ied` command-line tool.
-cli = ["std", "pcap", "scl", "goose", "sv", "mms", "client", "server"]
+cli = ["std", "pcap", "scl", "goose", "sv", "mms", "client", "server", "log-redb", "net"]
 
 [dependencies]
-roxmltree = { version = "0.21", optional = true }
+# At least 0.21.2: earlier versions overflow the stack on deeply nested input.
+roxmltree = { version = "0.21.2", optional = true }
+redb = { version = "4.5", optional = true }
+rawether = { version = "0.1", optional = true }
 
 [dev-dependencies]
 proptest = "1.11"
+# The log-store tests write rows past the store to prove a corrupt one is refused.
+redb = "4.5"
+# The interop peers run as containers; no TLS stack is pulled in.
+testcontainers = { version = "0.28", default-features = false, features = ["blocking"] }
 
 [lints.rust]
 # The library itself carries `#![forbid(unsafe_code)]` in `src/lib.rs`, which is the actual
@@ -89,8 +99,7 @@ path = "src/bin/ied.rs"
 required-features = ["cli"]
 
 # Every test target states the features it needs, so `cargo test --features <subset>` builds
-# the ones that can build instead of failing on the ones that cannot — the same rule the
-# examples already follow.
+# only the ones that can build.
 [[test]]
 name = "concepts"
 path = "tests/concepts.rs"
@@ -126,6 +135,11 @@ path = "tests/scl_fixtures.rs"
 required-features = ["scl", "goose", "sv"]
 
 [[test]]
+name = "scl_edit"
+path = "tests/scl_edit.rs"
+required-features = ["scl", "goose", "sv"]
+
+[[test]]
 name = "tshark_oracle"
 path = "tests/tshark_oracle.rs"
 required-features = ["goose", "sv", "pcap"]
@@ -140,9 +154,8 @@ name = "regressions"
 path = "tests/regressions.rs"
 required-features = ["mms"]
 
-# Interop against libiec61850, in both roles — the only third party that checks the
-# *sequence* rather than the octets. Skips unless `IEC61850_LIBIEC61850` names a built
-# checkout; nothing from it is vendored here.
+# Interop against libiec61850, IEC61850bean and csp0924's crates, each a container the test
+# builds from a pinned release (needs Docker; skips by name without it). Nothing is vendored.
 [[test]]
 name = "interop"
 path = "tests/interop.rs"
@@ -162,6 +175,21 @@ required-features = ["client", "scl"]
 name = "mms_server"
 path = "tests/mms_server.rs"
 required-features = ["client", "server"]
+
+[[test]]
+name = "log_store"
+path = "tests/log_store.rs"
+required-features = ["client", "log-redb"]
+
+[[test]]
+name = "net_link"
+path = "tests/net_link.rs"
+required-features = ["net", "goose", "sv"]
+
+[[test]]
+name = "process_bus_server"
+path = "tests/process_bus_server.rs"
+required-features = ["client", "server", "goose", "sv", "pcap"]
 
 # Examples state the features they use, so `cargo test --no-default-features` does not try to
 # build a GOOSE example without the GOOSE codec.

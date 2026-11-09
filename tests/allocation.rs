@@ -278,10 +278,9 @@ fn the_steady_state_allocates_nothing() {
 
 /// A file service costs the **chunk**, not the record.
 ///
-/// `FileOpen` used to read the whole file into the handle, so a client that opened a 200 MB
-/// COMTRADE record five times on ten associations had made the server allocate ten gigabytes
-/// — remotely, and with no limit anywhere to stop it. The store now reads ranges, so an open
-/// costs a path and a read costs one chunk whatever the file's size.
+/// The store reads ranges, so an open costs a path and a read costs one chunk whatever the
+/// file's size — a client opening a 200 MB COMTRADE record on many associations cannot make
+/// the server allocate the record each time.
 ///
 /// This is a claim about octets rather than calls: a count of allocations cannot tell a
 /// four-megabyte one from a one-kilobyte one, which is exactly the difference at stake.
@@ -362,3 +361,62 @@ const MODEL: &str = r#"<?xml version="1.0"?>
     <DOType id="INC_T" cdc="INC"><DA name="stVal" fc="ST" bType="INT32"/></DOType>
   </DataTypeTemplates>
 </SCL>"#;
+
+/// Receiving a file costs one chunk at a time, not the file: what the server holds per
+/// `FileRead` answer is bounded by the chunk, however large the file is.
+#[test]
+#[cfg(all(feature = "server", feature = "std"))]
+fn receiving_a_file_costs_a_chunk_not_the_file() {
+    use iec61850_rs::common::Instant;
+    use iec61850_rs::proto::mms::file::{FileAttributes, FileNameBuf};
+    use iec61850_rs::proto::mms::{ConfirmedRequest, ConfirmedResponse, Mms};
+    use iec61850_rs::server::{Acsi, AcsiConfig, Answer, DirectoryStore, FileWritePolicy, Ied};
+
+    const CHUNK: usize = 4096;
+    const CHUNKS: u32 = 64;
+    let dir = std::env::temp_dir().join(format!("iec61850-receive-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = AcsiConfig { file_write: FileWritePolicy::Anyone, ..AcsiConfig::default() };
+    let mut acsi = Acsi::with_config(Ied::from_scl(MODEL, Some("IED1")).unwrap(), cfg);
+    acsi.set_file_store(Box::new(DirectoryStore::new(&dir).writable()));
+    let source = FileNameBuf::from_path("big.bin").unwrap();
+    let dest = FileNameBuf::from_path("big.bin").unwrap();
+    let answer = acsi.request(1, Instant::ZERO, &ConfirmedRequest::ObtainFile { source_server: None, source: source.as_name(), destination: dest.as_name() });
+    assert!(matches!(answer, Answer::Deferred), "{answer:?}");
+    acsi.obtain_bind(1, 1);
+
+    let size = CHUNKS * u32::try_from(CHUNK).unwrap();
+    let open =
+        Mms::ConfirmedResponse { invoke_id: 0, service: ConfirmedResponse::FileOpen { frsm_id: 3, attributes: FileAttributes { size, last_modified: None } } }
+            .to_vec()
+            .unwrap();
+    let data = vec![0xA5u8; CHUNK];
+    let answer_once = |acsi: &mut Acsi, invoke: i64, pdu: &[u8]| {
+        assert!(acsi.obtain_call(1).is_some(), "a call is due");
+        acsi.obtain_issued(1, invoke);
+        let mms = Mms::parse(pdu, &iec61850_rs::common::Limits::DEFAULT).unwrap();
+        acsi.obtain_response(1, invoke, &mms)
+    };
+    let mut invoke = 10;
+    assert!(answer_once(&mut acsi, invoke, &open).is_none());
+    let mut worst = 0u64;
+    for n in 0..CHUNKS {
+        let read =
+            Mms::ConfirmedResponse { invoke_id: 0, service: ConfirmedResponse::FileRead { data: &data, more_follows: n + 1 < CHUNKS } }.to_vec().unwrap();
+        let mms = Mms::parse(&read, &iec61850_rs::common::Limits::DEFAULT).unwrap();
+        assert!(acsi.obtain_call(1).is_some());
+        invoke += 1;
+        acsi.obtain_issued(1, invoke);
+        let (_, bytes) = measure(|| {
+            let _ = acsi.obtain_response(1, invoke, &mms);
+        });
+        worst = worst.max(bytes);
+    }
+    assert!(worst < (CHUNK as u64) * 4, "a chunk received costs {worst} octets, more than a few chunks of {CHUNK}");
+    let close = Mms::ConfirmedResponse { invoke_id: 0, service: ConfirmedResponse::FileClose }.to_vec().unwrap();
+    let done = answer_once(&mut acsi, invoke + 1, &close).expect("the ObtainFile is answered");
+    assert!(matches!(Mms::parse(&done, &iec61850_rs::common::Limits::DEFAULT), Ok(Mms::ConfirmedResponse { service: ConfirmedResponse::ObtainFile, .. })));
+    assert_eq!(std::fs::metadata(dir.join("big.bin")).unwrap().len(), u64::from(size));
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -341,9 +341,8 @@ mod tests {
     /// `result-source-diagnostic [3]` is **mandatory** in an AARE, and an AARE without it is
     /// malformed to anything that reads the SEQUENCE positionally.
     ///
-    /// Our server omitted it and only our own client ever read the result — the two agreed,
-    /// which is the trap the notes call out. Wireshark did not: `BER Error: Wrong field in
-    /// SEQUENCE: expected class:CONTEXT(2) tag:3 but found class:CONTEXT(2) tag:30`.
+    /// Omitting it is invisible to this crate's own client; Wireshark reports `BER Error:
+    /// Wrong field in SEQUENCE: expected class:CONTEXT(2) tag:3`.
     #[test]
     fn an_aare_that_carries_a_result_carries_a_diagnostic_too() {
         let initiate = [0xA9u8, 0x00];

@@ -47,8 +47,8 @@ struct Groups {
     ///
     /// A client that selects a group for editing and then goes quiet without closing its
     /// association would otherwise hold the whole logical device's settings for ever;
-    /// `ResvTms` is the attribute that exists to stop it, and a server that publishes it and
-    /// never acts on it is the case D40 is about.
+    /// `ResvTms` is the attribute that exists to stop it, so the server acts on it rather than
+    /// only publishing it.
     editor_until: Option<Instant>,
 }
 
@@ -72,10 +72,10 @@ impl SettingGroups {
             for (reference, per_group, fallback) in settings_of(ied, &block.domain) {
                 for group in 1..=count {
                     let value = per_group.iter().find(|(g, _)| *g == group).and_then(|(_, text)| ied.parse_text(&reference, text)).or_else(|| fallback.clone());
-                    if let Some(v) = value {
-                        if let Some(slot) = values.get_mut(&group) {
-                            slot.insert(reference.clone(), v);
-                        }
+                    if let Some(v) = value
+                        && let Some(slot) = values.get_mut(&group)
+                    {
+                        slot.insert(reference.clone(), v);
                     }
                 }
             }

@@ -16,7 +16,7 @@
 //!     alternateAccess AlternateAccess },
 //!   selectAccess CHOICE { component [1], index [2], indexRange [3], allElements [4] } }
 //! ```
-//! ✅ (`../specs/asn1-wireshark/mms.asn`).
+//! ✅ (Wireshark's `asn1/mms/mms.asn`).
 //!
 //! The recursion says one thing twice. A step with more after it is `selectAlternateAccess`
 //! and tags its selection `[0]`–`[3]`; the last step is `selectAccess` and tags the same four
@@ -264,7 +264,8 @@ mod tests {
         // Nothing selected is not an empty element — it is no element at all.
         let mut e = Encoder::new();
         Path::default().write(&mut e).unwrap();
-        assert!(e.into_vec().is_empty());
+        let v = e.into_vec();
+        assert!(v.is_empty(), "{v:?}");
     }
 
     /// A selection this decoder cannot read is refused rather than narrowed to its first

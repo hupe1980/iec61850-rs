@@ -97,7 +97,7 @@ pub struct Termination {
 ///
 /// `operTm` is an **absolute** time and the deadline is a **monotonic** one, so the wait is
 /// computed once, at acceptance, from the difference between `operTm` and the wall clock then
-/// (D33: the two are different questions and neither may be derived from the other). The
+/// (the two clocks answer different questions and neither is derived from the other). The
 /// command's own `wall` is kept so the status it eventually writes is stamped with the moment
 /// it was *asked for*, which is what an operator reconstructing a sequence needs.
 #[derive(Clone, Debug)]
@@ -275,11 +275,11 @@ impl Controls {
         // **`Cancel` is exempt.** It withdraws a command rather than issuing one, and a node
         // that went blocked while a client held a selection must still let that client let go
         // — otherwise the only way out is the selection timing out.
-        if attribute != "Cancel" {
-            if let Some(cause) = mode_refusal(behaviour_of(ied, object), request.test) {
-                let stage = if attribute == "Oper" { Stage::Operate } else { Stage::Select };
-                return self.refuse(assoc, object, &request, model, stage, cause);
-            }
+        if attribute != "Cancel"
+            && let Some(cause) = mode_refusal(behaviour_of(ied, object), request.test)
+        {
+            let stage = if attribute == "Oper" { Stage::Operate } else { Stage::Select };
+            return self.refuse(assoc, object, &request, model, stage, cause);
         }
 
         match attribute {
@@ -350,18 +350,18 @@ impl Controls {
         // Time-activated operate (IEC 61850-7-2 §20): an `operTm` in the future arms the
         // command rather than running it. The write still succeeds — what the client is
         // waiting for is the termination, which arrives when the command actually runs.
-        if let Some(at) = request.oper_tm {
-            if let Some(wait) = at.to_unix_nanos().checked_sub(now.wall.to_unix_nanos()).filter(|w| *w > 0) {
-                self.timed.retain(|t| !(t.object == object && t.assoc == assoc));
-                self.timed.push(Timed {
-                    assoc,
-                    object: String::from(object),
-                    request: ControlRequest { t: now.wall, ..request.clone() },
-                    model,
-                    due: now.mono.plus_nanos(wait),
-                });
-                return Ok(());
-            }
+        if let Some(at) = request.oper_tm
+            && let Some(wait) = at.to_unix_nanos().checked_sub(now.wall.to_unix_nanos()).filter(|w| *w > 0)
+        {
+            self.timed.retain(|t| !(t.object == object && t.assoc == assoc));
+            self.timed.push(Timed {
+                assoc,
+                object: String::from(object),
+                request: ControlRequest { t: now.wall, ..request.clone() },
+                model,
+                due: now.mono.plus_nanos(wait),
+            });
+            return Ok(());
         }
         apply(ied, object, request, now.wall);
         if model.enhanced_security() {

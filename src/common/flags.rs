@@ -212,3 +212,18 @@ impl ControlModel {
         matches!(self, ControlModel::DirectEnhanced | ControlModel::SboEnhanced)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These widths are the same in every edition (IEC 61850-8-1 encodes `OptFlds` in ten bits
+    /// and `TrgOps`/`ReasonCode` in six from Edition 1 on), which is why nothing in them is
+    /// mapped by edition the way `AddCause` is.
+    #[test]
+    fn report_bit_strings_have_one_width_in_every_edition() {
+        assert_eq!(OptFlds::BITS, 10);
+        assert_eq!(TrgOps::BITS, 6);
+        assert_eq!(ReasonCode::BITS, 6);
+    }
+}

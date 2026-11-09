@@ -1,5 +1,5 @@
-//! Real 9-2LE traffic (`specs/pcap/sv-9-2LE-normal-traffic.cap`, 10 161 frames, 60 Hz) against
-//! the codec and the multi-stream subscriber. Skips when `specs/` is absent.
+//! Real 9-2LE traffic (`pcap/sv-9-2LE-normal-traffic.cap` in the reference corpus, 10 161 frames, 60 Hz) against
+//! the codec and the multi-stream subscriber. Skips when the reference corpus is absent.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
@@ -15,7 +15,7 @@ use iec61850_rs::proto::sv::{
 
 #[test]
 fn decodes_every_sv_frame() {
-    let Some(path) = common::spec("pcap/sv-9-2LE-normal-traffic.cap") else { return };
+    let Some(path) = common::reference("pcap/sv-9-2LE-normal-traffic.cap") else { return };
     let frames = common::read_pcap(&path);
     assert_eq!(frames.len(), 10_161);
     let mut max_cnt = 0;
@@ -40,7 +40,7 @@ fn decodes_every_sv_frame() {
 
 #[test]
 fn subscriber_tracks_continuity() {
-    let Some(path) = common::spec("pcap/sv-9-2LE-normal-traffic.cap") else { return };
+    let Some(path) = common::reference("pcap/sv-9-2LE-normal-traffic.cap") else { return };
     let frames = common::read_pcap(&path);
     let key = StreamKey { dst: MacAddr::parse("01-0c-cd-04-00-02").unwrap(), appid: 0x4001, sv_id: "4001".into() };
     let mut sub = Subscriber::new(vec![StreamConfig::new(key).with_samples_per_second(4800).with_conf_rev(1)]);
@@ -73,7 +73,7 @@ fn the_dataset_driven_layout_decodes_the_capture_the_way_the_9_2le_struct_does()
     // real traffic. `PhsMeas1` is 9-2LE's fixed data set; the layout is the same data set
     // described the way an SCL file describes it, and every one of the 10 161 frames has to
     // decode to the same eight currents and voltages through both.
-    let Some(path) = common::spec("pcap/sv-9-2LE-normal-traffic.cap") else { return };
+    let Some(path) = common::reference("pcap/sv-9-2LE-normal-traffic.cap") else { return };
     let mut channels = Vec::new();
     for name in ["Ia", "Ib", "Ic", "In", "Ua", "Ub", "Uc", "Un"] {
         channels.push((format!("MU01TCTR.{name}.instMag.i"), ChannelType::Int(4)));
@@ -107,7 +107,7 @@ fn re_encoding_a_captured_frame_reproduces_it_byte_for_byte() {
     // The strongest check available on the encoder: take a real merging unit's frames,
     // decode them, encode them again from the decoded values, and require the same bytes.
     // It catches every width, tag and ordering difference at once.
-    let Some(path) = common::spec("pcap/sv-9-2LE-normal-traffic.cap") else { return };
+    let Some(path) = common::reference("pcap/sv-9-2LE-normal-traffic.cap") else { return };
     for (_, f) in common::read_pcap(&path) {
         let fr = Frame::parse(&f).unwrap();
         let pdu = SavPduView::parse(fr.apdu, &Limits::DEFAULT).unwrap();
@@ -139,7 +139,7 @@ fn the_publisher_reproduces_the_captured_stream() {
     // sample blocks from the capture, and require the frames it builds to be the captured
     // frames. This is the publisher, the template patching and the link layer checked in
     // one go against hardware output.
-    let Some(path) = common::spec("pcap/sv-9-2LE-normal-traffic.cap") else { return };
+    let Some(path) = common::reference("pcap/sv-9-2LE-normal-traffic.cap") else { return };
     let frames = common::read_pcap(&path);
     let first = Frame::parse(&frames[0].1).unwrap();
     let header = FrameHeader {

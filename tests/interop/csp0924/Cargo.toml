@@ -1,0 +1,17 @@
+# csp0924's IEC 61850 crates as an interop peer. A project of its own, built inside its image, so
+# none of it enters iec61850-rs's dependency graph.
+[package]
+name = "csp0924-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+iec61850-client = "=0.4.0"
+iec61850-server = "=0.4.0"
+iec61850-scl = "=0.4.0"
+iec61850-model = "=0.4.0"
+iec61850-mms = "=0.4.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[workspace]

@@ -3,9 +3,9 @@
 //!
 //! Both lists are the standard's own, in the standard's own order ✅ ([`ServiceType`] from
 //! Table 26, [`ServiceError`] from Table 5). The **ordinals** are not: the name-to-number
-//! mapping belongs to IEC 61850-8-1, which is paywalled (R2), so the server reads them out of
-//! the `EnumType` the SCL file declares (D9) and falls back to the standard's list position
-//! only when the file declares none.
+//! mapping belongs to IEC 61850-8-1, which is paywalled, so the server reads them out of the
+//! `EnumType` the SCL file declares and falls back to the standard's list position only when
+//! the file declares none.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -151,7 +151,7 @@ impl ServiceType {
     /// Its position in Table 26 — the ordinal to use when the file declares no `EnumType`.
     ///
     /// This is a **fallback and not a claim**: the name-to-number mapping is IEC 61850-8-1's
-    /// and is paywalled (R2), so a file that declares the enumeration wins, always.
+    /// and is paywalled, so a file that declares the enumeration wins, always.
     pub fn table_ordinal(self) -> i64 {
         SERVICE_TYPES.iter().position(|(v, _)| *v == self).map_or(0, |i| i as i64)
     }

@@ -20,15 +20,31 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Downloaded standards artifacts (fetched via scripts/fetch-specs.sh, not vendored)
-/specs/
-
-# Internal architecture notes, deliberately not tracked. Once a crate exists,
+# Internal architecture notes (see concepts/README.md), anchored to the repository root.
+# ROADMAP.md is the spec of specs: every open item names its feature specification.
 # `tests/concepts.rs` guards them and skips when the directory is absent, which is what CI sees.
+#
+# The third-party corpus — ITU-T recommendations, RFCs, IEC previews, Wireshark's ASN.1
+# modules (GPL-2), the SCL XSD, sample captures and the OpenSCD fixtures — lives at
+# `concepts/reference/` and is covered by this line: fetched by scripts/fetch-references.sh,
+# indexed in `concepts/REFERENCES.md`, and never redistributed from here.
 /concepts/
 # Its predecessor: a single unlinked, unchecked design document, split into concepts/.
 # Kept ignored so it cannot come back by accident.
 CONCEPT.md
+
+# This project's own feature specifications, and the Spec Kit machinery that produces them:
+# one `specs/NNN-slug/` per ROADMAP item, `.specify/memory/constitution.md`, and the
+# `/speckit-*` skills. Same rule as `concepts/` — internal, and the published tree may not
+# cite a path its reader does not have; `cargo test --test concepts` fails on one that does.
+# Matching eebus, iso15118, bergman and agentplane.
+#
+# Until 2026-11-09 `specs/` held the reference corpus now under `concepts/reference/`;
+# a stale copy is ignored by the same line.
+/specs/
+/.specify/
+/.claude/
+.DS_Store
 
 # Fuzzing corpora and working artifacts. `fuzz/regressions/` is deliberately *not* ignored:
 # an input a fuzzer crashed on stops being an artifact once the bug is fixed and becomes the

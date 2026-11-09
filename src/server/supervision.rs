@@ -23,8 +23,8 @@
 //! `GoCBRef` and `SvCBRef` are **settings**: they come from the SCL file and are not written
 //! here. Everything else is status, and [`SubscriptionStatus`] is it.
 //!
-//! Two rules make this safe to call in a loop: only objects the file declares are written
-//! (D9), and an unchanged status writes nothing, so a supervision poll does not make every
+//! Two rules make this safe to call in a loop: only objects the file declares are written,
+//! and an unchanged status writes nothing, so a supervision poll does not make every
 //! report control block fire once a second.
 //!
 //! ```no_run

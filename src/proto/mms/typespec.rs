@@ -2,9 +2,9 @@
 //!
 //! This is how a client learns the *shape* of a variable before it writes one: that
 //! `CSWI1$CO$Pos$Oper` is a structure of seven components whose first is a two-bit bit string
-//! and whose fifth is a `utc-time`, or that `MMXU1$MX$TotW$mag$f` is a floating point. Every
-//! prior stack makes a caller know that in advance; reading it costs one round trip and turns
-//! "the write was refused with type-inconsistent" into something a tool can explain.
+//! and whose fifth is a `utc-time`, or that `MMXU1$MX$TotW$mag$f` is a floating point. One
+//! round trip turns "the write was refused with type-inconsistent" into something a tool can
+//! explain.
 //!
 //! ```text
 //! TypeSpecification ::= CHOICE {
@@ -18,7 +18,7 @@
 //! plus `floating-point [7] { format-width [0], exponent-width [1] }`, which ISO 9506-2 has
 //! and Wireshark's stripped module drops, and `mMSString [16]` / `utc-time [17]`, which
 //! IEC 61850-8-1 adds alongside the `Data` choices of the same numbers 🌐. Everything else is
-//! ISO 9506-2 as `../specs/asn1-wireshark/mms.asn` states it ✅. `objId [15]` is not modelled
+//! ISO 9506-2 as Wireshark's `asn1/mms/mms.asn` states it ✅. `objId [15]` is not modelled
 //! and arrives as [`TypeSpec::Other`]; nothing in IEC 61850 is one.
 //!
 //! A negative `bit-string`, `octet-string` or `visible-string` length means "at most that
@@ -161,9 +161,7 @@ impl TypeSpec {
                 // stripped module has no `floating-point` in `TypeSpecification` at all, so
                 // the oracle cannot tell the two apart and only a second stack can: this is
                 // what libiec61850 writes and reads 🌐. The context-tagged form is accepted
-                // too, because this crate itself emitted it before the interop run and a
-                // decoder that refuses a peer's octets over a tag it can read is D11's
-                // mistake in the other direction.
+                // too: a peer's octets that can be understood are understood.
                 let mut c = t.children();
                 let format_width = width(&next_width(&mut c, 0)?)?;
                 let exponent_width = width(&next_width(&mut c, 1)?)?;
@@ -286,8 +284,8 @@ impl TypeSpec {
 /// One width of a `floating-point` type specification, in either encoding.
 ///
 /// ISO 9506-2 leaves `format-width` and `exponent-width` unnamed, so the conformant octets are
-/// universal INTEGERs; `tag` is the context number this crate used to write instead, and is
-/// still accepted on the way in.
+/// universal INTEGERs; `tag` is the context-tagged alternative, which is accepted on the way
+/// in.
 fn next_width<'a>(c: &mut Cursor<'a>, tag: u32) -> Result<Tlv<'a>> {
     let t = c.next_required()?;
     if t.tag == Tag::universal(crate::ber::universal::INTEGER, false) || t.tag == Tag::context(tag) {
@@ -341,8 +339,8 @@ mod tests {
         assert_eq!(e.into_vec(), VENDOR);
     }
 
-    /// The context-tagged form this crate used to emit is still read, because a peer's octets
-    /// that can be understood are understood (D11) — even when the peer was us.
+    /// The context-tagged widths are read too, because a peer's octets that can be understood
+    /// are understood.
     #[test]
     fn the_older_context_tagged_widths_are_still_accepted() {
         const LEGACY: &[u8] = &[0xa7, 0x06, 0x80, 0x01, 0x40, 0x81, 0x01, 0x0b];

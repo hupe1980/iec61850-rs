@@ -110,11 +110,20 @@ pub struct ServiceError {
     pub code: i64,
     /// `additionalCode`, when the server sent one.
     pub additional: Option<i64>,
+    /// `serviceSpecificInformation` as `(choice tag, value)` — for an `ObtainFile` error,
+    /// `(0, side)` with the side from [`obtain_file_error`].
+    pub specific: Option<(u32, i64)>,
 }
 
 /// `errorClass` choice tags of an ISO 9506 [`ServiceError`], and the codes inside the ones
 /// this crate emits.
 pub mod service_error {
+    /// `service-preempt [5]`.
+    pub const SERVICE_PREEMPT: u32 = 5;
+    /// `service-preempt: timeout (1)`.
+    pub const TIMEOUT: i64 = 1;
+    /// `file [11]`.
+    pub const FILE: u32 = 11;
     /// `service [4]`.
     pub const SERVICE: u32 = 4;
     /// `service: primitives-out-of-sequence (1)` — the PDU arrived where it cannot be acted
@@ -142,6 +151,25 @@ impl ServiceError {
         Ok(e.into_vec())
     }
 
+    /// The encoded `ServiceError` an `ObtainFile` is refused with: `class`/`code` and, in
+    /// `serviceSpecificInformation [3] obtainFile [0]`, which side failed
+    /// ([`obtain_file_error`]).
+    pub fn encode_obtain_file(tag: Tag, class: u32, code: i64, side: i64) -> Result<Vec<u8>> {
+        let mut e = Encoder::new();
+        e.constructed(tag, |e| {
+            e.constructed(Tag::context_constructed(0), |e| {
+                e.integer(Tag::context(class), code)?;
+                Ok(())
+            })?;
+            e.constructed(Tag::context_constructed(3), |e| {
+                e.integer(Tag::context(0), side)?;
+                Ok(())
+            })?;
+            Ok(())
+        })?;
+        Ok(e.into_vec())
+    }
+
     /// Decode the `ServiceError` an [`Mms::ConfirmedError`] keeps encoded.
     pub fn parse(t: &Tlv<'_>) -> Result<ServiceError> {
         let mut out = ServiceError::default();
@@ -154,11 +182,49 @@ impl ServiceError {
                     out.code = inner.integer_i64().unwrap_or(0);
                 }
                 (Class::Context, 1) => out.additional = Some(f.integer_i64()?),
+                (Class::Context, 3) => {
+                    if let Some(Ok(inner)) = f.children().next() {
+                        out.specific = inner.integer_i64().ok().map(|v| (inner.tag.number, v));
+                    }
+                }
                 _ => {}
             }
         }
         Ok(out)
     }
+}
+
+/// The codes of the `file [11]` error class (ISO 9506-2).
+pub mod file_error {
+    /// `other (0)`.
+    pub const OTHER: i64 = 0;
+    /// `filename-ambiguous (1)`.
+    pub const FILENAME_AMBIGUOUS: i64 = 1;
+    /// `file-busy (2)`.
+    pub const FILE_BUSY: i64 = 2;
+    /// `filename-syntax-error (3)`.
+    pub const FILENAME_SYNTAX_ERROR: i64 = 3;
+    /// `content-type-invalid (4)`.
+    pub const CONTENT_TYPE_INVALID: i64 = 4;
+    /// `position-invalid (5)`.
+    pub const POSITION_INVALID: i64 = 5;
+    /// `file-access-denied (6)`.
+    pub const FILE_ACCESS_DENIED: i64 = 6;
+    /// `file-non-existent (7)`.
+    pub const FILE_NON_EXISTENT: i64 = 7;
+    /// `duplicate-filename (8)`.
+    pub const DUPLICATE_FILENAME: i64 = 8;
+    /// `insufficient-space-in-filestore (9)`.
+    pub const INSUFFICIENT_SPACE: i64 = 9;
+}
+
+/// `ObtainFile-Error`: which side of an `ObtainFile` failed, carried in a `ServiceError`'s
+/// `serviceSpecificInformation [3] obtainFile [0]`.
+pub mod obtain_file_error {
+    /// `source-file (0)` — reading the file from the client failed.
+    pub const SOURCE_FILE: i64 = 0;
+    /// `destination-file (1)` — the server could not store it.
+    pub const DESTINATION_FILE: i64 = 1;
 }
 
 /// The `ObjectClass` values IEC 61850-8-1 asks `GetNameList` for.
@@ -580,6 +646,8 @@ const SERVICE_DEFINE_NVL: u32 = 11;
 const SERVICE_DELETE_NVL: u32 = 13;
 /// `readJournal`.
 const SERVICE_READ_JOURNAL: u32 = 65;
+/// `obtainFile`.
+const SERVICE_OBTAIN_FILE: u32 = 46;
 /// `fileOpen`.
 const SERVICE_FILE_OPEN: u32 = 72;
 /// `fileRead`.
@@ -682,6 +750,17 @@ pub enum ConfirmedRequest<'a> {
     },
     /// `readJournal [65]` — IEC 61850's `QueryLogByTime` / `QueryLogAfterEntry`.
     ReadJournal(ReadJournal<'a>),
+    /// `obtainFile [46]` — ACSI `SetFile`: the server fetches `source` from the requesting
+    /// client with `FileOpen`/`FileRead`/`FileClose` and stores it as `destination`.
+    ObtainFile {
+        /// `sourceFileServer`, the encoded `ApplicationReference` of a third party to fetch
+        /// from; absent means the requesting client.
+        source_server: Option<&'a [u8]>,
+        /// The file on the source.
+        source: FileName<'a>,
+        /// Where the server stores it.
+        destination: FileName<'a>,
+    },
     /// `fileOpen [72]`.
     FileOpen {
         /// The file.
@@ -781,6 +860,8 @@ pub enum ConfirmedResponse<'a> {
         /// Whether the server has more to give.
         more_follows: bool,
     },
+    /// `obtainFile [46]` — the file was fetched and stored.
+    ObtainFile,
     /// `fileOpen [72]`.
     FileOpen {
         /// The server-side handle every subsequent read and the close must carry.
@@ -1038,6 +1119,13 @@ impl<'a> ConfirmedRequest<'a> {
                 ConfirmedRequest::DeleteNamedVariableList { scope, names, domain }
             }
             SERVICE_READ_JOURNAL => ConfirmedRequest::ReadJournal(ReadJournal::parse(&t)?),
+            SERVICE_OBTAIN_FILE => {
+                let mut c = t.children();
+                let source_server = c.next_if_tag(Tag::context_constructed(0))?.map(|t| t.value);
+                let source = FileName::parse(&c.next_tag(Tag::context_constructed(1))?, limits)?;
+                let destination = FileName::parse(&c.next_tag(Tag::context_constructed(2))?, limits)?;
+                ConfirmedRequest::ObtainFile { source_server, source, destination }
+            }
             SERVICE_FILE_OPEN => {
                 let mut c = t.children();
                 let name = FileName::parse(&c.next_tag(Tag::context_constructed(0))?, limits)?;
@@ -1146,6 +1234,25 @@ impl<'a> ConfirmedRequest<'a> {
                 })?;
             }
             ConfirmedRequest::ReadJournal(r) => r.write(e)?,
+            ConfirmedRequest::ObtainFile { source_server, source, destination } => {
+                e.constructed(Tag::context_constructed(SERVICE_OBTAIN_FILE), |e| {
+                    if let Some(server) = source_server {
+                        e.constructed(Tag::context_constructed(0), |e| {
+                            e.raw(server);
+                            Ok(())
+                        })?;
+                    }
+                    e.constructed(Tag::context_constructed(1), |e| {
+                        source.write_contents(e);
+                        Ok(())
+                    })?;
+                    e.constructed(Tag::context_constructed(2), |e| {
+                        destination.write_contents(e);
+                        Ok(())
+                    })?;
+                    Ok(())
+                })?;
+            }
             ConfirmedRequest::FileOpen { name, position } => {
                 e.constructed(Tag::context_constructed(SERVICE_FILE_OPEN), |e| {
                     e.constructed(Tag::context_constructed(0), |e| {
@@ -1306,15 +1413,15 @@ impl<'a> ConfirmedResponse<'a> {
             }
             SERVICE_FILE_READ => {
                 let mut c = t.children();
+                // Borrowed from the PDU, which the negotiated size and the TSDU limit already
+                // bound; a peer chunks a file to its PDU, not to a primitive limit.
                 let data = c.next_tag(Tag::context(0))?.value;
-                if data.len() > limits.max_primitive_len {
-                    return Err(Error::LimitExceeded { limit: "max_primitive_len", value: data.len() });
-                }
                 // `moreFollows` is DEFAULT TRUE: a server that omits it has more to give.
                 let more_follows = c.next_if_tag(Tag::context(1))?.map(|t| t.boolean()).transpose()?.unwrap_or(true);
                 ConfirmedResponse::FileRead { data, more_follows }
             }
             SERVICE_FILE_CLOSE => ConfirmedResponse::FileClose,
+            SERVICE_OBTAIN_FILE => ConfirmedResponse::ObtainFile,
             SERVICE_FILE_DELETE => ConfirmedResponse::FileDelete,
             SERVICE_FILE_DIRECTORY => {
                 let mut c = t.children();
@@ -1463,6 +1570,9 @@ impl<'a> ConfirmedResponse<'a> {
             ConfirmedResponse::FileClose => {
                 e.primitive(Tag::context(SERVICE_FILE_CLOSE), &[])?;
             }
+            ConfirmedResponse::ObtainFile => {
+                e.primitive(Tag::context(SERVICE_OBTAIN_FILE), &[])?;
+            }
             ConfirmedResponse::FileDelete => {
                 e.primitive(Tag::context(SERVICE_FILE_DELETE), &[])?;
             }
@@ -1514,7 +1624,7 @@ impl<'a> Mms<'a> {
     ///
     /// A response this codec cannot decode still answers the request it names: the peer has
     /// spoken and will say nothing more, so the caller has to fail now rather than wait out
-    /// its whole request timeout on octets that have already arrived (D46). Reading the
+    /// its whole request timeout on octets that have already arrived. Reading the
     /// identifier is cheap and independent of everything after it — it is the first field of
     /// all four confirmed PDU types — so the failure can be attributed even when the rest is
     /// unreadable. `None` for an unconfirmed PDU, a reject, or bytes that are not a PDU at all.
@@ -1688,10 +1798,8 @@ mod tests {
     /// A name list is the namespace of a whole logical device, not a data set.
     ///
     /// libiec61850's own `LTRK` test model has 643 names in one device, and every real IED has
-    /// more. Applying the data-set limit here made the client refuse a page of them — and,
-    /// because a refused answer used to leave the request outstanding, report that the server
-    /// had never replied. The bound that matters is the reassembled TSDU, which is enforced a
-    /// layer down; `max_list_items` is what says so at the decoder.
+    /// more, so the data-set limit must not apply to a name list. The bound that matters is the
+    /// reassembled TSDU, enforced a layer down; `max_list_items` is what says so at the decoder.
     #[test]
     fn a_name_list_may_be_larger_than_a_data_set() {
         use crate::ber::{Encoder, Tag};
@@ -1834,10 +1942,9 @@ mod tests {
     /// `listOfDirectoryEntry [0]` is the one file-service field that is **not** implicitly
     /// tagged, so the entries sit inside an inner universal `SEQUENCE`.
     ///
-    /// Both halves of this crate had it wrong in the same way and therefore agreed with each
-    /// other, which is precisely the failure the Wireshark oracle exists to catch — it did,
-    /// on its first run (`tests/tshark_mms.rs`). The octets asserted here are the shape
-    /// `mms.asn` states ✅ and libiec61850 writes 🌐: `bf 4d { a0 { 30 { 30 … } } }`.
+    /// A mistake here would be shared by both halves of this crate, so `tests/tshark_mms.rs`
+    /// checks it too. The octets asserted here are the shape `mms.asn` states ✅ and
+    /// libiec61850 writes 🌐: `bf 4d { a0 { 30 { 30 … } } }`.
     #[test]
     fn a_file_directory_response_wraps_its_entries_in_a_sequence() {
         let response = ConfirmedResponse::FileDirectory {
@@ -2197,5 +2304,44 @@ mod tests {
         }
         assert!(Mms::parse(&[], &Limits::DEFAULT).is_err());
         assert!(Mms::parse(&[0x30, 0x00], &Limits::DEFAULT).is_err(), "a SEQUENCE is not an MMS PDU");
+    }
+
+    /// `ObtainFile` as ISO 9506-2 states it: `[46] { sourceFileServer [0] OPTIONAL,
+    /// sourceFile [1], destinationFile [2] }`, a `NULL` response, and the error naming a side.
+    #[test]
+    fn obtain_file_round_trips_and_its_error_names_the_side() {
+        let source = file::FileNameBuf::from_path("settings.xml").unwrap();
+        let destination = file::FileNameBuf::from_path("SETTINGS/settings.xml").unwrap();
+        let request = Mms::ConfirmedRequest {
+            invoke_id: 7,
+            service: ConfirmedRequest::ObtainFile { source_server: None, source: source.as_name(), destination: destination.as_name() },
+        };
+        let bytes = request.to_vec().unwrap();
+        assert!(bytes.windows(2).any(|w| w == [0xbf, 0x2e]), "[46] constructed: {bytes:02x?}");
+        assert_eq!(Mms::parse(&bytes, &Limits::DEFAULT).unwrap(), request);
+        let third = Mms::ConfirmedRequest {
+            invoke_id: 8,
+            service: ConfirmedRequest::ObtainFile {
+                source_server: Some(&[0xa2, 0x02, 0x06, 0x00]),
+                source: source.as_name(),
+                destination: destination.as_name(),
+            },
+        };
+        assert_eq!(Mms::parse(&third.to_vec().unwrap(), &Limits::DEFAULT).unwrap(), third);
+
+        let response = Mms::ConfirmedResponse { invoke_id: 7, service: ConfirmedResponse::ObtainFile };
+        assert_eq!(Mms::parse(&response.to_vec().unwrap(), &Limits::DEFAULT).unwrap(), response);
+
+        let error = ServiceError::encode_obtain_file(
+            Tag::context_constructed(2),
+            service_error::FILE,
+            file_error::DUPLICATE_FILENAME,
+            obtain_file_error::DESTINATION_FILE,
+        )
+        .unwrap();
+        let t = Cursor::new(&error).next_required().unwrap();
+        let parsed = ServiceError::parse(&t).unwrap();
+        assert_eq!((parsed.class, parsed.code, parsed.specific), (11, 8, Some((0, 1))));
+        assert!(error.ends_with(&[0xa3, 0x03, 0x80, 0x01, 0x01]), "serviceSpecificInformation [3] obtainFile [0], as libiec61850 writes it");
     }
 }

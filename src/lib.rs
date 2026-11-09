@@ -89,14 +89,22 @@
 //!
 //! # Status
 //!
-//! Pre-release. The process bus is tested against real substation captures; on the station
-//! bus, the six OSI layers, the association over them and both ends above it are verified
-//! against a real capture, against `tshark` and against each other over a socket. Not
-//! included: the raw-socket adapters and the IEC 62351 security profiles.
-//! The API will change, and nothing here has been through a conformance laboratory.
+//! Pre-1.0. The process bus is tested against real substation captures and, with the `net`
+//! feature, on live Linux and macOS interfaces; on the station bus, the six OSI layers, the
+//! association over them and both ends above it are verified against a real capture, against
+//! `tshark`, against each other over a socket, and against libiec61850's client and server.
+//! Not included: TLS and the IEC 62351-6 authentication extension. The API changes between
+//! minor versions, and nothing here has been through a conformance laboratory.
 //!
 //! The guide at <https://hupe1980.github.io/iec61850-rs/> covers the protocols themselves,
 //! and is explicit about what is verified and what is not.
+//!
+//! # Reading the comments
+//!
+//! Claims about a standard in this crate's documentation carry a tag saying how they were
+//! checked: ✅ against a freely available text (an ITU-T recommendation, an RFC, Wireshark's
+//! ASN.1 module, a public IEC preview); 🌐 against a public source such as libiec61850 or
+//! Wireshark's dissector; ⚠ engineering judgement, not checked against the paywalled IEC text.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 // docs.rs builds with every feature and on nightly, so each gated item can carry the
@@ -114,6 +122,8 @@ pub mod ber;
 pub mod client;
 pub mod common;
 pub mod model;
+#[cfg(feature = "net")]
+pub mod net;
 #[cfg(feature = "pcap")]
 pub mod pcap;
 #[cfg(any(feature = "goose", feature = "sv", feature = "mms"))]

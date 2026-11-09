@@ -20,7 +20,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::common::{Error, Result, UtcTime};
+use crate::common::{Edition, Error, Result, UtcTime};
 
 pub use crate::common::ControlModel;
 use crate::proto::data::{Typed, Value};
@@ -332,7 +332,8 @@ pub enum AddCause {
     None,
     InconsistentParameters,
     LockedByOtherClient,
-    /// A value outside the enumeration; Edition 2.1 extends the list.
+    /// A value above 27, outside the list this crate names. Edition 2.1 lets the list be
+    /// extended.
     Other(i64),
 }
 
@@ -404,6 +405,39 @@ impl AddCause {
             AddCause::InconsistentParameters => 26,
             AddCause::LockedByOtherClient => 27,
             AddCause::Other(v) => v,
+        }
+    }
+
+    /// The edition that introduced this value.
+    ///
+    /// Edition 1 defines 0–18, `Unknown` to `ObjectNotSelected` ⚠ (the IEC 61850-8-1 Ed2.1
+    /// mapping table is paywalled; the boundary is engineering judgement). Edition 2 adds 19–27
+    /// 🌐 (libiec61850's `ControlAddCause`, and vendor documentation of the Edition 2 table).
+    /// A value above 27 is read as Edition 2.1's, the edition that lets the list be extended.
+    pub const fn since(self) -> Edition {
+        match self.to_code() {
+            0..=18 => Edition::Ed1,
+            19..=27 => Edition::Ed2,
+            _ => Edition::Ed2_1,
+        }
+    }
+
+    /// This value, or the nearest one `edition` defines if it does not define this one.
+    ///
+    /// The only Edition 2 value with an Edition 1 counterpart is `ObjectAlreadySelected`,
+    /// which maps to `SelectFailed`; every other newer value maps to `Unknown`, the code each
+    /// edition has for "no better answer". The boundary and the fallbacks are ⚠ until IEC 61850-8-1 Ed2.1 Table 110 is
+    /// read, so the server does **not** apply this: it sends every cause as it is, as
+    /// libiec61850 does. Map with it yourself if an Edition 1 client needs it.
+    #[must_use]
+    pub const fn for_edition(self, edition: Edition) -> AddCause {
+        let defined = matches!((self.since(), edition), (Edition::Ed1, _) | (Edition::Ed2, Edition::Ed2 | Edition::Ed2_1) | (Edition::Ed2_1, Edition::Ed2_1));
+        if defined {
+            self
+        } else if matches!((self, edition), (AddCause::ObjectAlreadySelected, Edition::Ed1)) {
+            AddCause::SelectFailed
+        } else {
+            AddCause::Unknown
         }
     }
 }
@@ -642,5 +676,39 @@ mod tests {
         };
         assert!(!negative.is_positive());
         assert_eq!((negative.ctl_num(), negative.control_object()), (7, "IED1LD0/CSWI1$CO$Pos$Oper"));
+    }
+
+    /// Every value, at every edition: the table in [`AddCause::for_edition`], row by row.
+    #[test]
+    fn every_add_cause_is_sent_as_its_edition_defines_it() {
+        use AddCause as A;
+        let ed1_fallback = |c: A| match c {
+            A::ObjectAlreadySelected => A::SelectFailed,
+            _ => A::Unknown,
+        };
+        for code in 0..=28 {
+            let c = A::from_code(code);
+            assert_eq!(c.to_code(), code, "round trip of {code}");
+            let (ed1, ed2, ed21) = (c.for_edition(Edition::Ed1), c.for_edition(Edition::Ed2), c.for_edition(Edition::Ed2_1));
+            match code {
+                0..=18 => {
+                    assert_eq!(c.since(), Edition::Ed1, "{code}");
+                    assert_eq!((ed1, ed2, ed21), (c, c, c), "{code}");
+                }
+                19..=27 => {
+                    assert_eq!(c.since(), Edition::Ed2, "{code}");
+                    assert_eq!((ed1, ed2, ed21), (ed1_fallback(c), c, c), "{code}");
+                }
+                _ => {
+                    assert_eq!(c.since(), Edition::Ed2_1, "{code}");
+                    assert_eq!((ed1, ed2, ed21), (A::Unknown, A::Unknown, c), "{code}");
+                }
+            }
+            for e in [Edition::Ed1, Edition::Ed2, Edition::Ed2_1] {
+                assert!(c.for_edition(e).since() <= e, "{code} at {e:?} is a value that edition defines");
+            }
+        }
+        assert_eq!(A::ObjectAlreadySelected.for_edition(Edition::Ed1).to_code(), 3);
+        assert_eq!(A::LockedByOtherClient.for_edition(Edition::Ed1).to_code(), 0);
     }
 }

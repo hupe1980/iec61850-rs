@@ -279,6 +279,10 @@ pub struct Client {
     /// built from a socket somebody else opened ([`Client::from_stream`]) — there is nothing
     /// to reconnect *to* when the transport was handed in.
     origin: Option<(String, ClientConfig)>,
+    /// The one file this client serves to the server while a `set_file` runs.
+    pub(crate) serving: Option<files::Serving>,
+    /// When this client last served the server during a `set_file`.
+    pub(crate) progress: Option<StdInstant>,
 }
 
 impl Client {
@@ -308,6 +312,8 @@ impl Client {
             rx: alloc_buffer(),
             request_timeout: request_timeout(&cfg.association),
             origin: Some((String::from(addr), cfg.clone())),
+            serving: None,
+            progress: None,
         };
         let now = c.now();
         c.assoc.start(now)?;
@@ -394,6 +400,8 @@ impl Client {
             request_timeout: request_timeout(&cfg.association),
             // A socket somebody else opened cannot be opened again by this client.
             origin: None,
+            serving: None,
+            progress: None,
         };
         let now = c.now();
         c.assoc.start(now)?;
@@ -832,10 +840,15 @@ impl Client {
         let now = self.now();
         let invoke_id = self.assoc.call(now, service)?;
         self.flush()?;
-        let deadline = StdInstant::now() + self.request_timeout;
+        let mut deadline = StdInstant::now() + self.request_timeout;
         loop {
             if let Some(pdu) = self.take_answer(invoke_id)? {
                 return Ok(pdu);
+            }
+            // The server served from this end since the last look: it is working on the
+            // request, so the wait starts again rather than running out mid-transfer.
+            if let Some(at) = self.progress.take() {
+                deadline = at + self.request_timeout;
             }
             if StdInstant::now() >= deadline {
                 return Err(Error::Io(String::from("request timed out")));
@@ -868,12 +881,20 @@ impl Client {
                 // telling us it could not read what we sent — and it will not answer.
                 AssociationEvent::Rejected { invoke_id: None, reject } => return Err(rejected(&reject)),
                 // The peer withdrew the request this call is waiting on. Nothing else is
-                // coming, so failing now beats waiting out the request timeout — the reject
-                // rule (D35) applied to the other PDU that ends a call without answering it.
+                // coming, so the call fails now rather than waiting out the request timeout.
                 AssociationEvent::Cancelled { invoke_id: id } if id == invoke_id => {
                     return Err(Error::Io(String::from("the peer cancelled the request")));
                 }
                 AssociationEvent::Unconfirmed { pdu } => self.keep_unsolicited(&pdu),
+                // The server asking this end for something: answered, never ignored, or it
+                // waits out its timeout. Outside a `set_file` every request is refused.
+                AssociationEvent::Request { invoke_id: id, pdu } => {
+                    self.answer_peer_request(id, &pdu)?;
+                    if self.serving.is_some() {
+                        let now = self.now();
+                        self.assoc.extend_deadline(invoke_id, now);
+                    }
+                }
                 // An answer that did not decode is still the end of this call. Failing with
                 // the decode error names what actually happened; waiting for the request
                 // timeout reports "the server did not reply" about a server that did.
@@ -888,7 +909,6 @@ impl Client {
                 AssociationEvent::Response { .. }
                 | AssociationEvent::Timeout { .. }
                 | AssociationEvent::Rejected { .. }
-                | AssociationEvent::Request { .. }
                 | AssociationEvent::Malformed { .. }
                 // A blocking client cancels nothing — every call here is answered before the
                 // caller gets control back — so a cancel either way concerns a request no
@@ -935,6 +955,7 @@ impl Client {
             // ask about a variant a wildcard already answers for.
             match event {
                 AssociationEvent::Unconfirmed { pdu } => self.keep_unsolicited(&pdu),
+                AssociationEvent::Request { invoke_id, pdu } => self.answer_peer_request(invoke_id, &pdu)?,
                 AssociationEvent::Closed(reason) => return Err(closed(reason)),
                 AssociationEvent::Refused { layer, code } => return Err(Error::Io(format!("association refused at {layer}: {code:?}"))),
                 // A reject arriving outside a call answers a request that already timed out,
@@ -942,13 +963,11 @@ impl Client {
                 // The association has released the invoke and counted it in
                 // `AssociationStats::rejected`; there is no call left to fail.
                 AssociationEvent::Rejected { .. }
-                // An answer or a timeout for a request nobody is waiting on any more, a
-                // request from the peer (this end serves none), the establishment event, and a
-                // PDU that did not decode — one bad report is not a reason to drop a
-                // connection, and `AssociationStats::malformed` counts it.
+                // An answer or a timeout for a request nobody is waiting on any more, the
+                // establishment event, and a PDU that did not decode — one bad report is not a
+                // reason to drop a connection, and `AssociationStats::malformed` counts it.
                 | AssociationEvent::Response { .. }
                 | AssociationEvent::Timeout { .. }
-                | AssociationEvent::Request { .. }
                 | AssociationEvent::Malformed { .. }
                 // A blocking client cancels nothing — every call here is answered before the
                 // caller gets control back — so a cancel either way concerns a request no

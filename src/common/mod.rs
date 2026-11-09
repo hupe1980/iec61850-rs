@@ -15,13 +15,13 @@ mod service;
 mod time;
 
 pub use edition::Edition;
-pub use error::{DecodeReason, Error, Result, data_access_reason};
+pub use error::{DecodeReason, Error, Result, data_access_reason, service_error_class};
 pub use flags::{ControlModel, OptFlds, ReasonCode, TrgOps};
 pub use limits::Limits;
 pub use mac::MacAddr;
-#[cfg(feature = "std")]
-pub use machine::SystemClock;
 pub use machine::{Clock, EventQueue, Instant, ManualClock, Now};
+#[cfg(feature = "std")]
+pub use machine::{SystemClock, monotonic_now};
 pub use quality::{Quality, Source, Validity};
 pub use reference::{Fc, ObjectReference, Selector, split_index};
 pub use service::{ServiceError, ServiceType, Tracked, TrackingCdc};

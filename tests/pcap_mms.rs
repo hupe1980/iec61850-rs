@@ -1,4 +1,4 @@
-//! The reference MMS capture (`specs/pcap/mms.pcap`, 165 TPKT packets over one association),
+//! The reference MMS capture (`pcap/mms.pcap` in the reference corpus, 165 TPKT packets over one association),
 //! decoded through every layer and re-encoded **byte for byte**.
 //!
 //! This is the strongest check available on the OSI stack without a second implementation to
@@ -7,7 +7,7 @@
 //! association, and the MMS PDUs — all of it against traffic a real client and a real server
 //! actually exchanged, with the octets they wrote as the oracle.
 //!
-//! Skips when `specs/` is absent, which is what CI sees.
+//! Skips when the reference corpus is absent, which is what CI sees.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
@@ -235,7 +235,7 @@ struct Counters {
 
 #[test]
 fn every_packet_of_the_reference_capture_decodes_and_re_encodes_byte_for_byte() {
-    let Some(path) = common::spec("pcap/mms.pcap") else { return };
+    let Some(path) = common::reference("pcap/mms.pcap") else { return };
     let payloads = tcp_payloads(&path);
     assert!(!payloads.is_empty(), "the capture holds TCP payloads");
 
@@ -296,7 +296,7 @@ fn the_association_state_machine_follows_the_reference_capture() {
     use iec61850_rs::common::Instant;
     use iec61850_rs::proto::mms::association::{Association, AssociationConfig, AssociationEvent, CloseReason};
 
-    let Some(path) = common::spec("pcap/mms.pcap") else { return };
+    let Some(path) = common::reference("pcap/mms.pcap") else { return };
     let payloads = tcp_payloads(&path);
     let now = Instant::ZERO;
 
@@ -374,7 +374,7 @@ fn the_capture_s_reports_are_not_mistaken_for_iec_61850_reports() {
     use iec61850_rs::client::Unsolicited;
     use iec61850_rs::common::Limits;
 
-    let Some(path) = common::spec("pcap/mms.pcap") else { return };
+    let Some(path) = common::reference("pcap/mms.pcap") else { return };
     let payloads = tcp_payloads(&path);
     let (mut client, mut server) = (tpkt::Reader::new(), tpkt::Reader::new());
     let (mut classified, mut as_61850) = (0u32, 0u32);
@@ -399,7 +399,7 @@ fn the_capture_s_reports_are_not_mistaken_for_iec_61850_reports() {
                     Unsolicited::CommandTermination(_) => panic!("this capture carries no controls"),
                     Unsolicited::Other { name, values, .. } => {
                         assert!(name.starts_with("KIRKLAND/") || name.starts_with("BELLEVUE/"), "unexpected report name {name}");
-                        assert!(!values.is_empty());
+                        assert_ne!(values, [] as [iec61850_rs::proto::data::Value; 0]);
                     }
                 }
             }

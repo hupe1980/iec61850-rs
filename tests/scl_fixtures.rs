@@ -1,7 +1,7 @@
-//! Every `OpenSCD` fixture in `specs/fixtures/openscd/` loads leniently (all IEDs), the
+//! Every `OpenSCD` fixture in the reference corpus loads leniently (all IEDs), the
 //! dangling type references those files carry come back as diagnostics with stable codes,
 //! strict loading rejects exactly those files, and every GOOSE control block with an
-//! address yields a publisher configuration. Skips when `specs/` is absent.
+//! address yields a publisher configuration. Skips when the reference corpus is absent.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
@@ -14,10 +14,7 @@ use iec61850_rs::scl::{self, FindingCode, LoadOptions};
 
 #[test]
 fn openscd_fixtures_load() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/fixtures/openscd");
-    if !dir.is_dir() {
-        return;
-    }
+    let Some(dir) = common::reference_dir("fixtures/openscd") else { return };
     let (mut files, mut ieds, mut gcbs, mut diags, mut strict_failures) = (0, 0, 0, 0, 0);
     for entry in std::fs::read_dir(&dir).unwrap().flatten() {
         let path = entry.path();
@@ -90,10 +87,7 @@ fn every_data_set_member_of_the_corpus_resolves() {
     // gathering members from a second logical device resolved to nothing. Both showed up
     // here as a wall of `UnresolvedFcda` against files whose types are perfectly well
     // defined, and neither showed up in a hand-written fixture.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/fixtures/openscd");
-    if !dir.is_dir() {
-        return;
-    }
+    let Some(dir) = common::reference_dir("fixtures/openscd") else { return };
     let mut checked = 0;
     for entry in std::fs::read_dir(&dir).unwrap().flatten() {
         let path = entry.path();
@@ -134,11 +128,7 @@ fn every_data_set_member_of_the_corpus_resolves() {
 
 #[test]
 fn the_corpus_validates_with_the_findings_it_is_known_to_have() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/fixtures/openscd");
-    let file = dir.join("valid2007B4.scd");
-    if !file.is_file() {
-        return;
-    }
+    let Some(file) = common::reference("fixtures/openscd/valid2007B4.scd") else { return };
     let xml = std::fs::read_to_string(&file).unwrap();
     let report = scl::validate(&xml, 50, Edition::Ed2_1).unwrap();
     let codes: Vec<FindingCode> = report.findings.iter().map(|f| f.code).collect();
@@ -164,10 +154,7 @@ fn the_parsed_handle_answers_exactly_what_the_one_shot_functions_do() {
     // It is only worth having if it cannot drift from the functions it replaces, so
     // the corpus is the check: same names, same version, same models, same subscriptions,
     // same findings.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/fixtures/openscd");
-    if !dir.is_dir() {
-        return;
-    }
+    let Some(dir) = common::reference_dir("fixtures/openscd") else { return };
     let mut files = 0;
     for entry in std::fs::read_dir(&dir).unwrap().flatten() {
         let path = entry.path();
@@ -194,10 +181,7 @@ fn every_sampled_value_stream_in_the_corpus_describes_its_channels() {
     // The dataset-driven layout against real files rather than a fixture: every
     // addressed sampled-value control block whose data set resolves must produce a layout
     // whose length is the ASDU length the publisher configuration computes independently.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/fixtures/openscd");
-    if !dir.is_dir() {
-        return;
-    }
+    let Some(dir) = common::reference_dir("fixtures/openscd") else { return };
     let mut checked = 0;
     for entry in std::fs::read_dir(&dir).unwrap().flatten() {
         let path = entry.path();
@@ -231,11 +215,7 @@ fn subscriptions_resolve_signal_bound_ext_refs_in_the_corpus() {
     // Only one of the seven `ExtRef`s in this file carries `srcCBName`. The rest name the
     // signal and leave the tool to find the control block that publishes it, which is what
     // a real SCD looks like.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/fixtures/openscd");
-    let file = dir.join("valid2007B4.scd");
-    if !file.is_file() {
-        return;
-    }
+    let Some(file) = common::reference("fixtures/openscd/valid2007B4.scd") else { return };
     let xml = std::fs::read_to_string(&file).unwrap();
     let subs = scl::subscriptions(&xml, "IED2", 50).unwrap();
     assert_eq!(subs.goose.len(), 1, "{subs:#?}");
@@ -246,4 +226,26 @@ fn subscriptions_resolve_signal_bound_ext_refs_in_the_corpus() {
     assert_eq!(g.ext_refs.len(), 4, "four signals, all on the one control block that publishes them");
     assert!(g.ext_refs.iter().all(|x| x.src_cb_name.is_none()), "these are the signal-bound ones");
     assert!(subs.unresolved.is_empty(), "{:#?}", subs.unresolved);
+}
+
+/// The edition a server built from a file serves is the file's, and it decides which control
+/// refusal codes go out: `valid2003.scd` gives an Edition 1 server, `valid2007B4.scd` an
+/// Edition 2.1 one.
+#[cfg(feature = "server")]
+#[test]
+fn the_openscd_edition_pair_serves_the_add_causes_of_its_edition() {
+    use iec61850_rs::proto::mms::control::AddCause;
+    use iec61850_rs::server::Ied;
+
+    for (file, edition, already_selected) in
+        [("valid2003.scd", Edition::Ed1, AddCause::SelectFailed), ("valid2007B4.scd", Edition::Ed2_1, AddCause::ObjectAlreadySelected)]
+    {
+        let Some(path) = common::reference(&format!("fixtures/openscd/{file}")) else { return };
+        let xml = std::fs::read_to_string(&path).unwrap();
+        let scl = scl::Scl::parse(&xml).unwrap();
+        let name = scl.ied_names().into_iter().next().unwrap_or_else(|| panic!("{file} has an IED"));
+        let ied = Ied::new(IedModel::from_scl(&xml, Some(&name)).unwrap()).unwrap();
+        assert_eq!(ied.edition(), edition, "{file}");
+        assert_eq!(AddCause::ObjectAlreadySelected.for_edition(ied.edition()), already_selected, "{file}: the mapping a caller may apply");
+    }
 }

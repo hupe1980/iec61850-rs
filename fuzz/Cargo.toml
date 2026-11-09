@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-iec61850-rs = { path = "..", default-features = false, features = ["std", "goose", "sv", "mms", "scl", "pcap", "client", "server"] }
+iec61850-rs = { path = "..", default-features = false, features = ["std", "goose", "sv", "mms", "scl", "pcap", "client", "server", "log-redb"] }
 
 [[bin]]
 name = "goose_frame"
@@ -68,5 +68,23 @@ doc = false
 [[bin]]
 name = "mms_server"
 path = "fuzz_targets/mms_server.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "scl_edit"
+path = "fuzz_targets/scl_edit.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "log_record"
+path = "fuzz_targets/log_record.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "obtain_engine"
+path = "fuzz_targets/obtain_engine.rs"
 test = false
 doc = false

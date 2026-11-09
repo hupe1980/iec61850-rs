@@ -132,10 +132,9 @@ mod tests {
         assert_eq!(Oid::MMS_APPLICATION_CONTEXT.to_string(), "1.0.9506.2.3");
         assert_eq!(Oid::MMS_APPLICATION_CONTEXT_9506.to_string(), "1.0.9506.1.1");
         assert_eq!(Oid::BER.to_string(), "2.1.1");
-        // The encoding `52 03 01` is what libiec61850 writes and what the notes recorded;
-        // decoding it says the identifier is 2.2.3.1 — association-control(2),
-        // authentication-mechanism(3), password-1(1) — and not the "2.3.1" the notes named
-        // it. The octets were right and the dotted form was not.
+        // The encoding `52 03 01` is what libiec61850 writes; decoded, the identifier is
+        // 2.2.3.1 — association-control(2), authentication-mechanism(3), password-1(1) — not
+        // the "2.3.1" it is sometimes written as.
         assert_eq!(Oid::PASSWORD_MECHANISM.to_string(), "2.2.3.1");
         // `1.1.2` and `1.1.1`, the AP-titles in the reference capture.
         assert_eq!(Oid(&[0x29, 0x02]).to_string(), "1.1.2");

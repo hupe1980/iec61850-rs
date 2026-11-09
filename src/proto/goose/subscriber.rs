@@ -374,12 +374,13 @@ impl Subscriber {
     /// without this the application would see the counter jump backwards with nothing
     /// telling it that the values it was holding had become invalid.
     fn check_expiry(&mut self, now: Instant) {
-        if let Some(s) = self.state {
-            if !self.expired && now >= s.expires_at {
-                self.expired = true;
-                self.stats.expiries = self.stats.expiries.saturating_add(1);
-                self.emit(SubscriberEvent::Expired);
-            }
+        if let Some(s) = self.state
+            && !self.expired
+            && now >= s.expires_at
+        {
+            self.expired = true;
+            self.stats.expiries = self.stats.expiries.saturating_add(1);
+            self.emit(SubscriberEvent::Expired);
         }
     }
 
@@ -874,10 +875,12 @@ mod tests {
     fn other_traffic_and_malformed_frames() {
         let mut s = sub();
         let t0 = Instant::ZERO;
-        assert!(s.feed(t0, &[0u8; 30]).is_empty());
+        let v = s.feed(t0, &[0u8; 30]);
+        assert!(v.is_empty(), "{v:?}");
         let mut other = frame(1, 0, false, vec![]);
         other[5] = 0x09;
-        assert!(s.feed(t0, &other).is_empty());
+        let v = s.feed(t0, &other);
+        assert!(v.is_empty(), "{v:?}");
         assert_eq!(s.stats().other_stream, 2);
         let truncated = &frame(1, 0, false, vec![])[..30];
         assert!(matches!(s.feed(t0, truncated).as_slice(), [SubscriberEvent::Invalid(Invalid::Malformed(_))]));

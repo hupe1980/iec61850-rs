@@ -1,14 +1,10 @@
-//! Wireshark as the oracle for the **station bus**, which is where it was missing.
+//! Wireshark as the oracle for the **station bus**.
 //!
-//! The process-bus oracle (`tshark_oracle.rs`) has checked GOOSE and SV frames from the
-//! start; the MMS side had nothing, and the two halves of this crate agreeing with each
-//! other is exactly the evidence the notes say is worth nothing (README rule 10). So this
-//! runs the real client against the real server through a recording proxy, writes the byte
-//! stream as a TCP capture and asks `tshark` what it is.
-//!
-//! It found a real defect on its first run: `FileDirectory`'s `listOfDirectoryEntry [0]` is
-//! **not** implicitly tagged, so the entries live inside an inner `SEQUENCE` — both halves
-//! of this crate had it wrong in the same way and therefore agreed.
+//! The two halves of this crate agreeing with each other proves nothing, because they share
+//! one codec. So this runs the real client against the real server through a recording proxy,
+//! writes the byte stream as a TCP capture and asks `tshark` what it is. That is how, for
+//! example, `FileDirectory`'s `listOfDirectoryEntry [0]` is known to be **not** implicitly
+//! tagged — a mistake both halves would share and therefore agree on.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
@@ -164,7 +160,7 @@ fn the_whole_station_bus_dissects_as_what_we_put_in() {
     for needle in [
         "\"mms.vendorName\": \"hupe1980\"",
         // `Status` and `GetCapabilityList` are new encodings that only this crate reads, so
-        // they get the oracle before they get a user (D38).
+        // they get the oracle before they get a user.
         "\"mms.vmdLogicalStatus\": \"0\"",
         "\"mms.vmdPhysicalStatus\": \"0\"",
         "\"mms.listOfCapabilities_item\": \"IEC 61850-8-1:2011+AMD1:2020\"",
@@ -184,12 +180,6 @@ fn the_whole_station_bus_dissects_as_what_we_put_in() {
     }
 }
 
-/// The two report shapes a third party is the only honest reader of.
-///
-/// A data set of **FCDs** reports each member as the structure it is, and a report longer than
-/// the negotiated PDU is split into segments. Both are encodings this crate's client is
-/// otherwise the only reader of, which is precisely the case rule 10 says proves nothing — so
-/// Wireshark reads them here.
 /// An `alternateAccess` — the one part of a `Read` that has no name of its own.
 ///
 /// A dissector is the only third party that can say the two tag sets are the right way round:
@@ -241,6 +231,11 @@ fn an_array_element_read_dissects_as_the_element_it_names() {
     }
 }
 
+/// The two report shapes a third party is the only honest reader of.
+///
+/// A data set of **FCDs** reports each member as the structure it is, and a report longer than
+/// the negotiated PDU is split into segments. This crate's client is otherwise the only reader
+/// of both encodings, so Wireshark reads them here.
 #[test]
 fn segmented_and_structured_reports_dissect_as_what_we_put_in() {
     if common::tshark().is_none() {
@@ -336,4 +331,48 @@ fn exercise(addr: &str, handle: &ServerHandle) {
     assert_eq!(body, b"STATION,IED1,2013\n");
 
     c.release().expect("release");
+}
+
+/// ACSI `SetFile`: the client's `ObtainFile`, the server's own `FileOpen`/`FileRead`/`FileClose`
+/// toward the client, and the `NULL` response — the one sequence where this server is the
+/// requester, so the one this crate's client is otherwise the only reader of.
+#[test]
+fn a_set_file_dissects_in_both_directions() {
+    use iec61850_rs::server::{AcsiConfig, FileWritePolicy, ServerConfig};
+    if common::tshark().is_none() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("iec61850-oracle-setfile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create");
+    let cfg = ServerConfig { acsi: AcsiConfig { file_write: FileWritePolicy::Anyone, ..AcsiConfig::default() }, ..ServerConfig::default() };
+    let mut server = Server::bind_with("127.0.0.1:0", Ied::from_scl(RELAY, Some("IED1")).expect("load"), &cfg).expect("bind");
+    server.set_file_store(Box::new(DirectoryStore::new(&dir).writable()));
+    let target = server.local_addr().expect("addr").to_string();
+    std::thread::spawn(move || {
+        let _ = server.accept_one();
+    });
+    let (addr, log) = recording_proxy(target);
+
+    let body: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+    let mut c = Client::connect(&addr).expect("associate");
+    c.set_file("received.bin", &body).expect("SetFile");
+    c.release().expect("release");
+    assert_eq!(std::fs::read(dir.join("received.bin")).unwrap(), body);
+
+    std::thread::sleep(Duration::from_millis(200));
+    let packets = log.lock().expect("lock").clone();
+    let text = dissect("set-file", &packets);
+    assert!(!text.contains("_ws.malformed"), "malformed PDU in the capture:\n{text}");
+    assert!(!text.contains("\"_ws.expert.severity\": \"Error\""), "expert error in the capture:\n{text}");
+    assert!(text.contains("\"mms.obtainFile_element\""), "Wireshark names the ObtainFile:\n{text}");
+    for field in ["\"mms.sourceFile\"", "\"mms.destinationFile\"", "\"mms.sizeOfFile\": \"3000\""] {
+        assert!(text.contains(field), "{field} missing:\n{text}");
+    }
+    // Source and destination in the request, and the name the server's own FileOpen carries.
+    assert_eq!(text.matches("\"mms.FileName_item\": \"received.bin\"").count(), 3, "three file names, each read back:\n{text}");
+    for service in ["fileOpen", "fileRead", "fileClose"] {
+        assert!(text.contains(service), "{service} toward the client is missing:\n{text}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
