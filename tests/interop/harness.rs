@@ -227,7 +227,12 @@ pub fn ied_container(net: &Network, files: &[(&str, &str)]) -> Container<Generic
     // One build at a time: the cargo cache is a shared volume, and two unpacks into it race.
     static BUILD: Mutex<()> = Mutex::new(());
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).canonicalize().expect("repository");
-    let rawether = repo.join("../rawether").canonicalize().expect("rawether next to the repository");
+    // `IEC61850_RAWETHER` names another checkout of `rawether` (a pinned copy, say); by default
+    // it is the one next to this repository, where the path dependency points.
+    let rawether = std::env::var_os("IEC61850_RAWETHER")
+        .map_or_else(|| repo.join("../rawether"), PathBuf::from)
+        .canonicalize()
+        .expect("rawether next to the repository, or at $IEC61850_RAWETHER");
     let mut request = image("ied")
         .with_mount(Mount::bind_mount(repo.to_string_lossy(), "/src/iec61850-rs").with_access_mode(AccessMode::ReadOnly))
         .with_mount(Mount::bind_mount(rawether.to_string_lossy(), "/src/rawether").with_access_mode(AccessMode::ReadOnly))

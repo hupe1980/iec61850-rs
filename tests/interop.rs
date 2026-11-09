@@ -197,7 +197,7 @@ fn this_client_drives_a_libiec61850_server() {
 /// and then serves this server's `FileOpen`/`FileRead`/`FileClose` out of its container.
 #[test]
 fn libiec61850s_file_tool_sends_a_file_to_this_server() {
-    use iec61850_rs::server::{AcsiConfig, DirectoryStore, ServerConfig, SetFilePolicy};
+    use iec61850_rs::server::{AcsiConfig, DirectoryStore, FileWritePolicy, ServerConfig};
     if !docker() {
         return;
     }
@@ -213,7 +213,7 @@ fn libiec61850s_file_tool_sends_a_file_to_this_server() {
     let (_, err, code) = sh(&peer, "seq 1 3000 > /tmp/upload.bin");
     assert_eq!(code, 0, "{err}");
 
-    let cfg = ServerConfig { acsi: AcsiConfig { set_file: SetFilePolicy::Anyone, ..AcsiConfig::default() }, ..ServerConfig::default() };
+    let cfg = ServerConfig { acsi: AcsiConfig { file_write: FileWritePolicy::Anyone, ..AcsiConfig::default() }, ..ServerConfig::default() };
     let ied = Ied::from_scl(&read_file(&peer, "examples/server_example_threadless/simpleIO_direct_control.cid"), None).expect("their model");
     let mut server = Server::bind_with(&std::net::SocketAddr::new(harness::bind_addr(), 0).to_string(), ied, &cfg).expect("bind");
     server.set_file_store(Box::new(DirectoryStore::new(&store).writable()));
@@ -279,6 +279,22 @@ fn libiec61850s_log_client_reads_this_servers_log_from_either_store() {
 }
 
 /// **Our client, their server**: the log services.
+/// **Our client, their server**: `SetFile`. This client offers a file and libiec61850's
+/// `server_example_files` fetches it back with `FileOpen`/`FileRead`/`FileClose` into its own
+/// file store, byte for byte.
+#[test]
+fn this_client_sends_a_file_to_a_libiec61850_server() {
+    if !docker() {
+        return;
+    }
+    let (server, addr) = lib_server("server_example_files", "server_example_files");
+    let mut c = associate(addr);
+    let body: String = (0..3000).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+    c.set_file("upload.txt", body.as_bytes()).expect("SetFile accepted by libiec61850");
+    c.release().expect("release");
+    assert_eq!(read_file(&server, "examples/server_example_files/vmd-filestore/upload.txt"), body, "their store holds what we sent");
+}
+
 #[test]
 fn this_client_reads_a_log_out_of_a_libiec61850_server() {
     if !docker() {

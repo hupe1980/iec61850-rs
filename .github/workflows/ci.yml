@@ -76,13 +76,15 @@ jobs:
         continue-on-error: true
         env:
           RUSTDOCFLAGS: --cfg docsrs -D warnings
-  # The one oracle that checks *behaviour* rather than octets: libiec61850's client against
-  # this server, and this client against libiec61850's server. `tshark` reads every PDU either
-  # half emits and never reads a **sequence**, and the two halves of this crate share one
-  # codec, so they agree by construction — this is the third party that does neither.
+  # The oracles that check *behaviour* rather than octets: libiec61850 (both roles, both
+  # buses), IEC61850bean and csp0924's crates, each a container image the test builds from a
+  # pinned, checksummed release. `tshark` reads every PDU either half emits and never reads a
+  # **sequence**, and the two halves of this crate share one codec, so they agree by
+  # construction — these are the third parties that do neither.
   #
-  # It is a job of its own because it builds a C library, and `IEC61850_REQUIRE_INTEROP`
-  # makes a skip a failure: an oracle that can quietly stop running is not an oracle.
+  # It is a job of its own because the peer images take minutes to build cold, and
+  # `IEC61850_REQUIRE_INTEROP` makes a skip a failure: an oracle that can quietly stop running
+  # is not an oracle.
   interop:
     runs-on: ubuntu-latest
     steps:
