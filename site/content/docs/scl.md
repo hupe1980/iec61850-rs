@@ -1,6 +1,6 @@
 +++
 title = "SCL and the IED model"
-description = "Load an IEC 61850-6 SCL file — ICD, CID or SCD — into an IED model in Rust, resolve what an IED subscribes to, and catch errors the XML schema permits."
+description = "Load an IEC 61850-6 SCL file — ICD, CID or SCD — into an IED model in Rust, resolve what an IED subscribes to, catch errors the XML schema permits, and edit the file without reformatting it."
 weight = 50
 
 [extra]
@@ -298,7 +298,50 @@ The loader does not validate against `SCL.xsd`, so `validate` also reports the o
 violation that changes server behaviour: a type template declaring a member name twice
 (`DuplicateTypeMember`).
 
+## Editing
+
+`scl::Document` edits a file without reformatting it. The text is the document: an unedited
+document is its input byte for byte — BOM, line endings, quote style, attribute spacing,
+comments, CDATA and character references included — and an edit changes only the bytes it is
+about, so a review diff shows the change and nothing else.
+
+```rust
+use iec61850_rs::scl::{Document, Hitem};
+
+let mut doc = Document::from_bytes(std::fs::read("bay.scd")?)?;
+doc.rename_ied("Relay1", "Bay1Relay")?;           // and every reference to it
+doc.set_ap_address("Bay1Relay", "AP1", "IP", "10.0.0.5")?;
+doc.add_history(&Hitem {
+    version: "2".into(), revision: "A".into(), when: "2026-11-09T10:00:00Z".into(),
+    who: Some("alice".into()), what: Some("re-address bay 1".into()), why: None,
+})?;
+std::fs::write("bay.scd", doc.as_str())?;
+```
+
+Each operation is one transaction: if its result would not be well-formed XML it is refused and
+the document is unchanged, and `undo`/`redo` restore exact bytes. New elements go where the
+schema requires them, indented like their siblings, with the file's own line ending.
+
+| Operation | References kept consistent |
+|---|---|
+| `rename_ied` | every `iedName` (`ConnectedAP`, `ExtRef`, `ClientLN`, `LNode`, …), `IEDName`, and `Val` object references such as an `LGOS.GoCBRef` |
+| `remove_ied` | its `ConnectedAP`s (and a `SubNetwork` left empty), `IEDName`/`ClientLN`/`KDC` entries; bound `ExtRef`s are unbound, `LNode`s become `iedName="None"` |
+| `add_ln` / `remove_ln` | members that name a removed LN go, a data set left empty goes with its `datSet` references; `ExtRef`s and `LNode`s are released |
+| `add_data_set` / `rename_data_set` / `remove_data_set`, `add_fcda` / `remove_fcda` | `datSet` of the LN's control blocks and `Val` references |
+| `add_control` / `rename_control` / `remove_control` (GOOSE, SV, report, log) | `GSE`/`SMV` `cbName`, `ExtRef/@srcCBName`, `Val` references |
+| `bind_ext_ref` / `unbind_ext_ref` | `intAddr`, `desc` and the `pServT`/`pLN`/`pDO`/`pDA` restrictions are kept |
+| `set_gse_address` / `set_smv_address` / `set_ap_address` | an entry is created under the right `ConnectedAP` when there is none |
+| `add_history` | creates `History` if needed |
+
+For anything else, `Document::edit` gives raw element, attribute and text operations in one
+transaction; `Document::read` gives the same view without editing. A file with a DTD is refused,
+so no entity is expanded or fetched; input must be UTF-8.
+
+From the command line, `ied scl edit` makes the common edits —
+[Command line](@/docs/cli.md#edit-scl).
+
 ## Limits
 
-The loader is read-only: it does not write SCL, does not validate against the IEC 61850-7-7
-namespace files, and generates no typed Rust model.
+The loader does not validate against the IEC 61850-7-7 namespace files and generates no typed
+Rust model. The editor does not import an IED from an ICD into an SCD (data-type template
+merging).

@@ -1,30 +1,4 @@
-//! Editing SCL without reformatting it.
-//!
-//! A [`Document`] holds the file's text, and the text *is* the document: an unedited document
-//! is its input byte for byte, and an edit changes only the bytes it is about. Each edit is one
-//! transaction — the text is parsed once, the edit records byte-range [`Patch`]es against that
-//! parse, and they are applied together. A result that is not well-formed XML is refused and
-//! the document is left as it was. Every applied transaction keeps its inverse, so
-//! [`undo`](Document::undo) and [`redo`](Document::redo) restore exact bytes.
-//!
-//! The typed operations ([`rename_ied`](Document::rename_ied),
-//! [`set_gse_address`](Document::set_gse_address), …) keep references consistent; for anything
-//! else, [`edit`](Document::edit) gives a [`Tx`] with raw element, attribute and text
-//! operations. New elements go where the SCL schema requires them, indented like their
-//! siblings, with the file's own line ending.
-//!
-//! ```
-//! use iec61850_rs::scl::Document;
-//!
-//! let mut doc = Document::parse(r#"<SCL><Header id="x"/>
-//!   <IED name="Relay1"/>
-//! </SCL>"#)?;
-//! doc.rename_ied("Relay1", "Bay1Relay")?;
-//! assert!(doc.as_str().contains(r#"<IED name="Bay1Relay"/>"#));
-//! doc.undo();
-//! assert!(doc.as_str().contains(r#"<IED name="Relay1"/>"#));
-//! # Ok::<(), iec61850_rs::Error>(())
-//! ```
+//! Editing SCL without reformatting it; see [`Document`].
 
 mod layout;
 mod ops;
@@ -59,7 +33,34 @@ impl Transaction {
     }
 }
 
-/// An SCL file being edited. See the [module documentation](self).
+/// An SCL file being edited, without reformatting it.
+///
+/// The document holds the file's text, and the text *is* the document: an unedited document is
+/// its input byte for byte, and an edit changes only the bytes it is about. Each edit is one
+/// transaction — the text is parsed once, the edit records byte-range [`Patch`]es against that
+/// parse, and they are applied together. A result that is not well-formed XML is refused and
+/// the document is left as it was. Every applied transaction keeps its inverse, so
+/// [`undo`](Document::undo) and [`redo`](Document::redo) restore exact bytes.
+///
+/// The typed operations ([`rename_ied`](Document::rename_ied),
+/// [`set_gse_address`](Document::set_gse_address), …) keep references consistent; for anything
+/// else, [`edit`](Document::edit) gives a [`Tx`] with raw element, attribute and text
+/// operations. New elements go where the SCL schema requires them, indented like their
+/// siblings, with the file's own line ending. A document with a DTD is refused, so no entity is
+/// ever expanded or fetched.
+///
+/// ```
+/// use iec61850_rs::scl::Document;
+///
+/// let mut doc = Document::parse(r#"<SCL><Header id="x"/>
+///   <IED name="Relay1"/>
+/// </SCL>"#)?;
+/// doc.rename_ied("Relay1", "Bay1Relay")?;
+/// assert!(doc.as_str().contains(r#"<IED name="Bay1Relay"/>"#));
+/// doc.undo();
+/// assert!(doc.as_str().contains(r#"<IED name="Relay1"/>"#));
+/// # Ok::<(), iec61850_rs::Error>(())
+/// ```
 #[derive(Clone, Debug)]
 pub struct Document {
     text: String,

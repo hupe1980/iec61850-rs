@@ -441,6 +441,55 @@ and the command exits non-zero.
 one that names nothing, or a block this IED does not subscribe to (`[not subscribed]`), is
 flagged. `--freq` (default 50) is the nominal frequency for reading `smpRate`.
 
+## Edit SCL
+
+`scl edit` makes one change without reformatting the file; references move with it:
+
+```bash
+$ ied scl edit bay.scd rename-ied Pub Bay1 --in-place --who alice --why "bay renumbering"
+rename IED Pub → Bay1: 6 change(s)
+$ ied scl edit bay.scd gse Bay1 LD0 gcb1 --appid 0042 --vlan 00A --dry-run
+--- bay.scd
++++ bay.scd
+@@ -17,8 +17,8 @@
+ 				<GSE ldInst="LD0" cbName="gcb1">
+ 					<Address>
+ 						<P type="MAC-Address">01-0C-CD-01-00-01</P>
+-						<P type="APPID">0001</P>
+-						<P type="VLAN-ID">000</P>
++						<P type="APPID">0042</P>
++						<P type="VLAN-ID">00A</P>
+ 						<P type="VLAN-PRIORITY">4</P>
+ 					</Address>
+ 				</GSE>
+set GSE address of Bay1LD0/gcb1: 2 change(s)
+```
+
+The six changes of the rename are the IED, its `ConnectedAP`, an `LNode`, a subscriber's
+`ExtRef`, an `LGOS` value naming its GOOSE block, and the history item.
+
+| Edit | Arguments |
+|---|---|
+| `rename-ied` | `<OLD> <NEW>` |
+| `remove-ied` | `<NAME>` |
+| `gse` | `<IED> <LD> <CB>` with `--mac`, `--appid` (hex), `--vlan` (hex), `--vlan-priority`, `--min-time`/`--max-time` (ms); unset fields keep their value |
+| `smv` | `<IED> <LD> <CB>` with `--mac`, `--appid`, `--vlan`, `--vlan-priority` |
+| `ap-address` | `<IED> <AP> <P-TYPE> <VALUE>`, e.g. `IP 10.0.0.5` |
+| `history` | `--what <TEXT>` (and `--version`, `--revision`, `--who`, `--why`) |
+
+| Option | |
+|---|---|
+| `-o <FILE>`, `--in-place` | where to write (default stdout); the file is replaced atomically |
+| `--dry-run` | print a unified diff and write nothing |
+| `--who`, `--why` | also record the edit as a `Header/History` item |
+| `--check` | refuse to write if the result has any validation error |
+| `--force` | write even if the edit adds validation errors — refused otherwise |
+| `--max-size <BYTES>` | refuse larger input before reading it (default 1 GiB) |
+| `--freq <50\|60>` | nominal frequency for validation (default 50) |
+
+The file is validated before and after the edit; an edit that adds an error finding is refused
+with the finding's code. A failed edit writes nothing.
+
 ## Encode, decode, dissect
 
 ```bash
