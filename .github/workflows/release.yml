@@ -136,15 +136,21 @@ jobs:
     needs: [guard, ci, binaries]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    # Holds CARGO_REGISTRY_TOKEN, and is where a required reviewer goes if a publish should
-    # need a human to approve it.
+    # crates.io Trusted Publishing: the job exchanges its OIDC identity for a short-lived token,
+    # so no registry secret is stored. The environment is where a required reviewer goes if a
+    # publish should need a human to approve it.
     environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
       - run: cargo publish --locked
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   # Last: the release page is the announcement, so it goes up once the thing it announces is
   # actually installable.
