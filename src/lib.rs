@@ -122,6 +122,8 @@ pub mod ber;
 pub mod client;
 pub mod common;
 pub mod model;
+#[cfg(feature = "net")]
+pub mod net;
 #[cfg(feature = "pcap")]
 pub mod pcap;
 #[cfg(any(feature = "goose", feature = "sv", feature = "mms"))]

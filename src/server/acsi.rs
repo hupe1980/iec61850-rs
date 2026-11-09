@@ -436,6 +436,8 @@ pub struct Acsi {
     tracking: Tracking,
     /// The logs it keeps.
     logs: Logs,
+    /// The GOOSE and sampled-value publishers its `GoCB`s and `MSVCB`s drive.
+    publishers: super::process_bus::Publishers,
     /// Where its files come from. `NoFiles` by default: an IED that has none should say so
     /// rather than expose a filesystem by accident.
     files: Box<dyn FileStore>,
@@ -479,6 +481,7 @@ impl Acsi {
         let mut groups = SettingGroups::new(&ied);
         let logs = Logs::new(&ied);
         let tracking = Tracking::new(&ied);
+        let publishers = super::process_bus::Publishers::new(&ied);
         let mut acsi = Acsi {
             ied,
             reports,
@@ -486,6 +489,7 @@ impl Acsi {
             groups: SettingGroups::default(),
             tracking,
             logs,
+            publishers,
             files: Box::new(NoFiles),
             handles: Vec::new(),
             next_frsm: 1,
@@ -665,6 +669,9 @@ impl Acsi {
     /// `RptEna` being per-block rather than per-server.
     pub fn commit(&mut self, now: Instant) -> Vec<(AssocId, Vec<u8>)> {
         let dirty = self.ied.take_dirty();
+        // The process bus first: a state change is a GOOSE before it is a report.
+        let utc = self.clock.now();
+        self.publishers.on_commit(&self.ied, &dirty, now, utc);
         let wall = self.now(now).entry();
         // Logging first: a log entry records what the model held at the moment of the change,
         // and the report engine writes counters back into the model as it publishes.
@@ -677,6 +684,7 @@ impl Acsi {
 
     /// Time passed: emit whatever a gathering window or an integrity period has made due.
     pub fn on_timeout(&mut self, now: Instant) -> Vec<(AssocId, Vec<u8>)> {
+        self.publishers.on_timeout(now);
         self.controls.on_timeout(&mut self.ied, now);
         // An edit reservation nobody released: `ResvTms` is what ends it.
         self.groups.on_timeout(&mut self.ied, now);
@@ -696,7 +704,31 @@ impl Acsi {
         // Both layers own deadlines: a report's gathering window or integrity period, and a
         // selection expiry or a time-activated command. Reporting only one of them is how an
         // event loop sleeps through the other.
-        [self.reports.next_timeout(), self.controls.next_timeout(), self.groups.next_timeout()].into_iter().flatten().min()
+        [self.reports.next_timeout(), self.controls.next_timeout(), self.groups.next_timeout(), self.publishers.next_timeout()].into_iter().flatten().min()
+    }
+
+    /// The source address GOOSE and sampled values are published from: the hardware address of
+    /// the interface they go out on.
+    pub fn set_source_mac(&mut self, mac: crate::common::MacAddr) {
+        self.publishers.set_source(mac);
+    }
+
+    /// The system frequency for a sampled-value block whose `smpRate` counts samples per
+    /// period (default 50 Hz).
+    pub fn set_nominal_hz(&mut self, hz: u32) {
+        self.publishers.set_nominal_hz(hz);
+    }
+
+    /// Hand every GOOSE and sampled-value frame that is due to `send`. Call after
+    /// [`Acsi::commit`] and [`Acsi::on_timeout`]; the frames borrow the publishers' buffers, so
+    /// nothing is allocated.
+    pub fn drain_frames(&mut self, send: impl FnMut(&[u8])) {
+        self.publishers.drain(send);
+    }
+
+    /// `GoCB`s and `MSVCB`s currently publishing.
+    pub fn publishing(&self) -> usize {
+        self.publishers.enabled()
     }
 
     /// An association opened, and this is what it calls itself.
@@ -1099,6 +1131,15 @@ impl Acsi {
             }
             _ => {}
         }
+        // Enabling a `GoCB` or `MSVCB` starts a publisher, which needs a data set the file says
+        // how to publish; a block that cannot is refused here rather than enabled and silent.
+        if let Some((block, attribute)) = reference.rsplit_once(tree::SEP)
+            && matches!(attribute, "GoEna" | "SvEna")
+            && value == Value::Boolean(true)
+            && self.publishers.refusal(block).is_some()
+        {
+            return Err(super::ied::DATA_ACCESS_VALUE_INVALID);
+        }
         if let Some((block, attribute)) = reference.rsplit_once(tree::SEP) {
             if self.reports.has(block) {
                 self.reports.on_write(assoc, &mut self.ied, block, attribute, &value, now)?;
@@ -1265,7 +1306,13 @@ impl Acsi {
         let (mut matched, mut deleted) = (0u32, 0u32);
         for name in names {
             let ObjectName::DomainSpecific { domain, item } = name else { continue };
-            let (exists, removed) = self.ied.delete_data_set(&alloc::format!("{domain}/{item}"));
+            let reference = alloc::format!("{domain}/{item}");
+            // A data set a publisher is sending must outlive the stream.
+            if self.publishers.publishes_data_set(&self.ied, &reference) {
+                matched += 1;
+                continue;
+            }
+            let (exists, removed) = self.ied.delete_data_set(&reference);
             matched += u32::from(exists);
             deleted += u32::from(removed);
             if removed {

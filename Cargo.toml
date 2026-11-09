@@ -2,7 +2,7 @@
 name = "iec61850-rs"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "IEC 61850 in Rust: GOOSE, Sampled Values, an MMS client and server over the full OSI station-bus stack, and SCL. Panic-free, sans-IO, no_std-capable."
 repository = "https://github.com/hupe1980/iec61850-rs"
@@ -42,11 +42,15 @@ client = ["std", "mms"]
 # A blocking MMS server over TCP: the association in the server role, the IED model from SCL
 # as the served namespace, and the ACSI services above it. No runtime.
 server = ["std", "mms", "scl"]
+# GOOSE and SV on a live interface: raw Ethernet through `rawether` (Linux AF_PACKET, macOS
+# and FreeBSD BPF), with the IEC 61850 presets.
+net = ["std", "dep:rawether"]
 # The `ied` command-line tool.
-cli = ["std", "pcap", "scl", "goose", "sv", "mms", "client", "server"]
+cli = ["std", "pcap", "scl", "goose", "sv", "mms", "client", "server", "net"]
 
 [dependencies]
 roxmltree = { version = "0.21", optional = true }
+rawether = { version = "0.1", path = "../rawether", optional = true }
 
 [dev-dependencies]
 proptest = "1.11"
@@ -157,6 +161,11 @@ required-features = ["client", "scl"]
 name = "mms_server"
 path = "tests/mms_server.rs"
 required-features = ["client", "server"]
+
+[[test]]
+name = "process_bus_server"
+path = "tests/process_bus_server.rs"
+required-features = ["client", "server", "goose", "sv", "pcap"]
 
 # Examples state the features they use, so `cargo test --no-default-features` does not try to
 # build a GOOSE example without the GOOSE codec.

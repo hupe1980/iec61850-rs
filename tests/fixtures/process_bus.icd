@@ -1,0 +1,77 @@
+<?xml version="1.0"?>
+<!-- An IED with a GOOSE control block, a sampled-value control block and a GOOSE control
+     block the file gives no address: what the server's publishers are tested against. -->
+<SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">
+  <Header id="process_bus"/>
+  <Communication>
+    <SubNetwork name="process">
+      <ConnectedAP iedName="IED1" apName="P1">
+        <GSE ldInst="LD0" cbName="gcbTrip">
+          <Address>
+            <P type="MAC-Address">01-0C-CD-01-00-05</P>
+            <P type="APPID">0005</P>
+            <P type="VLAN-ID">001</P>
+            <P type="VLAN-PRIORITY">4</P>
+          </Address>
+          <MinTime unit="s" multiplier="m">4</MinTime>
+          <MaxTime unit="s" multiplier="m">100</MaxTime>
+        </GSE>
+        <SMV ldInst="MU" cbName="msvcb01">
+          <Address>
+            <P type="MAC-Address">01-0C-CD-04-00-01</P>
+            <P type="APPID">4000</P>
+            <P type="VLAN-ID">002</P>
+            <P type="VLAN-PRIORITY">4</P>
+          </Address>
+        </SMV>
+      </ConnectedAP>
+    </SubNetwork>
+  </Communication>
+  <IED name="IED1"><AccessPoint name="P1"><Server>
+    <LDevice inst="LD0">
+      <LN0 lnClass="LLN0" inst="" lnType="LLN0_T">
+        <DataSet name="dsTrip">
+          <FCDA ldInst="LD0" lnClass="PTRC" lnInst="1" doName="Tr" daName="general" fc="ST"/>
+          <FCDA ldInst="LD0" lnClass="PTRC" lnInst="1" doName="Tr" daName="q" fc="ST"/>
+        </DataSet>
+        <GSEControl name="gcbTrip" datSet="dsTrip" confRev="3" appID="IED1_Trip" type="GOOSE"/>
+        <GSEControl name="gcbBare" datSet="dsTrip" confRev="1" appID="IED1_Bare" type="GOOSE"/>
+      </LN0>
+      <LN lnClass="PTRC" inst="1" prefix="" lnType="PTRC_T"/>
+    </LDevice>
+    <LDevice inst="MU">
+      <LN0 lnClass="LLN0" inst="" lnType="LLN0_T">
+        <DataSet name="PhsMeas">
+          <FCDA ldInst="MU" lnClass="TCTR" lnInst="1" doName="AmpSv" daName="instMag.i" fc="MX"/>
+          <FCDA ldInst="MU" lnClass="TCTR" lnInst="1" doName="AmpSv" daName="q" fc="MX"/>
+          <FCDA ldInst="MU" lnClass="TCTR" lnInst="2" doName="AmpSv" daName="instMag.i" fc="MX"/>
+          <FCDA ldInst="MU" lnClass="TCTR" lnInst="2" doName="AmpSv" daName="q" fc="MX"/>
+        </DataSet>
+        <SampledValueControl name="msvcb01" smvID="IED1MU01" datSet="PhsMeas" confRev="1" smpRate="80" nofASDU="1" smpMod="SmpPerPeriod" multicast="true"/>
+      </LN0>
+      <LN lnClass="TCTR" inst="1" prefix="" lnType="TCTR_T"/>
+      <LN lnClass="TCTR" inst="2" prefix="" lnType="TCTR_T"/>
+    </LDevice>
+  </Server></AccessPoint></IED>
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_T" lnClass="LLN0"><DO name="Mod" type="INC_T"/></LNodeType>
+    <LNodeType id="PTRC_T" lnClass="PTRC"><DO name="Tr" type="ACT_T"/></LNodeType>
+    <LNodeType id="TCTR_T" lnClass="TCTR"><DO name="AmpSv" type="SAV_T"/></LNodeType>
+    <DOType id="INC_T" cdc="INC">
+      <DA name="stVal" fc="ST" bType="Enum" type="Mod_E"/>
+      <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+    </DOType>
+    <DOType id="ACT_T" cdc="ACT">
+      <DA name="general" fc="ST" bType="BOOLEAN"/>
+      <DA name="q" fc="ST" bType="Quality"/>
+      <DA name="t" fc="ST" bType="Timestamp"/>
+    </DOType>
+    <DOType id="SAV_T" cdc="SAV">
+      <DA name="instMag" fc="MX" bType="Struct" type="AnalogueValueI"/>
+      <DA name="q" fc="MX" bType="Quality"/>
+    </DOType>
+    <DAType id="AnalogueValueI"><BDA name="i" bType="INT32"/></DAType>
+    <EnumType id="Mod_E"><EnumVal ord="1">on</EnumVal></EnumType>
+  </DataTypeTemplates>
+</SCL>

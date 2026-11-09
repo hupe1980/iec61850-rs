@@ -32,6 +32,7 @@ mod files;
 mod ied;
 mod log;
 mod net;
+mod process_bus;
 mod rcb;
 mod sg;
 mod supervision;
