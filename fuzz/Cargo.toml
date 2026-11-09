@@ -70,3 +70,9 @@ name = "mms_server"
 path = "fuzz_targets/mms_server.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "scl_edit"
+path = "fuzz_targets/scl_edit.rs"
+test = false
+doc = false

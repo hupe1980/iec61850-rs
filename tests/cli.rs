@@ -637,3 +637,132 @@ const SIM_RELAY: &str = r#"<?xml version="1.0"?>
     <DAType id="AV_T"><BDA name="f" bType="FLOAT32"/></DAType>
   </DataTypeTemplates>
 </SCL>"#;
+
+// --- `ied scl edit` ---------------------------------------------------------------------------
+
+const EDIT_FIXTURE: &str = include_str!("fixtures/edit.scd");
+
+/// A scratch directory per test, so parallel tests do not share files.
+fn scratch_file(name: &str, text: &str) -> (PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!("ied-scl-edit-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("bay.scd");
+    std::fs::write(&file, text).unwrap();
+    (dir, file.to_str().unwrap().to_string())
+}
+
+#[test]
+fn scl_edit_renames_to_stdout_and_leaves_the_file_alone() {
+    let (dir, file) = scratch_file("stdout", EDIT_FIXTURE);
+    let o = run(&["scl", "edit", &file, "rename-ied", "Pub", "Bay1"]);
+    assert!(o.ok, "{}", o.stderr);
+    assert!(o.stderr.contains("5 change(s)"), "{}", o.stderr);
+    assert_eq!(o.stdout.lines().count(), EDIT_FIXTURE.lines().count());
+    assert!(o.stdout.contains("<IED name=\"Bay1\">") && o.stdout.contains("<Val>Bay1LD0/LLN0$GO$gcb1</Val>"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), EDIT_FIXTURE);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+// SR-004
+#[test]
+fn scl_edit_refuses_input_above_the_size_limit() {
+    let (dir, file) = scratch_file("size", EDIT_FIXTURE);
+    let o = run(&["scl", "edit", &file, "rename-ied", "Pub", "Bay1", "--max-size", "100"]);
+    assert!(!o.ok && o.stderr.contains("limit") && o.stdout.is_empty(), "{}", o.stderr);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+// SR-008
+#[test]
+fn scl_edit_refuses_an_edit_that_adds_a_validation_error_unless_forced() {
+    let second = "\t\t\t\t<GSE ldInst=\"LD0\" cbName=\"gcb2\">\n\t\t\t\t\t<Address>\n\t\t\t\t\t\t<P type=\"MAC-Address\">01-0C-CD-01-00-01</P>\n\t\t\t\t\t\t<P type=\"APPID\">0002</P>\n\t\t\t\t\t</Address>\n\t\t\t\t</GSE>\n\t\t\t</ConnectedAP>\n\t\t\t<ConnectedAP iedName=\"Sub\"";
+    let text = EDIT_FIXTURE.replacen("\t\t\t</ConnectedAP>\n\t\t\t<ConnectedAP iedName=\"Sub\"", second, 1).replacen(
+        "\t\t\t\t\t\t</GSEControl>",
+        "\t\t\t\t\t\t</GSEControl>\n\t\t\t\t\t\t<GSEControl name=\"gcb2\" datSet=\"ds1\" appID=\"g2\" confRev=\"1\"/>",
+        1,
+    );
+    let (dir, file) = scratch_file("finding", &text);
+    let out = dir.join("out.scd");
+    let out = out.to_str().unwrap();
+    let o = run(&["scl", "edit", &file, "gse", "Pub", "LD0", "gcb2", "--appid", "0001", "-o", out]);
+    assert!(!o.ok && o.stderr.contains("DuplicateStream"), "{}", o.stderr);
+    assert!(!std::path::Path::new(out).exists(), "nothing is written");
+    let o = run(&["scl", "edit", &file, "gse", "Pub", "LD0", "gcb2", "--appid", "0001", "-o", out, "--force"]);
+    assert!(o.ok, "{}", o.stderr);
+    // The whole address is written: the VLAN fields the block lacked are added after APPID.
+    let written = std::fs::read_to_string(out).unwrap();
+    assert!(
+        written
+            .contains("<P type=\"APPID\">0001</P>\n\t\t\t\t\t\t<P type=\"VLAN-ID\">000</P>\n\t\t\t\t\t\t<P type=\"VLAN-PRIORITY\">4</P>\n\t\t\t\t\t</Address>"),
+        "{written}"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+// SR-009
+#[test]
+fn scl_edit_in_place_is_atomic() {
+    let (dir, file) = scratch_file("inplace", EDIT_FIXTURE);
+    let o = run(&["scl", "edit", &file, "ap-address", "Pub", "AP1", "IP", "10.0.0.9", "--in-place"]);
+    assert!(o.ok, "{}", o.stderr);
+    assert!(std::fs::read_to_string(&file).unwrap().contains("<P type=\"IP\">10.0.0.9</P>"));
+    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert_eq!(left.len(), 1, "no temporary file is left behind: {left:?}");
+
+    // A write that cannot happen leaves the original byte for byte.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let before = std::fs::read(&file).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let o = run(&["scl", "edit", &file, "ap-address", "Pub", "AP1", "IP", "10.0.0.10", "--in-place"]);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!o.ok && o.stderr.contains("unchanged"), "{}", o.stderr);
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+// SR-010
+#[test]
+fn scl_edit_dry_run_prints_a_diff_and_writes_nothing() {
+    let (dir, file) = scratch_file("dry", EDIT_FIXTURE);
+    let o = run(&["scl", "edit", &file, "rename-ied", "Sub", "Hmi", "--dry-run", "--in-place"]);
+    assert!(o.ok, "{}", o.stderr);
+    let removed = o.stdout.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
+    let added = o.stdout.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
+    assert_eq!((removed, added), (4, 4), "{}", o.stdout);
+    assert!(o.stdout.contains("+\t\t\t\t\t\t\t<IEDName>Hmi</IEDName>"), "{}", o.stdout);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), EDIT_FIXTURE);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+// SR-011
+#[test]
+fn scl_edit_records_who_and_why_in_the_header_history() {
+    let (dir, file) = scratch_file("history", EDIT_FIXTURE);
+    let o = run(&["scl", "edit", &file, "ap-address", "Pub", "AP1", "IP", "10.0.0.9", "--who", "alice", "--why", "new subnet"]);
+    assert!(o.ok, "{}", o.stderr);
+    let items: Vec<_> = o.stdout.lines().filter(|l| l.contains("<Hitem ")).collect();
+    assert_eq!(items.len(), 1, "{}", o.stdout);
+    assert!(
+        items[0].contains("version=\"1\" revision=\"A\"") && items[0].contains("who=\"alice\" what=\"set IP of Pub/AP1\" why=\"new subnet\""),
+        "{}",
+        items[0]
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn scl_edit_reports_a_failed_edit_and_writes_nothing() {
+    let (dir, file) = scratch_file("fail", EDIT_FIXTURE);
+    for args in [vec!["rename-ied", "Nobody", "X"], vec!["rename-ied", "Pub", "Sub"], vec!["frobnicate"], vec!["rename-ied", "Pub"]] {
+        let mut full = vec!["scl", "edit", file.as_str()];
+        full.extend(&args);
+        full.push("--in-place");
+        let o = run(&full);
+        assert!(!o.ok, "{args:?} should fail");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), EDIT_FIXTURE, "{args:?}");
+    }
+    std::fs::remove_dir_all(dir).ok();
+}

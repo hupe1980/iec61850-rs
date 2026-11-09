@@ -68,7 +68,7 @@ dl "https://content.nettedautomation.com/n/download/2025/IEC61850-Series_KHS_202
 dl "https://web.archive.org/web/2016id_/http://iec61850.ucaiug.org/Implementation%20Guidelines/DigIF_spec_9-2LE_R2-1_040707-CB.pdf" $R/ucaiug/IEC61850-9-2LE-DigIF_spec_R2-1.pdf
 dl "https://sites.ecse.rpi.edu/~vanfrl/documents/mscthesis/2015_Seyed_Reza%20Firouzi_MSc%20thesis%20report.pdf" $R/ucaiug/RPI-2015-Firouzi-IEC61850-90-5-R-GOOSE-R-SV-thesis.pdf
 # SCL XSD (community mirror of the IEC code component; prefer the official IEC package when available)
-for f in SCL.xsd SCL_BaseTypes.xsd SCL_Enums.xsd SCL_IED.xsd SCL_Substation.xsd SCL_Communication.xsd SCL_DataTypeTemplates.xsd; do
+for f in SCL.xsd SCL_BaseSimpleTypes.xsd SCL_BaseTypes.xsd SCL_Enums.xsd SCL_IED.xsd SCL_Substation.xsd SCL_Communication.xsd SCL_DataTypeTemplates.xsd; do
   dl "https://raw.githubusercontent.com/rte-france/SCL_Loader/master/src/scl_loader/resources/SCL_Schema/$f" "$R/scl/$f"; done
 # Sample captures
 dl "https://wiki.wireshark.org/uploads/__moin_import__/attachments/SampleCaptures/mms.pcap.gz" $R/pcap/mms.pcap.gz
