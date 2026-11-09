@@ -167,12 +167,23 @@ proptest! {
 #[test]
 fn child_appends_until_killed() {
     let Some(path) = std::env::var_os("IEC61850_LOG_KILL_CHILD") else { return };
-    let mut store = RedbLog::open(PathBuf::from(path), logs(), 64).unwrap();
+    let mut store = RedbLog::open(PathBuf::from(&path), logs(), 64).unwrap();
+    let ready = ready_marker(std::path::Path::new(&path));
     let mut i: u32 = 0;
     loop {
         store.append(LOG, entry(i % 86_400_000, i64::from(i))).unwrap();
+        if i == 0 {
+            std::fs::write(&ready, b"").unwrap();
+        }
         i = i.wrapping_add(1);
     }
+}
+
+/// The file the child creates once its first append is committed.
+fn ready_marker(store: &std::path::Path) -> PathBuf {
+    let mut name = store.as_os_str().to_owned();
+    name.push(".ready");
+    PathBuf::from(name)
 }
 
 /// A process killed while appending leaves a store that reopens consistent: the count is the
@@ -189,9 +200,18 @@ fn a_store_killed_mid_append_reopens_consistent() {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        std::thread::sleep(Duration::from_millis(300 + 150 * round));
+        // Kill only after the first commit, so a slow runner cannot make the test vacuous, and
+        // at a different point in the append stream each round.
+        let ready = ready_marker(&file.0);
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while !ready.exists() {
+            assert!(std::time::Instant::now() < until, "round {round}: the child never committed an append");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(50 + 75 * round));
         child.kill().unwrap(); // SIGKILL
         child.wait().unwrap();
+        let _ = std::fs::remove_file(&ready);
 
         let mut store = RedbLog::open(&file.0, logs(), 64).unwrap();
         let all = store.by_time(LOG, None, None, 1000).expect("every entry decodes");
