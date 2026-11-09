@@ -145,7 +145,7 @@ fn enabling_a_sampled_value_control_block_publishes_the_models_values_every_samp
 
     c.write("IED1MU/LLN0$MS$msvcb01$SvEna", Fc::MS, &Value::Boolean(false)).unwrap();
     let _ = collect(&rx, Duration::from_millis(50));
-    assert!(collect(&rx, Duration::from_millis(100)).is_empty());
+    assert_eq!(collect(&rx, Duration::from_millis(100)).len(), 0, "disabled means silent");
     c.release().unwrap();
 }
 

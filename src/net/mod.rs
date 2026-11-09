@@ -19,7 +19,7 @@
 //! use iec61850_rs::net::{Link, LinkOptions};
 //! use iec61850_rs::proto::goose::{Subscriber, SubscriberConfig, SubscriptionKey};
 //!
-//! let key = SubscriptionKey { dst: "01-0C-CD-01-00-05".parse()?, appid: 5, gocb_ref: "IED1LD0/LLN0$GO$gcbTrip".into() };
+//! let key = SubscriptionKey { dst: iec61850_rs::MacAddr::parse("01-0C-CD-01-00-05")?, appid: 5, gocb_ref: "IED1LD0/LLN0$GO$gcbTrip".into() };
 //! let mut link = Link::open("eth0", &LinkOptions::goose().join(key.dst))?;
 //! iec61850_rs::net::drop_capabilities()?; // CAP_NET_RAW is not needed any more
 //! let mut sub = Subscriber::new(SubscriberConfig::new(key));

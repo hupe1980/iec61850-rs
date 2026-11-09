@@ -8,9 +8,9 @@
 //! than re-deciding anything, so what the tool reports about a frame is what a subscribing
 //! IED would decide about it.
 //!
-//! Everything here works on capture files. Live capture arrives with the network adapters;
-//! until then a pcap is the interface, which has the pleasant side effect that every
-//! subcommand is testable in CI.
+//! The process-bus commands read and write capture files, and — with `--iface` — a live
+//! interface. A live capture is recorded and then judged by exactly the code that judges a
+//! file, so both paths report the same thing about the same frames.
 
 // Timestamps and rates are cast to `f64` only to be printed; the precision a `u64`
 // nanosecond count loses past 2^52 is 104 days of sub-nanosecond digits nobody reads.
@@ -44,6 +44,9 @@ USAGE:
 
 COMMANDS:
     goose sniff <FILE.pcap>        Decode GOOSE and run the subscriber's verdict over it
+    goose sniff --iface <IF>       …on a live interface
+    goose publish --iface <IF> --scd <FILE> --gocb <REF>
+                                   Publish a GOOSE control block of an SCD on an interface
     mms sniff <FILE.pcap>          Decode MMS over the OSI stack: association, services, values
     mms identify <HOST[:PORT]>     Associate with a server and print what it says it is
     mms status <HOST[:PORT]>       Ask whether the server is healthy — the cheapest round trip there is
@@ -62,12 +65,26 @@ COMMANDS:
     mms log <HOST[:PORT]> <LOG>    Read a log's entries; --lcb prints its control block
     mms sg <HOST[:PORT]> [REF]     Setting groups: print, --activate N, --edit N
     sv monitor <FILE.pcap>         Track sampled-value streams: gaps, sync, staleness
+    sv monitor --iface <IF>        …on a live interface
     pcap info <FILE.pcap>          Summarise what a capture contains
     scl validate <FILE.scl>        Engineering checks the XML schema does not make
     scl show <FILE.scl> [IED]      Print an IED's model: devices, nodes, control blocks
     scl subs <FILE.scd> <IED>      What an IED subscribes to, resolved from the publishers
     mu <FILE.pcap> [OPTIONS]       Generate a sampled-value stream into a capture
+    mu --iface <IF> [OPTIONS]      …onto a live interface, paced at the profile's rate
     sim <FILE.scd|.icd|.cid>       Serve the file's IEDs as real MMS servers
+
+Every command answers -h / --help with its own usage.
+
+Live interfaces need CAP_NET_RAW on Linux — grant it to the binary with
+`sudo setcap cap_net_raw+ep $(command -v ied)` rather than running as root — or access to
+/dev/bpf* on macOS. The capability is dropped as soon as the interface is open.
+
+Live options (goose sniff, sv monitor):
+    --iface <IF>        the interface to listen on
+    --duration <S>      how long to listen before reporting (default 10)
+    --write <FILE.pcap> keep the capture
+    --promiscuous       also receive frames addressed elsewhere (port mirrors)
 
 `mms` client options (identify/browse/read/write/report):
     --fc <ST|MX|CO|SP|...>  functional constraint for a dotted reference. Reads default to
@@ -100,7 +117,18 @@ COMMANDS:
     --local-tsel <HEX>      OSI transport selector this end presents (default 0001)
     --remote-tsel <HEX>     OSI transport selector of the server (default 0001)
 
+`goose publish` options:
+    --iface <IF>        the interface to publish on
+    --scd <FILE>        the engineering file
+    --ied <NAME>        the publishing IED (default: the file's only one)
+    --gocb <REF>        the control block, LD/LN.name (IED1LD0/LLN0.gcbTrip)
+    --value <TEXT>      a value per data-set member, in order (default: the file's values)
+    --duration <S>      publish for this long (default 10): the first frame, then the
+                        retransmission curve the file's MinTime/MaxTime give
+
 `sim` options:
+    --iface <IF>        publish the GoCBs and MSVCBs a client enables on this interface
+    --freq <50|60>      nominal frequency, for an MSVCB's smpRate per period (default 50)
     --ied <NAME>        serve only this IED (default: every IED in the file)
     --bind <ADDR>       address to listen on (default 127.0.0.1)
     --port <N>          first port; each further IED takes the next one (default 102)
@@ -134,11 +162,20 @@ COMMANDS:
     --amplitude <N>     peak of the synthetic sinusoid, raw units (default 100000)
     --gm <HEX>          publish gmIdentity, 8 octets as 16 hex digits
     --refr-tm           publish refrTm on every ASDU
+    --iface <IF>        send on this interface instead of writing a capture
+    --launch-time       hand each frame to the kernel with its launch time (SO_TXTIME;
+                        needs an etf or taprio qdisc on the interface)
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    // `ied <command> … --help` prints that command's usage, wherever the flag stands — and is
+    // never taken for a file name.
+    if words.len() > 1 && words.iter().any(|w| matches!(*w, "-h" | "--help")) {
+        print!("{}", help_for(&words));
+        return ExitCode::SUCCESS;
+    }
     let result = match words.as_slice() {
         [] | ["-h" | "--help" | "help"] => {
             print!("{USAGE}");
@@ -148,8 +185,9 @@ fn main() -> ExitCode {
             println!("ied {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
-        ["goose", "sniff", file] => goose_sniff(file),
-        ["mms", "sniff", file] => mms_sniff(file),
+        ["goose", "sniff", rest @ ..] => goose_sniff_cmd(rest),
+        ["goose", "publish", rest @ ..] => goose_publish(rest),
+        ["mms", "sniff", file] => file_arg(file).and_then(mms_sniff),
         ["mms", "identify", host, rest @ ..] => mms_identify(host, rest),
         ["mms", "status", host, rest @ ..] => mms_status(host, rest),
         ["mms", "browse", host, rest @ ..] => mms_browse(host, rest),
@@ -163,13 +201,13 @@ fn main() -> ExitCode {
         ["mms", "get", host, path, rest @ ..] => mms_get(host, path, rest),
         ["mms", "log", host, log, rest @ ..] => mms_log(host, log, rest),
         ["mms", "sg", host, rest @ ..] => mms_setting_groups(host, rest),
-        ["sv", "monitor", file, rest @ ..] => sv_monitor(file, rest),
-        ["pcap", "info", file] => pcap_info(file),
-        ["scl", "validate", file, rest @ ..] => scl_validate(file, rest),
-        ["scl", "show", file, rest @ ..] => scl_show(file, rest.first().copied()),
-        ["scl", "subs", file, ied, rest @ ..] => scl_subs(file, ied, rest),
-        ["mu", file, rest @ ..] => merging_unit(file, rest),
-        ["sim", file, rest @ ..] => simulate(file, rest),
+        ["sv", "monitor", rest @ ..] => sv_monitor_cmd(rest),
+        ["pcap", "info", file] => file_arg(file).and_then(pcap_info),
+        ["scl", "validate", file, rest @ ..] => file_arg(file).and_then(|f| scl_validate(f, rest)),
+        ["scl", "show", file, rest @ ..] => file_arg(file).and_then(|f| scl_show(f, rest.first().copied())),
+        ["scl", "subs", file, ied, rest @ ..] => file_arg(file).and_then(|f| scl_subs(f, ied, rest)),
+        ["mu", rest @ ..] => mu_cmd(rest),
+        ["sim", file, rest @ ..] => file_arg(file).and_then(|f| simulate(f, rest)),
         other => Err(format!("unknown command `{}`\n\n{USAGE}", other.join(" "))),
     };
     match result {
@@ -179,6 +217,229 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// A positional file argument, refused when it looks like an option: `ied mu --help` must
+/// never write a capture called `--help`.
+fn file_arg(file: &str) -> Result<&str, String> {
+    if file.starts_with('-') {
+        return Err(format!("expected a file name, found the option `{file}` (see --help)"));
+    }
+    Ok(file)
+}
+
+/// The usage of one command: its lines from the command list, and its option sections.
+fn help_for(words: &[&str]) -> String {
+    let command: Vec<&str> = words.iter().take_while(|w| !w.starts_with('-')).take(2).copied().collect();
+    let prefix = command.join(" ");
+    let first = command.first().copied().unwrap_or_default();
+    let mut out = String::from("ied — IEC 61850 command line\n\nUSAGE:\n");
+    let mut lines = USAGE.lines().peekable();
+    while let Some(line) = lines.next() {
+        let l = line.trim_start();
+        if !prefix.is_empty() && l.starts_with(&prefix) && line.starts_with("    ") {
+            let _ = writeln!(out, "    ied {l}");
+            // A wrapped description sits on the next, deeper-indented line.
+            while let Some(next) = lines.next_if(|n| n.starts_with("                    ") && !n.trim_start().starts_with(first)) {
+                let _ = writeln!(out, "{next}");
+            }
+        }
+    }
+    // Option sections: a header naming the command, down to the next blank line.
+    let mut in_section = false;
+    for l in USAGE.lines() {
+        if l.is_empty() {
+            in_section = false;
+            continue;
+        }
+        if !l.starts_with(' ') && !l.ends_with(':') {
+            // Prose, not a section.
+            in_section = false;
+            continue;
+        }
+        if !l.starts_with(' ') {
+            in_section = l.contains(&format!("`{prefix}`"))
+                || l.contains(&format!("`{first}`"))
+                || (l.starts_with("Live") && matches!(prefix.as_str(), "goose sniff" | "sv monitor"));
+            if in_section {
+                let _ = writeln!(out, "\n{l}");
+            }
+            continue;
+        }
+        if in_section {
+            let _ = writeln!(out, "{l}");
+        }
+    }
+    if matches!(prefix.as_str(), "goose sniff" | "sv monitor" | "goose publish" | "mu" | "sim") {
+        out.push_str("\nLive interfaces need CAP_NET_RAW (Linux) or /dev/bpf* access (macOS); see `ied --help`.\n");
+    }
+    out
+}
+
+/// Options shared by the live listening commands.
+struct LiveOptions {
+    iface: String,
+    duration: Duration,
+    write: Option<String>,
+    promiscuous: bool,
+}
+
+/// Split `--iface`, `--duration`, `--write` and `--promiscuous` out of `args`; the rest is
+/// the command's own options.
+fn live_options<'a>(args: &[&'a str]) -> Result<(Option<LiveOptions>, Vec<&'a str>), String> {
+    let mut live = LiveOptions { iface: String::new(), duration: Duration::from_secs(10), write: None, promiscuous: false };
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let mut value = || it.next().copied().ok_or_else(|| format!("{arg} needs a value"));
+        match *arg {
+            "--iface" => live.iface = value()?.to_string(),
+            "--duration" => live.duration = Duration::from_secs_f64(value()?.parse().map_err(|_| "--duration needs seconds".to_string())?),
+            "--write" => live.write = Some(file_arg(value()?)?.to_string()),
+            "--promiscuous" => live.promiscuous = true,
+            other => rest.push(other),
+        }
+    }
+    Ok((if live.iface.is_empty() { None } else { Some(live) }, rest))
+}
+
+/// Listen on an interface for the configured time and keep what arrived as a capture file,
+/// which the command then judges exactly as it judges one it was given.
+fn capture_live(live: &LiveOptions, options: iec61850_rs::net::LinkOptions) -> Result<String, String> {
+    use iec61850_rs::net::{Link, drop_capabilities};
+    let mut link = Link::open(&live.iface, &options.promiscuous(live.promiscuous)).map_err(|e| format!("{}: {e}", live.iface))?;
+    drop_capabilities().map_err(|e| e.to_string())?;
+    let path = live.write.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("ied-live-{}.pcap", std::process::id())).display().to_string());
+    let mut out = Writer::create(&path).map_err(|e| format!("{path}: {e}"))?;
+    eprintln!("listening on {} ({}, {:?}) for {:.1} s", link.interface(), link.mac(), link.receive_path(), live.duration.as_secs_f64());
+    let end = std::time::Instant::now() + live.duration;
+    let (mut frames, mut truncated) = (0u64, 0u64);
+    loop {
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let Some(rx) = link.recv(Some(left.min(Duration::from_millis(100)))).map_err(|e| e.to_string())? else { continue };
+        if rx.truncated {
+            // A frame longer than what was captured cannot be decoded honestly: count it.
+            truncated += 1;
+            continue;
+        }
+        let ts = rx.wire_time.map_or(rx.at.0, |w| u64::try_from(w.secs).unwrap_or(0).saturating_mul(1_000_000_000).saturating_add(u64::from(w.nanos)));
+        out.write(ts, rx.frame).map_err(|e| e.to_string())?;
+        frames += 1;
+    }
+    out.finish().map_err(|e| e.to_string())?;
+    let stats = link.stats().map_err(|e| e.to_string())?;
+    eprintln!(
+        "captured {frames} frame(s){}{}",
+        if truncated > 0 { format!(", {truncated} truncated (not decoded)") } else { String::new() },
+        if stats.dropped > 0 { format!(", {} dropped by the kernel", stats.dropped) } else { String::new() }
+    );
+    Ok(path)
+}
+
+fn goose_sniff_cmd(args: &[&str]) -> Result<(), String> {
+    let (live, rest) = live_options(args)?;
+    match (live, rest.as_slice()) {
+        (Some(live), []) => {
+            let path = capture_live(&live, iec61850_rs::net::LinkOptions::goose())?;
+            let result = goose_sniff(&path);
+            if live.write.is_none() {
+                let _ = std::fs::remove_file(&path);
+            }
+            result
+        }
+        (None, [file]) => goose_sniff(file_arg(file)?),
+        _ => Err(String::from("usage: ied goose sniff (<FILE.pcap> | --iface <IF> [--duration S] [--write FILE])")),
+    }
+}
+
+fn sv_monitor_cmd(args: &[&str]) -> Result<(), String> {
+    let (live, rest) = live_options(args)?;
+    if let Some(live) = live {
+        let path = capture_live(&live, iec61850_rs::net::LinkOptions::sv())?;
+        let result = sv_monitor(&path, &rest);
+        if live.write.is_none() {
+            let _ = std::fs::remove_file(&path);
+        }
+        return result;
+    }
+    let (file, options) = rest.split_first().ok_or("usage: ied sv monitor (<FILE.pcap> | --iface <IF>) [OPTIONS]")?;
+    sv_monitor(file_arg(file)?, options)
+}
+
+/// `ied goose publish` — one GOOSE control block of an SCD, on a live interface.
+fn goose_publish(args: &[&str]) -> Result<(), String> {
+    use iec61850_rs::net::{Link, LinkOptions, drop_capabilities};
+    let (mut iface, mut scd, mut ied, mut gocb, mut values, mut duration) = (None, None, None, None, Vec::new(), Duration::from_secs(10));
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let mut value = || it.next().copied().ok_or_else(|| format!("{arg} needs a value"));
+        match *arg {
+            "--iface" => iface = Some(value()?),
+            "--scd" => scd = Some(file_arg(value()?)?),
+            "--ied" => ied = Some(value()?),
+            "--gocb" => gocb = Some(value()?),
+            "--value" => values.push(value()?),
+            "--duration" => duration = Duration::from_secs_f64(value()?.parse().map_err(|_| "--duration needs seconds".to_string())?),
+            other => return Err(format!("unknown option `{other}`")),
+        }
+    }
+    let (Some(iface), Some(scd), Some(gocb)) = (iface, scd, gocb) else {
+        return Err(String::from("usage: ied goose publish --iface <IF> --scd <FILE> --gocb <LD/LN.name> [--value V]…"));
+    };
+    let xml = std::fs::read_to_string(scd).map_err(|e| format!("{scd}: {e}"))?;
+    let model = scl::Scl::parse(&xml).and_then(|s| s.model(ied)).map_err(|e| format!("{scd}: {e}"))?;
+    let served = Ied::new(model).map_err(|e| e.to_string())?;
+    let (ld_ln, name) = gocb.split_once('.').ok_or("--gocb is LD/LN.name, for example IED1LD0/LLN0.gcbTrip")?;
+    let block_ref = format!("{ld_ln}$GO${name}");
+    let block = served.block(&block_ref).ok_or_else(|| format!("{scd}: no GOOSE control block {gocb}"))?;
+    let members = block
+        .data_set
+        .as_deref()
+        .and_then(|ds| served.data_set(ds))
+        .map(iec61850_rs::server::ServedDataSet::references)
+        .ok_or("the control block has no data set")?;
+    if !values.is_empty() && values.len() != members.len() {
+        return Err(format!("{} --value given, the data set has {} members", values.len(), members.len()));
+    }
+    let mut data = Vec::with_capacity(members.len());
+    for (k, m) in members.iter().enumerate() {
+        let v = match values.get(k) {
+            Some(text) => served.parse_text(m, text).ok_or_else(|| format!("{m}: cannot read `{text}`"))?,
+            None => served.read_reference(m).ok_or_else(|| format!("{m}: no value"))?,
+        };
+        data.push(v);
+    }
+
+    let link = Link::open(iface, &LinkOptions::goose()).map_err(|e| format!("{iface}: {e}"))?;
+    drop_capabilities().map_err(|e| e.to_string())?;
+    let cfg = served.model.goose_publisher_config(gocb, link.mac()).map_err(|e| format!("{gocb}: {e}"))?;
+    let t = UtcTime::from_unix_nanos(unix_nanos(), TimeQuality::default());
+    let mut publisher = iec61850_rs::proto::goose::Publisher::new(cfg, &data, t).map_err(|e| e.to_string())?;
+    let start = iec61850_rs::common::monotonic_now();
+    let end = start.plus_nanos(duration.as_nanos().min(u128::from(u64::MAX)) as u64);
+    let mut sent = 0u64;
+    loop {
+        let now = iec61850_rs::common::monotonic_now();
+        if now >= end {
+            break;
+        }
+        publisher.on_timeout(now).map_err(|e| e.to_string())?;
+        if let Some(frame) = publisher.poll_transmit() {
+            link.send(frame).map_err(|e| e.to_string())?;
+            sent += 1;
+        }
+        let next = publisher.next_timeout().unwrap_or(end).min(end);
+        std::thread::sleep(Duration::from_nanos(next.nanos_since(iec61850_rs::common::monotonic_now())));
+    }
+    println!("{gocb}: {sent} frames on {iface}, stNum {} sqNum {}", publisher.st_num(), publisher.sq_num());
+    Ok(())
+}
+
+fn unix_nanos() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos().min(u128::from(u64::MAX)) as u64)
 }
 
 fn read(file: &str) -> Result<Capture, String> {
@@ -770,6 +1031,8 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
             "--files" => o.files = Some(value()?.to_string()),
             "--writable" => o.writable = true,
             "--edition" => o.edition = Some(parse_edition(value()?)?),
+            "--iface" => o.iface = Some(value()?.to_string()),
+            "--freq" => o.freq = value()?.parse().map_err(|_| "--freq needs a number".to_string())?,
             other => return Err(format!("unknown option `{other}`")),
         }
     }
@@ -809,6 +1072,11 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
             let store = DirectoryStore::new(dir);
             server.set_file_store(Box::new(if o.writable { store.writable() } else { store }));
         }
+        server.set_nominal_hz(o.freq);
+        if let Some(iface) = &o.iface {
+            let link = iec61850_rs::net::Link::open(iface, &iec61850_rs::net::LinkOptions::process_bus()).map_err(|e| format!("{iface}: {e}"))?;
+            server.publish_on(link).map_err(|e| format!("{name}: {e}"))?;
+        }
         let addr = server.local_addr().map_err(|e| e.to_string())?;
         println!("{name} on {addr} — {} — logical device(s) {}", edition_name(edition), devices.join(", "));
         if !trackers.is_empty() {
@@ -818,6 +1086,11 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
     }
     if let Some(dir) = &o.files {
         println!("files from {dir}{}", if o.writable { " (deletable)" } else { " (read-only)" });
+    }
+    if let Some(iface) = &o.iface {
+        // Every link is open; the capability is not needed to keep them.
+        iec61850_rs::net::drop_capabilities().map_err(|e| e.to_string())?;
+        println!("GOOSE and sampled values a client enables go out on {iface}");
     }
     println!("serving; ^C to stop");
 
@@ -844,13 +1117,17 @@ struct SimOptions {
     writable: bool,
     /// `None` takes the edition from the file, which is where an IED's edition is declared.
     edition: Option<Edition>,
+    /// Publish enabled `GoCB`s and `MSVCB`s on this interface.
+    iface: Option<String>,
+    /// Nominal frequency for sampled-value rates counted per period.
+    freq: u32,
 }
 
 impl Default for SimOptions {
     fn default() -> SimOptions {
         // Loopback and port 102: the standard port needs privileges, and a simulator that
         // binds every interface by default is a simulator someone finds on a substation LAN.
-        SimOptions { ied: None, bind: String::from("127.0.0.1"), port: 102, files: None, writable: false, edition: None }
+        SimOptions { ied: None, bind: String::from("127.0.0.1"), port: 102, files: None, writable: false, edition: None, iface: None, freq: 50 }
     }
 }
 
@@ -1945,11 +2222,92 @@ fn scl_subs(file: &str, ied: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
-fn merging_unit(file: &str, args: &[&str]) -> Result<(), String> {
+/// Where `ied mu` puts its frames.
+enum MuSink {
+    File { out: Writer, path: String },
+    Live { link: Box<iec61850_rs::net::Link>, launch: bool, start: Instant, first: u64 },
+}
+
+impl MuSink {
+    /// Write or send one frame stamped `nanos` (on the capture's timeline). A live frame leaves
+    /// when its sample is due: paced here, or handed over with its launch time.
+    fn emit(&mut self, nanos: u64, frame: &[u8]) -> Result<(), String> {
+        match self {
+            MuSink::File { out, .. } => out.write(nanos, frame).map_err(|e| e.to_string()),
+            MuSink::Live { link, launch, start, first } => {
+                let due = start.plus_nanos(nanos - *first);
+                if *launch {
+                    // Hand over a millisecond early; the qdisc releases it on time.
+                    wait_until(Instant(due.0.saturating_sub(1_000_000)));
+                    link.send_at(frame, due).map_err(|e| e.to_string())
+                } else {
+                    wait_until(due);
+                    link.send(frame).map_err(|e| e.to_string())
+                }
+            }
+        }
+    }
+}
+
+/// Sleep until `due` on the monotonic clock: coarse sleep, then a short spin, because a
+/// 250 µs frame interval is below what a sleep alone keeps.
+fn wait_until(due: Instant) {
+    loop {
+        let now = iec61850_rs::common::monotonic_now();
+        let left = due.nanos_since(now);
+        if left == 0 {
+            return;
+        }
+        if left > 200_000 {
+            std::thread::sleep(Duration::from_nanos(left - 150_000));
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+fn mu_cmd(args: &[&str]) -> Result<(), String> {
+    let (target, options) = match args.split_first() {
+        Some((first, rest)) if !first.starts_with('-') => (Some(*first), rest),
+        _ => (None, args),
+    };
+    let mut iface = None;
+    let mut launch = false;
+    let mut rest = Vec::new();
+    let mut it = options.iter();
+    while let Some(arg) = it.next() {
+        match *arg {
+            "--iface" => iface = Some(*it.next().ok_or("--iface needs a value")?),
+            "--launch-time" => launch = true,
+            other => rest.push(other),
+        }
+    }
+    match (target, iface) {
+        (Some(file), None) => merging_unit(MuTarget::File(file_arg(file)?), &rest),
+        (None, Some(iface)) => merging_unit(MuTarget::Live(iface, launch), &rest),
+        _ => Err(String::from("usage: ied mu (<OUT.pcap> | --iface <IF> [--launch-time]) [OPTIONS]")),
+    }
+}
+
+enum MuTarget<'a> {
+    File(&'a str),
+    Live(&'a str, bool),
+}
+
+fn merging_unit(target: MuTarget<'_>, args: &[&str]) -> Result<(), String> {
     let opt = MuOptions::parse(args)?;
+    let (link, src) = match target {
+        MuTarget::Live(iface, launch) => {
+            let link = iec61850_rs::net::Link::open(iface, &iec61850_rs::net::LinkOptions::sv().launch_time(launch)).map_err(|e| format!("{iface}: {e}"))?;
+            iec61850_rs::net::drop_capabilities().map_err(|e| e.to_string())?;
+            let src = link.mac();
+            (Some((link, launch)), src)
+        }
+        MuTarget::File(_) => (None, MacAddr([0x02, 0, 0, 0, 0, 1])),
+    };
     let header = FrameHeader {
         dst: MacAddr([0x01, 0x0C, 0xCD, 0x04, (opt.appid >> 8) as u8 & 0x01, opt.appid as u8]),
-        src: MacAddr([0x02, 0, 0, 0, 0, 1]),
+        src,
         vlan: Some(VlanTag::DEFAULT),
         ethertype: ETHERTYPE_SV,
         appid: opt.appid,
@@ -1963,10 +2321,16 @@ fn merging_unit(file: &str, args: &[&str]) -> Result<(), String> {
         publisher.set_gm_identity(id);
     }
 
-    let mut out = Writer::create(file).map_err(|e| format!("{file}: {e}"))?;
     let interval = opt.profile.frame_interval_nanos();
     let per_frame = publisher.asdus_per_frame();
     let mut nanos = 1_700_000_000u64 * 1_000_000_000;
+    let mut sink = match (target, link) {
+        (MuTarget::File(file), _) => MuSink::File { out: Writer::create(file).map_err(|e| format!("{file}: {e}"))?, path: file.to_string() },
+        (MuTarget::Live(..), Some((link, launch))) => {
+            MuSink::Live { link: Box::new(link), launch, start: iec61850_rs::common::monotonic_now().plus_millis(5), first: nanos }
+        }
+        (MuTarget::Live(..), None) => return Err(String::from("no link")),
+    };
     let mut sample_index = 0u32;
 
     for _ in 0..opt.frames {
@@ -1996,15 +2360,28 @@ fn merging_unit(file: &str, args: &[&str]) -> Result<(), String> {
         }
         publisher.publish(Instant(nanos), &refs).map_err(|e| e.to_string())?;
         if let Some(frame) = publisher.poll_transmit() {
-            out.write(nanos, frame).map_err(|e| e.to_string())?;
+            sink.emit(nanos, frame)?;
         }
         sample_index += per_frame as u32;
         nanos += interval;
     }
-    out.finish().map_err(|e| e.to_string())?;
+    let destination = match sink {
+        MuSink::File { out, path } => {
+            out.finish().map_err(|e| e.to_string())?;
+            format!("wrote {} frames to {path}", opt.frames)
+        }
+        MuSink::Live { mut link, launch, .. } => {
+            let late = if launch { link.launch_errors().map_err(|e| e.to_string())? } else { 0 };
+            format!(
+                "sent {} frames on {}{}",
+                opt.frames,
+                link.interface(),
+                if late > 0 { format!(" ({late} missed their launch time)") } else { String::new() }
+            )
+        }
+    };
     println!(
-        "wrote {} frames to {file}: svID={} {} samples/s, {per_frame} ASDU/frame, {} frames/s, {} Hz waveform",
-        opt.frames,
+        "{destination}: svID={} {} samples/s, {per_frame} ASDU/frame, {} frames/s, {} Hz waveform",
         opt.sv_id,
         opt.profile.samples_per_second,
         opt.profile.frames_per_second(),

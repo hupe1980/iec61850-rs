@@ -163,6 +163,11 @@ path = "tests/mms_server.rs"
 required-features = ["client", "server"]
 
 [[test]]
+name = "net_link"
+path = "tests/net_link.rs"
+required-features = ["net", "goose", "sv"]
+
+[[test]]
 name = "process_bus_server"
 path = "tests/process_bus_server.rs"
 required-features = ["client", "server", "goose", "sv", "pcap"]

@@ -253,6 +253,18 @@ number of samples per second is refused.
 `ied sv monitor <capture> --scd <file>` is the same thing from the command line: the file
 configures the streams, and every ASDU comes out as named channels.
 
+## On a live interface
+
+`Link::open(iface, &LinkOptions::sv())` with the `net` feature: frames out, frames in, with the
+kernel filtering on the SV EtherType and multicast range. On Linux a 4800 frames/s stream
+crosses a veth pair without a gap; `LinkOptions::launch_time(true)` with `Link::send_at`
+hands each frame to the kernel with the time it is due (`SO_TXTIME`, for an `etf` or `taprio`
+qdisc).
+
+A server's MSVCB publishes once `SvEna` is written: every sample period it sends the model's
+current values of the data set, encoded through the layout the file implies, and a change
+takes effect from the next sample.
+
 ## Not included
 
 Unicast sampled values, the IEC 62351-6 authentication extension, and the IEC 62351-6 §6.2.2

@@ -1230,7 +1230,11 @@ mod publisher_control_blocks {
         assert_eq!(c.read("IED1LD0/LLN0$US$usvMU$UsvID", Fc::US).unwrap().as_str().map(str::to_owned), Some(String::from("MU02")));
 
         // Only the enable flag is a client's to write — the rest is engineering.
-        c.write("IED1LD0/LLN0$US$usvMU$SvEna", Fc::US, &Value::Boolean(true)).expect("SvEna is writable");
+        // `SvEna` passes the write policy; enabling it is refused with `object-value-invalid`
+        // (11), not `object-access-denied` (3), because this server cannot publish a unicast
+        // stream — saying so beats accepting the enable and sending nothing.
+        let enable = c.write("IED1LD0/LLN0$US$usvMU$SvEna", Fc::US, &Value::Boolean(true));
+        assert!(matches!(enable, Err(iec61850_rs::Error::DataAccess(11))), "{enable:?}");
         assert!(c.write("IED1LD0/LLN0$US$usvMU$SmpRate", Fc::US, &Value::Unsigned(96)).is_err(), "SmpRate is not");
         c.release().unwrap();
     }
