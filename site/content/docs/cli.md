@@ -9,8 +9,32 @@ cargo install iec61850-rs --features cli
 ```
 
 One binary, `ied`, with subcommands. The process-bus subcommands read and write **capture
-files**, so they need no network interface and no privileges; `ied` does not capture from a
-live interface. The `mms` subcommands and `sim` use TCP.
+files** — no interface, no privileges — and, with `--iface`, a **live interface**. The `mms`
+subcommands and `sim` use TCP. Every subcommand answers `--help` with its own usage.
+
+## Live interfaces
+
+```bash
+sudo setcap cap_net_raw+ep "$(command -v ied)"     # once, instead of running as root
+
+ied goose sniff --iface eth1 --duration 30          # listen, then judge what arrived
+ied sv monitor --iface eth1 --scd bay.scd --write sv.pcap
+ied mu --iface eth1 --profile le80-60 --frames 48000          # a merging unit on the wire
+ied mu --iface eth1 --launch-time                               # paced by the kernel (etf/taprio)
+ied goose publish --iface eth1 --scd bay.scd --gocb IED1LD0/LLN0.gcbTrip --value true
+ied sim bay.scd --iface eth1                        # enabled GoCBs/MSVCBs publish here
+```
+
+A live capture is recorded for `--duration` seconds (default 10) and then judged by exactly
+the code that judges a capture file, so both report the same thing about the same frames;
+`--write` keeps it. The kernel filters on the GOOSE or SV EtherType and on the IEC multicast
+range (or the groups a command joins) before anything reaches `ied`; truncated frames are
+counted, not decoded. `--promiscuous` is for port mirrors.
+
+The capability is dropped as soon as the interface is open. On Linux the sockets use a
+TPACKET_V3 ring, kernel timestamps and, with `--launch-time`, `SO_TXTIME`; on macOS they use
+BPF devices (`/dev/bpf*` access, as Wireshark's ChmodBPF grants). Windows has no live
+interface.
 
 ## Generate a stream
 

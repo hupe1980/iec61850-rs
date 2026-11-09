@@ -32,6 +32,9 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+      # rawether, the raw Ethernet crate behind the `net` feature, is a path dependency at
+      # ../rawether; cargo resolves it even when the feature is off.
+      - run: git clone --depth 1 https://github.com/hupe1980/rawether "$GITHUB_WORKSPACE/../rawether"
       - uses: dtolnay/rust-toolchain@stable
 
       # A crates.io version is immutable and a tag is not, so the tag is checked against the
@@ -92,6 +95,9 @@ jobs:
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
     steps:
       - uses: actions/checkout@v4
+      # rawether, the raw Ethernet crate behind the `net` feature, is a path dependency at
+      # ../rawether; cargo resolves it even when the feature is off.
+      - run: git clone --depth 1 https://github.com/hupe1980/rawether "$GITHUB_WORKSPACE/../rawether"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -145,6 +151,9 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+      # rawether, the raw Ethernet crate behind the `net` feature, is a path dependency at
+      # ../rawether; cargo resolves it even when the feature is off.
+      - run: git clone --depth 1 https://github.com/hupe1980/rawether "$GITHUB_WORKSPACE/../rawether"
       - uses: dtolnay/rust-toolchain@stable
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
@@ -163,6 +172,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      # rawether, the raw Ethernet crate behind the `net` feature, is a path dependency at
+      # ../rawether; cargo resolves it even when the feature is off.
+      - run: git clone --depth 1 https://github.com/hupe1980/rawether "$GITHUB_WORKSPACE/../rawether"
         with:
           fetch-depth: 0
       - uses: actions/download-artifact@v4
