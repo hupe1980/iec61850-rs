@@ -29,11 +29,10 @@ receives files, the log survives a restart, and SCL can be edited without being 
   publisher from the SCL file: GOOSE on change with the file's retransmission curve, SV every
   sample period. `Server::{publish_on, publish_to, set_source_mac, set_nominal_hz,
   frames_dropped}`, `ServerHandle::frames_dropped`, `Acsi::{drain_frames, set_source_mac,
-  publishing, frames_dropped}`. Frames wait in a bounded outbox, so no tick or commit can
-  overwrite one before it is sent, and the process-bus thread takes only the publishers' own
-  lock: a commit spending milliseconds in a durable log does not delay a sampled value. The
-  thread starts with `Server::run`, so a link opened and registered before
-  `net::drop_capabilities()` leaves no thread holding the capability.
+  publishing, frames_dropped}`. Frames wait in a bounded outbox and the process-bus thread takes
+  only the publishers' lock, so a slow log append never delays a sampled value. The thread
+  starts with `Server::run`: open and register the link, call `net::drop_capabilities()`, then
+  run.
 - ⚠ **ACSI `SetFile` (MMS `ObtainFile`)** on both sides, **off by default**:
   `Client::{set_file, set_file_path}`; a sans-IO transfer engine on the server
   (`server::Obtains`) that never blocks other associations; `FileWritePolicy`
@@ -95,7 +94,6 @@ receives files, the log survives a restart, and SCL can be edited without being 
   `IEC61850_REQUIRE_INTEROP=1` makes a skip a failure, `IEC61850_SKIP_INTEROP=1` skips the peers.
 - Releases publish through crates.io Trusted Publishing, and `ied` is released to the
   `hupe1980/tap` Homebrew tap.
-- The interop harness takes another `rawether` checkout from `IEC61850_RAWETHER`.
 
 ### Fixed
 
@@ -113,9 +111,6 @@ receives files, the log survives a restart, and SCL can be edited without being 
 - Every `LogStore` method is fallible (`Result<_, LogError>`); `by_time`/`after_entry` return
   `LogPage`; `purge` and `bounds` are required; `Logs::set_store` takes the `Ied`.
 - `Negotiated`, `ServiceError` and `AcsiConfig` gain fields; `FileStore` gains `create`.
-- `SetFilePolicy` is `FileWritePolicy`, and `AcsiConfig::set_file` is `AcsiConfig::file_write`.
-- `Server::publish_on`/`publish_to` start no thread; the process-bus thread starts with
-  `Server::run` or the first `Server::accept_one`.
 
 ## [0.3.0] — 2026-09-06
 
