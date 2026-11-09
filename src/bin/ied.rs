@@ -145,9 +145,9 @@ Live options (goose sniff, sv monitor):
                         with --password, only a client that presents the password may send
     --password <TEXT>   require this ACSE password of every association
     --edition <1|2|2.1> serve as this edition, overriding the file's own schema version
+                        (Edition 1 has no ResvTms and no Owner on a report control block)
     --log-db <PATH>     keep the logs in a file that survives a restart (a directory of
                         <IED>.redb files when the SCD has several IEDs)
-                        (Edition 1 has no ResvTms and no Owner on a report control block)
 
 `scl validate` options:
     --freq <50|60>      nominal frequency, to read smpRate (default 50)
