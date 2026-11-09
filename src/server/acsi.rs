@@ -196,13 +196,19 @@ struct FileHandle {
 }
 
 /// `errorClass` choice tags of ISO 9506 `ServiceError`.
+///
+/// The numbers are the context tags of ISO 9506-2's `errorClass` ✅ (Wireshark's `mms.asn`).
 pub mod error_class {
-    /// `access(7)` — the object could not be accessed.
+    /// `definition [2]` — the request names something that is not defined, or not consistently.
+    pub const DEFINITION: u32 = 2;
+    /// `resource [3]` — the server lacks the memory, storage or capability to answer.
+    pub const RESOURCE: u32 = 3;
+    /// `service [4]` — the service, or this form of it, is not supported here.
+    pub const SERVICE: u32 = 4;
+    /// `access [7]` — the object could not be accessed.
     pub const ACCESS: u32 = 7;
-    /// `service(5)` — the service itself is not supported here.
-    pub const SERVICE: u32 = 5;
-    /// `definition(4)` — the request names something that is not defined.
-    pub const DEFINITION: u32 = 4;
+    /// `file [11]` — a file service failed.
+    pub const FILE: u32 = 11;
 }
 
 impl Answer {

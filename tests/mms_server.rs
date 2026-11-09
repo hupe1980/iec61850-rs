@@ -608,6 +608,25 @@ fn a_refusal_carries_an_add_cause_the_served_edition_defines() {
     assert_eq!(refused(Edition::Ed2, AddCause::Other(40)), AddCause::Unknown);
 }
 
+/// The `errorClass` tags the server answers with are ISO 9506-2's: `definition [2]`,
+/// `resource [3]`, `service [4]`, `access [7]`, `file [11]` (Wireshark's `mms.asn`).
+#[test]
+fn service_error_classes_are_the_iso_9506_tags() {
+    use iec61850_rs::common::service_error_class;
+    use iec61850_rs::server::error_class;
+    for (class, name) in [
+        (error_class::DEFINITION, "definition"),
+        (error_class::RESOURCE, "resource"),
+        (error_class::SERVICE, "service"),
+        (error_class::ACCESS, "access"),
+        (error_class::FILE, "file"),
+    ] {
+        assert_eq!(service_error_class(class), Some(name));
+    }
+    let shown = iec61850_rs::Error::Service { class: 2, code: 0 }.to_string();
+    assert!(shown.contains("definition"), "{shown}");
+}
+
 /// A relay whose overcurrent pickup is a setting with four groups.
 const SETTINGS: &str = r#"<?xml version="1.0"?>
 <SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">
