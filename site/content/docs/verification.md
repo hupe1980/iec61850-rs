@@ -1,14 +1,14 @@
 +++
 title = "Verification"
-description = "How iec61850-rs is tested: vendor captures re-encoded byte for byte, Wireshark and libiec61850 as external oracles, adversarial simulation, fuzzing — and what is not proven."
+description = "How iec61850-rs is tested: vendor captures re-encoded byte for byte, Wireshark and three other stacks as external oracles, adversarial simulation, fuzzing — and what is not proven."
 weight = 70
 +++
 
 Three kinds of evidence, strongest first:
 
 1. **A verdict from a tool this project did not write** — Wireshark's dissectors.
-2. **Agreement with another implementation** — a vendor IED's captured frames; libiec61850's
-   client and server, run against this stack in CI.
+2. **Agreement with another implementation** — a vendor IED's captured frames; libiec61850,
+   IEC61850bean and csp0924's crates, run against this stack in CI in both roles.
 3. **This crate's own tests** — which prove consistency, not correctness.
 
 A dissector says whether a PDU is well-formed; only a peer says whether it is the PDU that was
@@ -80,27 +80,29 @@ too-old `tshark` a failure.
 
 [wireshark#19580]: https://gitlab.com/wireshark/wireshark/-/issues/19580
 
-## libiec61850, in both roles
+## Three other stacks, in both roles
 
-`tests/interop.rs` builds [libiec61850](https://github.com/mz-automation/libiec61850) (C,
-GPLv3/commercial) in a CI job and runs:
+`tests/interop.rs` runs this crate against three implementations it did not write. Each is a
+container image built from a pinned, checksum-verified release, so the suite needs nothing but
+Docker; GPL code runs as an external process and is never linked.
 
-| Direction | What runs | What it checks |
+| Peer | Direction | What it checks |
 |---|---|---|
-| their client → this server | `mms_utility` | `Identify`, `GetNameList` over the sorted namespace, a structured `Read`, type discovery |
-| their client → this server | `client_example_control` | all four control models including both selects, one `CommandTermination+` per enhanced-security command, and the switchgear actually moving |
-| their client → this server | `client_example1` | enabling a report control block in one write, general interrogation, integrity reports and their reason codes |
-| this client → their server | `server_example_basic_io` | associate, `Status`, both directories, `Read`, `GetVariableAccessAttributes`, data sets, reporting, a control, release |
-| this client → their server | `server_example_logging` | the log control block with its buffer cursor, both log queries |
-| both directions | `mms_utility -y <index>` and the harmonics model | an array element read as one element, at four depths |
+| [libiec61850](https://github.com/mz-automation/libiec61850) 1.6.2.1 (C) | their client → this server | `Identify`, the sorted namespace, structured reads, type discovery; all four control models with their terminations; reports with GI and integrity; `SetFile`; their log client against both log stores |
+| | this client → their server | `Status`, directories, reads, types, data sets, reporting, control, both log queries |
+| | both directions | an array element read as one element, at four depths |
+| | GOOSE, both directions | their publisher → this subscriber; this publisher → their subscriber, judged valid |
+| | SV, both directions | their publisher → this subscriber; a 9-2LE merging unit → their subscriber |
+| [IEC61850bean](https://github.com/beanit/iec61850bean) 1.9.0 (Java) | both directions | association, model discovery, reads, a write, reporting with GI, a direct control, file directory |
+| [csp0924's crates](https://github.com/csp0924/iec61850-rust) 0.4.0 (Rust) | their client → this server | association, directories, reads, a write, reporting with GI, a direct control |
+| | this client → their server | directories, reads, type discovery |
 
-The servers are loaded from libiec61850's own engineering files, read from its tree. The GPL
-binaries run as external processes and are never linked.
+The process-bus runs put `ied` and libiec61850 on one Docker network, each with a raw socket on
+its own interface. Every disagreement found, and whose it was, is recorded in
+`tests/interop/PEERS.md` in the repository — among them the empty session selector that made
+IEC61850bean refuse every association with this crate, now fixed.
 
-libiec61850 spells a log control block's buffer cursor `OldEntr`/`NewEntr`; IEC 61850-7-2
-spells it `OldEnt`/`NewEnt`. This client asks for both; this server publishes the standard's.
-
-`IEC61850_LIBIEC61850` points at a built checkout and the tests skip without it;
+Run it with `cargo test --all-features --test interop`. Without Docker the tests skip by name;
 `IEC61850_REQUIRE_INTEROP=1`, set in CI, turns the skip into a failure.
 
 ## Adversarial simulation
@@ -198,10 +200,9 @@ Documentation is built with warnings denied on the all-features build docs.rs se
 
 - **No conformance certificate.** IEC 61850-10 test procedures, run by UCAIug-accredited
   laboratories, have not been applied.
-- **One interop peer, station bus only.** libiec61850 is the only second stack in CI.
-  IEC61850bean and other implementations are not tested against, and GOOSE/SV interop with
-  libiec61850 is not tested: the crate has no raw-socket adapter, so the process bus is checked
-  with capture files and Wireshark.
+- **Three peers, not the field.** libiec61850, IEC61850bean and csp0924's crates agree with this
+  crate on the scenarios above; a vendor IED may still differ. csp0924's server is covered for
+  browse and read only, because it does not take control blocks from the SCL file.
 - **Some rules come from secondary sources.** The IEC standards are paywalled; where a rule is
   taken from a public preview, a Wireshark dissector, an open-source implementation or a paper,
   the source code says so. The IEC 62351-6 layer-2 authentication extension (§8.2.2) and the

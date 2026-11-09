@@ -280,8 +280,10 @@ impl<'a> Spdu<'a> {
                 body.extend_from_slice(&[PI_VERSION_NUMBER, 1, c.version]);
                 body.extend_from_slice(&[PI_SESSION_REQUIREMENT, 2]);
                 body.extend_from_slice(&c.requirements.to_be_bytes());
+                // An empty selector is no selector: the parameter is left out rather than sent
+                // with a length of zero, which a peer that reads it as a number refuses.
                 for (code, ssel) in [(PI_CALLING_SSEL, c.calling_ssel), (PI_CALLED_SSEL, c.called_ssel)] {
-                    if let Some(s) = ssel {
+                    if let Some(s) = ssel.filter(|s| !s.is_empty()) {
                         body.push(code);
                         write_li(s.len(), &mut body)?;
                         body.extend_from_slice(s);
@@ -430,6 +432,22 @@ mod tests {
         let mut out = Vec::new();
         Spdu::Connect(c).write(&mut out).unwrap();
         assert_eq!(out, wire, "re-encoding must reproduce the octets");
+    }
+
+    /// `IEC61850bean` reads a session selector as a 1-, 2-, 4- or 8-octet number and refuses the
+    /// association on any other length, so an empty selector — the default when the file names
+    /// none — is left out of the SPDU, in both directions.
+    #[test]
+    fn an_empty_session_selector_is_left_out_rather_than_sent_empty() {
+        for spdu in [Spdu::Connect(Connect::new(Some(&[]), Some(&[]), &[0xAA])), Spdu::Accept(Connect::new(Some(&[]), Some(&[]), &[0xAA]))] {
+            let mut out = Vec::new();
+            spdu.write(&mut out).unwrap();
+            let params = &out[2..];
+            assert!(!params.windows(2).any(|w| w == [PI_CALLING_SSEL, 0] || w == [PI_CALLED_SSEL, 0]), "{out:02x?}");
+        }
+        let mut out = Vec::new();
+        Spdu::Accept(Connect::new(Some(&[0, 1]), Some(&[0, 1]), &[0xAA])).write(&mut out).unwrap();
+        assert!(out.windows(4).any(|w| w == [PI_CALLING_SSEL, 2, 0, 1]), "a real selector is still sent: {out:02x?}");
     }
 
     #[test]

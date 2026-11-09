@@ -91,6 +91,8 @@ Live options (goose sniff, sv monitor):
     --duration <S>      how long to listen before reporting (default 10)
     --write <FILE.pcap> keep the capture
     --promiscuous       also receive frames addressed elsewhere (port mirrors)
+    --group <MAC>       receive exactly this multicast group (repeatable) instead of the
+                        IEC range, e.g. a publisher engineered outside it
 
 `mms` client options (identify/browse/read/write/report):
     --fc <ST|MX|CO|SP|...>  functional constraint for a dotted reference. Reads default to
@@ -312,12 +314,13 @@ struct LiveOptions {
     duration: Duration,
     write: Option<String>,
     promiscuous: bool,
+    groups: Vec<MacAddr>,
 }
 
-/// Split `--iface`, `--duration`, `--write` and `--promiscuous` out of `args`; the rest is
-/// the command's own options.
+/// Split `--iface`, `--duration`, `--write`, `--promiscuous` and `--group` out of `args`; the
+/// rest is the command's own options.
 fn live_options<'a>(args: &[&'a str]) -> Result<(Option<LiveOptions>, Vec<&'a str>), String> {
-    let mut live = LiveOptions { iface: String::new(), duration: Duration::from_secs(10), write: None, promiscuous: false };
+    let mut live = LiveOptions { iface: String::new(), duration: Duration::from_secs(10), write: None, promiscuous: false, groups: Vec::new() };
     let mut rest = Vec::new();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -327,6 +330,10 @@ fn live_options<'a>(args: &[&'a str]) -> Result<(Option<LiveOptions>, Vec<&'a st
             "--duration" => live.duration = Duration::from_secs_f64(value()?.parse().map_err(|_| "--duration needs seconds".to_string())?),
             "--write" => live.write = Some(file_arg(value()?)?.to_string()),
             "--promiscuous" => live.promiscuous = true,
+            "--group" => {
+                let mac = value()?;
+                live.groups.push(MacAddr::parse(mac).map_err(|e| format!("--group {mac}: {e}"))?);
+            }
             other => rest.push(other),
         }
     }
@@ -337,6 +344,7 @@ fn live_options<'a>(args: &[&'a str]) -> Result<(Option<LiveOptions>, Vec<&'a st
 /// which the command then judges exactly as it judges one it was given.
 fn capture_live(live: &LiveOptions, options: iec61850_rs::net::LinkOptions) -> Result<String, String> {
     use iec61850_rs::net::{Link, drop_capabilities};
+    let options = live.groups.iter().fold(options, |o, g| o.join(*g));
     let mut link = Link::open(&live.iface, &options.promiscuous(live.promiscuous)).map_err(|e| format!("{}: {e}", live.iface))?;
     drop_capabilities().map_err(|e| e.to_string())?;
     let path = live.write.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("ied-live-{}.pcap", std::process::id())).display().to_string());

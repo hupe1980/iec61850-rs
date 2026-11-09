@@ -60,6 +60,7 @@ rawether = { version = "0.1", path = "../rawether", optional = true }
 proptest = "1.11"
 # The log-store tests write rows past the store to prove a corrupt one is refused.
 redb = "4.5"
+testcontainers = { version = "0.28", default-features = false, features = ["blocking"] }
 
 [lints.rust]
 # The library itself carries `#![forbid(unsafe_code)]` in `src/lib.rs`, which is the actual
