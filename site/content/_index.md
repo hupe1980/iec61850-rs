@@ -202,8 +202,8 @@ bus the server's service layer is a function from request to answer, tested with
 
 ## A command line that runs anywhere
 
-`ied` works on capture files and over a socket, so most of it needs no interface, no
-privileges and no Linux.
+`ied` works on capture files, over a socket and on a live interface (`--iface`); most of it
+needs no privileges and no Linux.
 
 ```bash
 ied sim relay.icd                                    # be the IED: a server from an SCL file
@@ -235,21 +235,21 @@ tool says about a frame is what a subscribing IED would decide. CI runs `ied mu`
 <div class="card">
 <h3>Built</h3>
 <p><strong>Process bus.</strong> GOOSE and Sampled Values: codecs, publishers, subscribers,
-the 9-2LE and IEC 61869-9 profiles and any other engineered data set.</p>
+the 9-2LE and IEC 61869-9 profiles and any other engineered data set — over capture files or
+live interfaces (Linux <code>AF_PACKET</code> rings with launch-time transmit, macOS BPF).</p>
 <p><strong>Station bus, both ends.</strong> All six OSI layers, the association for both
-roles, and above it a client and a server with no async runtime and no dependency: browse,
-read, write, reporting with server-side segmentation, all four control models, files, logs,
+roles, and above it a client and a server with no async runtime: browse,
+read, write, reporting with server-side segmentation, all four control models, files (including <code>SetFile</code>), durable logs,
 setting groups, type discovery, data-set create/delete and IEC 61850-7-2 service tracking — and
 a client that reconnects on a backoff you state.</p>
 <p><strong>Engineering.</strong> SCL loading from ICD, CID and SCD, subscription resolution,
-and the engineering checks the XML schema permits. A BER codec, the wire types, pcap, and the
+the engineering checks the XML schema permits, and editing that keeps every untouched byte. A BER codec, the wire types, pcap, and the
 <code>ied</code> command line.</p>
 </div>
 <div class="card">
 <h3>Not included</h3>
-<p>Raw-socket adapters: the process bus encodes and decodes, but something else puts the
-frames on the wire. TLS (IEC 62351-3) and the IEC 62351-6 authentication extension. Routable
-GOOSE/SV (IEC TR 61850-90-5). A durable <code>LogStore</code> backend. An async client.</p>
+<p>TLS (IEC 62351-3) and the IEC 62351-6 authentication extension. Routable GOOSE/SV
+(IEC TR 61850-90-5). Unicast SV. An async client.</p>
 <p>Out of scope entirely: the XMPP mapping of IEC 61850-8-2, Edition 1 GSSE, and a graphical
 SCL editor — <a href="https://github.com/openscd/open-scd">OpenSCD</a> already is one.</p>
 </div>

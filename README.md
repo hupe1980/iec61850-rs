@@ -22,20 +22,20 @@ encoders checked against real substation captures frame for frame.
 | **MMS client** | Blocking, no runtime, no dependency. Connect (optionally from the SCD), `Status`, `Identify`, `GetCapabilityList`, paged browse, read and write, type discovery, data-set create and delete, reconnect with a `Backoff` |
 | **Arrays** (IEC 61850-8-1 §7.3) | `read("…/MHAI1.HA.phsAHar(2).cVal.mag.f")` becomes one named variable plus an ISO 9506 alternate-access selection. SCL's `count` and `FCDA/@ix` are honoured; a selection the server cannot serve is refused |
 | **Reporting** (IEC 61850-8-1 §17) | Configure and enable a control block, request a general interrogation, and receive decoded reports — per member its index, reference, value and reason. Reports larger than the negotiated PDU are segmented by the server and rejoined by the client |
-| **Files** (IEC 61850-8-1 §23) | List, read and delete. The `frsmID` is released even when a read fails; the server's sandboxed store is read in ranges |
-| **Logs** (IEC 61850-7-2 §17) | Read the control block, then `QueryLogByTime` or `QueryLogAfterEntry` (resumes without a gap or a duplicate). Server-side entries live behind a `LogStore` trait |
+| **Files** (IEC 61850-8-1 §23) | List, read, delete, and send with `SetFile` (off by default; size, quota and path checks, published only when complete). The server's sandboxed store is read in ranges |
+| **Logs** (IEC 61850-7-2 §17) | Read the control block, then `QueryLogByTime` or `QueryLogAfterEntry` (resumes without a gap or a duplicate). Server-side entries live behind a `LogStore` trait — in memory, or in a redb file that survives a restart (`log-redb`) |
 | **Supervision** (IEC 61850-7-4) | `LGOS` and `LSVS`: a subscriber's own state — live, `ndsCom`, arriving `confRev`, simulated — published into the logical node the SCL file declares |
 | **Service tracking** (IEC 61850-7-2 §14) | Who enabled a control block, which client was refused with what, who queried a log. The file declares the tracking objects by `cdc`, the server fills them in, and a report control block carries them. All ten classes |
 | **Setting groups** (IEC 61850-7-2 §11) | Read the `SGCB`, activate a group, or select ▸ write ▸ confirm ▸ release an edit in one call. The server serves each setting under `SG` and `SE` and expires an abandoned edit on `ResvTms` |
 | **Control** (IEC 61850-7-2 §20) | All four models behind one `execute`, with `origin`, `ctlNum`, `Check`, `Test`, time-activated operate and `Cancel`. The model is read from the server unless stated; a refusal returns its `AddCause` |
-| **Server** (IEC 61850-8-1) | An SCL file is the whole configuration — no generated model, no build step. Browse, read, write, type discovery, a report engine (`BufTm`, `GI`, integrity, buffered replay), all four control models behind an application hook, setting groups, a sandboxed file store, logs, and the GOOSE/SV control blocks. Writes are limited by functional constraint, commands gated by `Beh`; the edition comes from the file. Pluggable wall clock; every queue bounded |
-| **SCL** (IEC 61850-6) | Load an IED model from ICD/CID/SCD, resolve subscriptions from `Inputs/ExtRef`, and validate engineering errors with stable diagnostic codes. Lenient by default, strict on request |
-| **`ied`** | `sim`, `mu`, `sv monitor`, `goose sniff`, `mms sniff`, `mms status/identify/browse/read/write/rcb/report/control/type/files/get/log/sg`, `pcap info`, `scl validate`, `scl show`, `scl subs` |
+| **Server** (IEC 61850-8-1) | An SCL file is the whole configuration — no generated model, no build step. Browse, read, write, type discovery, a report engine (`BufTm`, `GI`, integrity, buffered replay), all four control models behind an application hook, setting groups, a sandboxed file store, logs, and GOOSE/SV control blocks that publish when a client enables them. Optional ACSE password. Writes are limited by functional constraint, commands gated by `Beh`; the edition comes from the file. Pluggable wall clock; every queue bounded |
+| **SCL** (IEC 61850-6) | Load an IED model from ICD/CID/SCD, resolve subscriptions from `Inputs/ExtRef`, validate engineering errors with stable diagnostic codes, and **edit without reformatting**: an untouched file is byte-identical, a rename moves every reference, every edit undoes exactly |
+| **Live interfaces** (feature `net`) | GOOSE and SV on Linux (`AF_PACKET`, `TPACKET_V3` ring, kernel/NIC timestamps, `SO_TXTIME` launch time) and macOS (BPF) through [`rawether`](https://crates.io/crates/rawether), with a kernel filter on EtherType and destination |
+| **`ied`** | `sim`, `mu`, `sv monitor`, `goose sniff`, `mms sniff`, `goose publish`, `mms status/identify/browse/read/write/rcb/report/control/type/files/get/put/log/sg`, `pcap info`, `scl validate/show/subs/edit` — capture files or `--iface` |
 | Supporting | Panic-free BER codec, the IEC 61850 wire types, classic pcap reader and writer |
 
-**Not included:** `SetFile` (MMS `ObtainFile`), a durable `LogStore` backend, raw-socket
-adapters, TLS (IEC 62351-3), the IEC 62351-6 authentication extension, routable GOOSE/SV
-(IEC TR 61850-90-5), and encoding fixed-length GOOSE (decoding it works).
+**Not included:** TLS (IEC 62351-3), the IEC 62351-6 authentication extension, routable
+GOOSE/SV (IEC TR 61850-90-5), unicast SV, and encoding fixed-length GOOSE (decoding it works).
 
 ## Install
 
@@ -44,9 +44,10 @@ cargo add iec61850-rs
 cargo install iec61850-rs --features cli    # the `ied` command line
 ```
 
-One dependency, `roxmltree`, and only with the `scl` feature. The MMS client and server are
-blocking and need no async runtime. Everything below `std` builds `no_std` (with `alloc`), e.g.
-for `thumbv7em-none-eabihf`.
+Dependencies are optional and per feature: `roxmltree` (`scl`), `redb` (`log-redb`) and
+`rawether` (`net`). The library is `#![forbid(unsafe_code)]`; the raw-socket `unsafe` lives in
+`rawether`. The MMS client and server are blocking and need no async runtime. Everything below
+`std` builds `no_std` (with `alloc`), e.g. for `thumbv7em-none-eabihf`. MSRV 1.90.
 
 ## Use it
 
@@ -184,7 +185,9 @@ ied sim relay.icd                                    # …or the same thing with
 ied mu stream.pcap --profile f4800s2 --frames 2000   # a virtual merging unit, IEC 61869-9
 ied sv monitor stream.pcap                           # the library's own subscriber, over a capture
 ied sv monitor stream.pcap --scd bay.scd             # …with every ASDU channel named by the SCD
+ied sv monitor --iface eth1                          # …or live, off the process-bus port
 ied goose sniff bay.pcap                             # gocbRef, stNum/sqNum, TAL, simulation bit
+ied goose publish --iface eth1 --scd bay.scd --gocb IED1LD0/LLN0.gcbTrip
 ied mms sniff station.pcap                           # six OSI layers: association, services, values
 ied mms status 10.0.0.5                              # is it alive? the cheapest round trip there is
 ied mms browse 10.0.0.5                              # a live server: devices, data, data sets
@@ -195,14 +198,17 @@ ied mms control 10.0.0.5 IED1LD0/CSWI1.Pos true --model sbo-enhanced
 ied mms type 10.0.0.5 IED1LD0/CSWI1.Pos.Oper --fc CO   # the shape a write has to match
 ied mms files 10.0.0.5                               # what the IED has stored
 ied mms get 10.0.0.5 COMTRADE/rec0001.cfg out.cfg    # …and pull one off it
+ied mms put 10.0.0.5 settings.xml settings.xml       # SetFile, if the server allows it
 ied mms log 10.0.0.5 IED1LD0/LLN0\$GeneralLog --lcb IED1LD0/LLN0.lcb01
 ied mms sg 10.0.0.5 --activate 2                     # put setting group 2 into force
 ied scl validate relay.icd                           # the engineering errors the schema permits
 ied scl subs bay.scd IED2                            # every ExtRef resolved to its publisher
+ied scl edit bay.scd rename-ied IED2 BAY2 --in-place --who alice --why "new bay"
 ```
 
-`ied sim` serves every IED in an SCD, each on its own port. `goose sniff` and `sv monitor` run
-the library's own subscriber state machines over a capture.
+`ied sim` serves every IED in an SCD, each on its own port; with `--iface` it also publishes the
+GOOSE and SV a client enables. `goose sniff` and `sv monitor` run the library's own subscriber
+state machines, over a capture or a live interface.
 
 ## Examples
 

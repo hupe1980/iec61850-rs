@@ -12,12 +12,83 @@ matter to a device on the other end of a substation LAN rather than to a compile
 
 ## [Unreleased]
 
+## [0.4.0] — unreleased
+
+GOOSE and SV leave the capture file, the server sends what its control blocks describe and
+receives files, the log survives a restart, and SCL can be edited without being reformatted.
+
+### Added
+
+- ⚠ **GOOSE and SV on a live interface** (feature `net`, in `cli`): `net::Link` over the new
+  [`rawether`](https://crates.io/crates/rawether) crate — Linux `AF_PACKET` with a `TPACKET_V3`
+  ring, macOS/FreeBSD BPF — with GOOSE/SV presets (`LinkOptions::{goose, sv, process_bus}`), a
+  kernel filter on EtherType **and** destination, monotonic receive instants with the kernel or
+  NIC timestamp beside them (`Received::wire_time`), launch-time send on `CLOCK_TAI`
+  (`send_at`), drop counters and `net::drop_capabilities()`.
+- ⚠ **The server publishes its GoCBs and MSVCBs.** Enabling `GoEna`/`SvEna` starts the block's
+  publisher from the SCL file: GOOSE on change with the file's retransmission curve, SV every
+  sample period. `Server::{publish_on, publish_to, set_source_mac, set_nominal_hz}`,
+  `Acsi::{drain_frames, set_source_mac, publishing}`.
+- ⚠ **ACSI `SetFile` (MMS `ObtainFile`)** on both sides, **off by default**:
+  `Client::{set_file, set_file_path}`; a sans-IO transfer engine on the server
+  (`server::Obtains`) that never blocks other associations; `SetFilePolicy`
+  (`Off`/`Authenticated`/`Anyone`), `AcsiConfig::{set_file, max_obtains, obtain_timeout_ms}`;
+  `FileStore::create`, `FileWriter`, `DirectoryStore::{allow_overwrite, with_limits}` with size
+  and quota limits, hidden temporaries published only when complete, unsafe paths refused.
+- ⚠ **Server-side ACSE password**: a server with `AssociationConfig::password` refuses an
+  association without it (constant-time comparison); `Negotiated::authenticated`.
+- **`RedbLog`** (feature `log-redb`, in `cli`): the server's log in a redb file that survives a
+  restart — one transaction per append, owner-only files, a locked or foreign file refused.
+  `server::check_log_store` is the `LogStore` contract as a reusable check.
+- **`scl::Document` — edit SCL without reformatting it.** An unedited file is its input byte for
+  byte; an edit changes only the bytes it is about and is refused if the result is not
+  well-formed; `undo`/`redo` restore exact bytes. Typed operations keep references consistent
+  (`rename_ied`, `remove_ied`, logical nodes, data sets and members, GOOSE/SV/report/log control
+  blocks, `ExtRef` bind/unbind, GSE/SMV/access-point addresses, history items); `Document::edit`
+  and `Document::read` give raw access.
+- `AddCause::{since, for_edition}`; `Controls::set_edition`.
+- CLI: `ied goose sniff --iface`, `ied sv monitor --iface`, `ied mu --iface [--launch-time]`,
+  `ied goose publish`, `ied sim --iface/--freq/--log-db/--password`, `ied mms put`,
+  `ied scl edit` (dry-run diff, atomic write, refuses an edit that adds a validation error unless
+  `--force`, records who and why in the header history). Every subcommand answers `--help`.
+- Fuzz targets `log_record`, `obtain_engine`, `scl_edit`.
+- Tests: live GOOSE/SV over a veth pair on Linux (both receive paths), SetFile against
+  libiec61850's `file-tool` and through the Wireshark oracle, `RedbLog` against `MemoryLog` by
+  proptest and across a killed process, every OpenSCD file round-tripping byte for byte.
+
 ### Changed
 
-- `scripts/fetch-specs.sh` is now `scripts/fetch-references.sh`. Set `IEC61850_REFERENCE` to
-  choose where the reference corpus (ITU-T recommendations, RFCs, IEC previews, Wireshark's
-  ASN.1 modules, sample captures, OpenSCD fixtures) goes; the capture and fixture tests read
-  the same variable and skip when the corpus is absent.
+- ⚠ An Edition 1 server sends only Edition 1 `AddCause` values (0–18): `ObjectAlreadySelected`
+  as `SelectFailed`, any other newer cause as `Unknown` — in `LastApplError` and the control
+  tracker alike.
+- ⚠ Enabling a GoCB/MSVCB the server cannot publish (no address, no fixed SV layout, a unicast
+  USVCB) is refused with `object-value-invalid`; deleting a data set a publishing block uses is
+  refused.
+- ⚠ The client answers every confirmed request a server sends it instead of ignoring it.
+- ⚠ A `FileRead` response is bounded by the negotiated PDU and the TSDU limit, not by
+  `Limits::max_primitive_len`.
+- ⚠ A log query the store cannot answer is refused with `resource` / `mass-storage-unavailable`.
+- `DirectoryStore` never lists, reads or deletes a dot-file.
+- `MemoryLog` evicts in O(1).
+- `Error::Service` names its class ("definition (class 2)").
+- `scripts/fetch-specs.sh` is now `scripts/fetch-references.sh`, writing to
+  `$IEC61850_REFERENCE`; it also fetches `SCL_BaseSimpleTypes.xsd`.
+- Releases publish through crates.io Trusted Publishing.
+
+### Fixed
+
+- ⚠ `ServiceError` answers used the wrong `errorClass` tags: `definition` is 2 and `service` 4
+  (they went out as 4 and 5); `resource` (3) and `file` (11) added.
+- ⚠ A deeply nested SCL file overflowed the loader's stack; `roxmltree` ≥ 0.21.2 parses
+  iteratively, and a 200 000-level document is tested.
+- `ied mu --help` wrote a capture called `--help`; no option is taken for a file name.
+
+### Breaking
+
+- MSRV is **1.90**.
+- Every `LogStore` method is fallible (`Result<_, LogError>`); `by_time`/`after_entry` return
+  `LogPage`; `purge` and `bounds` are required; `Logs::set_store` takes the `Ied`.
+- `Negotiated`, `ServiceError` and `AcsiConfig` gain fields; `FileStore` gains `create`.
 
 ## [0.3.0] — 2026-09-06
 
@@ -193,7 +264,8 @@ First release. GOOSE and Sampled Values with sans-IO publishers and subscribers,
 and MMS PDUs, the association state machine in both roles, a blocking MMS client and server,
 SCL loading and validation, pcap tooling and the `ied` command line.
 
-[Unreleased]: https://github.com/hupe1980/iec61850-rs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/hupe1980/iec61850-rs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/hupe1980/iec61850-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hupe1980/iec61850-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hupe1980/iec61850-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/hupe1980/iec61850-rs/releases/tag/v0.1.0

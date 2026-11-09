@@ -23,6 +23,7 @@ hyphen-to-underscore rule implies. (`iec61850` on crates.io belongs to an unrela
 | `server` *(default)* | The blocking MMS server: an SCL file is the namespace, with a report engine, the four control models, setting groups, a sandboxed file store and logs. Implies `std`, `mms` and `scl` |
 | `scl` *(default)* | Load an IED model from ICD/CID/SCD files. Pulls in `roxmltree` |
 | `pcap` *(default)* | Read and write classic pcap capture files |
+| `log-redb` | A durable server log in a redb file. Pulls in `redb` |
 | `net` | GOOSE and SV on a live interface (Linux AF_PACKET, macOS/FreeBSD BPF) through [`rawether`](https://crates.io/crates/rawether) |
 | `cli` | The `ied` command line. Implies every other feature |
 
