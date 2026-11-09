@@ -15,7 +15,7 @@ mod service;
 mod time;
 
 pub use edition::Edition;
-pub use error::{DecodeReason, Error, Result, data_access_reason};
+pub use error::{DecodeReason, Error, Result, data_access_reason, service_error_class};
 pub use flags::{ControlModel, OptFlds, ReasonCode, TrgOps};
 pub use limits::Limits;
 pub use mac::MacAddr;

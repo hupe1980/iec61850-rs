@@ -92,6 +92,9 @@ jobs:
           # `IEC61850_REQUIRE_INTEROP` turns a tool that is missing here into a failure rather
           # than a test that quietly stops running.
           make -C "$RUNNER_TEMP/libiec61850/examples/server_example_logging"
+          # Their log client and file tool are outside the example list too.
+          make -C "$RUNNER_TEMP/libiec61850/examples/iec61850_client_example_log"
+          make -C "$RUNNER_TEMP/libiec61850/examples/iec61850_client_example_files"
       - run: cargo test --all-features --test interop -- --test-threads=3
         env:
           IEC61850_LIBIEC61850: ${{ runner.temp }}/libiec61850
@@ -109,7 +112,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.90.0
       - run: cargo check --all-features
   fuzz-smoke:
     runs-on: ubuntu-latest

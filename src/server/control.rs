@@ -32,7 +32,7 @@ use core::result::Result;
 
 use super::acsi::AssocId;
 use super::ied::{DATA_ACCESS_DENIED, DATA_ACCESS_VALUE_INVALID, Ied};
-use crate::common::{Fc, Instant, Now, UtcTime};
+use crate::common::{Edition, Fc, Instant, Now, UtcTime};
 use crate::proto::data::Value;
 use crate::proto::mms::control::{AddCause, ControlError, ControlModel, ControlRequest, LastApplError};
 use crate::proto::mms::{AccessResult, Mms, ObjectName, Unconfirmed, VariableAccess, VariableSpecification};
@@ -121,6 +121,8 @@ pub struct Controls {
     /// `respAddCause`. It is taken rather than read, because it describes *one* command and a
     /// second reader would be told about a command that had already been reported.
     last_cause: Option<AddCause>,
+    /// The edition served: every `AddCause` that leaves is one this edition defines.
+    edition: Edition,
 }
 
 /// Hand-written because a [`ControlHook`] is a closure and closures have no `Debug`; the
@@ -134,13 +136,22 @@ impl core::fmt::Debug for Controls {
             .field("sbo_timeout_ms", &self.sbo_timeout_ms)
             .field("pending", &self.pending.len())
             .field("last_cause", &self.last_cause)
+            .field("edition", &self.edition)
             .finish()
     }
 }
 
 impl Default for Controls {
     fn default() -> Controls {
-        Controls { selections: BTreeMap::new(), timed: Vec::new(), hook: None, sbo_timeout_ms: DEFAULT_SBO_TIMEOUT_MS, pending: Vec::new(), last_cause: None }
+        Controls {
+            selections: BTreeMap::new(),
+            timed: Vec::new(),
+            hook: None,
+            sbo_timeout_ms: DEFAULT_SBO_TIMEOUT_MS,
+            pending: Vec::new(),
+            last_cause: None,
+            edition: Edition::default(),
+        }
     }
 }
 
@@ -154,6 +165,12 @@ impl Controls {
     /// Ask `hook` before every select, operate and cancel.
     pub fn on_control(&mut self, hook: ControlHook) {
         self.hook = Some(hook);
+    }
+
+    /// The edition the refusals are encoded for ([`AddCause::for_edition`]). The server sets
+    /// it from its [`Ied`]; an `AddCause` the hook returns is mapped too.
+    pub fn set_edition(&mut self, edition: Edition) {
+        self.edition = edition;
     }
 
     /// How long a selection is held.
@@ -200,6 +217,7 @@ impl Controls {
             let refusal =
                 mode_refusal(behaviour_of(ied, &t.object), t.request.test).map_or_else(|| self.ask(&t.object, Stage::Operate, &t.request, t.model), Err);
             if let Err(cause) = refusal {
+                let cause = cause.for_edition(self.edition);
                 let error = LastApplError {
                     control_object: alloc::format!("{}$Oper", t.object),
                     error: ControlError::Unknown,
@@ -275,11 +293,11 @@ impl Controls {
         // **`Cancel` is exempt.** It withdraws a command rather than issuing one, and a node
         // that went blocked while a client held a selection must still let that client let go
         // — otherwise the only way out is the selection timing out.
-        if attribute != "Cancel" {
-            if let Some(cause) = mode_refusal(behaviour_of(ied, object), request.test) {
-                let stage = if attribute == "Oper" { Stage::Operate } else { Stage::Select };
-                return self.refuse(assoc, object, &request, model, stage, cause);
-            }
+        if attribute != "Cancel"
+            && let Some(cause) = mode_refusal(behaviour_of(ied, object), request.test)
+        {
+            let stage = if attribute == "Oper" { Stage::Operate } else { Stage::Select };
+            return self.refuse(assoc, object, &request, model, stage, cause);
         }
 
         match attribute {
@@ -350,18 +368,18 @@ impl Controls {
         // Time-activated operate (IEC 61850-7-2 §20): an `operTm` in the future arms the
         // command rather than running it. The write still succeeds — what the client is
         // waiting for is the termination, which arrives when the command actually runs.
-        if let Some(at) = request.oper_tm {
-            if let Some(wait) = at.to_unix_nanos().checked_sub(now.wall.to_unix_nanos()).filter(|w| *w > 0) {
-                self.timed.retain(|t| !(t.object == object && t.assoc == assoc));
-                self.timed.push(Timed {
-                    assoc,
-                    object: String::from(object),
-                    request: ControlRequest { t: now.wall, ..request.clone() },
-                    model,
-                    due: now.mono.plus_nanos(wait),
-                });
-                return Ok(());
-            }
+        if let Some(at) = request.oper_tm
+            && let Some(wait) = at.to_unix_nanos().checked_sub(now.wall.to_unix_nanos()).filter(|w| *w > 0)
+        {
+            self.timed.retain(|t| !(t.object == object && t.assoc == assoc));
+            self.timed.push(Timed {
+                assoc,
+                object: String::from(object),
+                request: ControlRequest { t: now.wall, ..request.clone() },
+                model,
+                due: now.mono.plus_nanos(wait),
+            });
+            return Ok(());
         }
         apply(ied, object, request, now.wall);
         if model.enhanced_security() {
@@ -381,6 +399,7 @@ impl Controls {
     /// select and reports the refusal afterwards leaves the client believing it holds a
     /// breaker it does not.
     fn refuse(&mut self, assoc: AssocId, object: &str, request: &ControlRequest, model: ControlModel, stage: Stage, cause: AddCause) -> Result<(), i64> {
+        let cause = cause.for_edition(self.edition);
         self.last_cause = Some(cause);
         let error = LastApplError {
             control_object: alloc::format!("{object}$Oper"),

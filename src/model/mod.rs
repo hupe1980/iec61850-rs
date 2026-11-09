@@ -1113,15 +1113,15 @@ impl IedModel {
         }
         // `ix` without an index in the name is the schema's own form, and it needs an array
         // somewhere on the path for the index to be placed against.
-        if let Some(ix) = fcda.ix {
-            if !walk.iter().any(|s| s.index.is_some()) {
-                match walk.iter().find(|s| s.count.is_some()) {
-                    Some(FcdaStep { name, count: Some(n), .. }) if ix >= *n => {
-                        return Err(alloc::format!("ix={ix} is past the end of `{name}`, which has {n} elements"));
-                    }
-                    Some(_) => {}
-                    None => return Err(alloc::format!("ix={ix} but nothing on this path is an array")),
+        if let Some(ix) = fcda.ix
+            && !walk.iter().any(|s| s.index.is_some())
+        {
+            match walk.iter().find(|s| s.count.is_some()) {
+                Some(FcdaStep { name, count: Some(n), .. }) if ix >= *n => {
+                    return Err(alloc::format!("ix={ix} is past the end of `{name}`, which has {n} elements"));
                 }
+                Some(_) => {}
+                None => return Err(alloc::format!("ix={ix} but nothing on this path is an array")),
             }
         }
         Ok(())

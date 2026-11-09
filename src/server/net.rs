@@ -189,13 +189,16 @@ impl Server {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_file_store(store);
     }
 
-    /// Keep the log entries in `store` instead of the default bounded in-memory one.
-    ///
-    /// The default is right for a simulator and wrong for a device that must survive a
-    /// restart; a durable store is a backend, not a redesign, because the trigger evaluation
-    /// and the two ACSI queries sit above the trait rather than inside it.
+    /// Keep the log entries in `store` instead of the default bounded in-memory one — e.g. a
+    /// `RedbLog` (feature `log-redb`) to survive a restart. What the store already holds is
+    /// published in the log control blocks at once.
     pub fn set_log_store(&mut self, store: Box<dyn super::LogStore>) {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_log_store(store);
+    }
+
+    /// The logs the model declares, as full references — the list a store is opened for.
+    pub fn log_references(&self) -> Vec<String> {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.log_references().to_vec()
     }
 
     /// Replace the wall clock every absolute timestamp is read from.
@@ -393,6 +396,28 @@ fn dispatch(shared: &Shared, due: Vec<(AssocId, Vec<u8>)>) {
     }
 }
 
+/// Issue the next request of a transfer toward the client (an `ObtainFile`'s `FileOpen`,
+/// `FileRead` or `FileClose`), if one is due. It is issued and the loop goes on: the answer
+/// arrives as an event like any other, so a client that answers slowly holds its own transfer
+/// and nothing else.
+fn issue_transfer_calls(shared: &Arc<Mutex<Shared>>, assoc: &mut Association, id: AssocId, now: Instant) {
+    let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
+    loop {
+        let issued = match guard.acsi.obtain_call(id) {
+            None => return,
+            Some(call) => assoc.call(now, &call),
+        };
+        if let Ok(invoke) = issued {
+            guard.acsi.obtain_issued(id, invoke);
+        } else {
+            if let Some(bytes) = guard.acsi.obtain_failed(id, None) {
+                let _ = assoc.send_encoded(&bytes);
+            }
+            return;
+        }
+    }
+}
+
 /// One association, from the COTP connection request to the release.
 fn serve(
     id: AssocId,
@@ -431,12 +456,34 @@ fn serve(
             match event {
                 AssociationEvent::Request { invoke_id, pdu } => requests.push((invoke_id, pdu)),
                 AssociationEvent::Closed(_) => closed = true,
+                // The answers to the requests this server issued toward the client — the
+                // `FileOpen`/`FileRead`/`FileClose` of an `ObtainFile`. The last one ends the
+                // transfer and answers the client's `ObtainFile`.
+                AssociationEvent::Response { invoke_id, pdu } => {
+                    let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    let answer = match Mms::parse(&pdu, &limits) {
+                        Ok(mms) => guard.acsi.obtain_response(id, invoke_id, &mms),
+                        Err(_) => guard.acsi.obtain_failed(id, Some(invoke_id)),
+                    };
+                    drop(guard);
+                    if let Some(bytes) = answer {
+                        let _ = assoc.send_encoded(&bytes);
+                    }
+                }
+                AssociationEvent::Timeout { invoke_id } | AssociationEvent::Malformed { invoke_id: Some(invoke_id), .. } => {
+                    let answer = shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.obtain_failed(id, Some(invoke_id));
+                    if let Some(bytes) = answer {
+                        let _ = assoc.send_encoded(&bytes);
+                    }
+                }
                 // What the peer agreed to accept sizes two things the ACSI layer would
                 // otherwise guess at: a `GetNameList` page and a report. ISO 9506 negotiates
                 // *down*, so the server's own configured size is an upper bound, not an
                 // agreement, and a report larger than this is segmented rather than dropped.
                 AssociationEvent::Established(n) => {
-                    shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_association_max_pdu(id, n.max_pdu);
+                    let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    guard.acsi.set_association_max_pdu(id, n.max_pdu);
+                    guard.acsi.set_authenticated(id, n.authenticated);
                 }
                 // A response, a timeout or an undecodable PDU on a server association: none
                 // of them is a request, and none of them is a reason to drop the client.
@@ -447,15 +494,22 @@ fn serve(
         for (invoke_id, pdu) in requests {
             let answer = {
                 let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
-                match Mms::parse(&pdu, &limits) {
+                let answer = match Mms::parse(&pdu, &limits) {
                     Ok(Mms::ConfirmedRequest { service, .. }) => guard.acsi.request(id, now, &service),
                     // Not a confirmed request, or not a PDU at all — which ISO 9506 answers
                     // with a reject naming the *PDU*, not with a service error naming a
                     // service that was never called.
                     _ => super::acsi::Answer::INVALID_PDU,
+                };
+                // An `ObtainFile` is answered when the file has arrived, not now.
+                if matches!(answer, super::acsi::Answer::Deferred) {
+                    guard.acsi.obtain_bind(id, invoke_id);
                 }
+                answer
             };
-            if let Ok(bytes) = answer.encode(invoke_id) {
+            if let Ok(bytes) = answer.encode(invoke_id)
+                && !bytes.is_empty()
+            {
                 let _ = assoc.send_encoded(&bytes);
             }
             // A commit may have happened inside the request — a control that changed a
@@ -463,6 +517,8 @@ fn serve(
             let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
             publish(&mut guard, now);
         }
+
+        issue_transfer_calls(shared, &mut assoc, id, now);
 
         loop {
             match outbound.try_recv() {

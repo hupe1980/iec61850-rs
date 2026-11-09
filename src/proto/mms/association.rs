@@ -177,6 +177,9 @@ pub struct Negotiated {
     pub tpdu_data: usize,
     /// The presentation context MMS was negotiated into.
     pub mms_context: u16,
+    /// Whether the client presented the configured ACSE password: on a server, the password
+    /// it requires was given; on a client, one was sent and the server accepted it.
+    pub authenticated: bool,
 }
 
 /// Why an association ended.
@@ -356,6 +359,21 @@ pub struct Association {
     peer_ref: u16,
 }
 
+/// The password inside an ACSE `authentication-value`: its `[0] GraphicString` choice.
+fn password_of(value: &[u8]) -> Option<&[u8]> {
+    let t = Cursor::new(value).next()?.ok()?;
+    (t.tag == Tag::context(0)).then_some(t.value)
+}
+
+/// Whether two secrets are equal, in time that depends on their lengths only.
+fn same_secret(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = u8::from(a.len() != b.len());
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 impl Association {
     /// The client end. Nothing is sent until [`Association::start`].
     pub fn client(cfg: AssociationConfig) -> Association {
@@ -467,15 +485,15 @@ impl Association {
 
     /// Time passed: expire the handshake and any request that went unanswered.
     pub fn on_timeout(&mut self, now: Instant) {
-        if let Some(deadline) = self.connect_deadline {
-            if now >= deadline {
-                match self.state {
-                    // A release this end asked for and the peer never confirmed is still a
-                    // release: reporting it as a handshake timeout would name the wrong end.
-                    State::Releasing => return self.close(CloseReason::Released),
-                    State::Established | State::Closed => {}
-                    _ => return self.close(CloseReason::ConnectTimeout),
-                }
+        if let Some(deadline) = self.connect_deadline
+            && now >= deadline
+        {
+            match self.state {
+                // A release this end asked for and the peer never confirmed is still a
+                // release: reporting it as a handshake timeout would name the wrong end.
+                State::Releasing => return self.close(CloseReason::Released),
+                State::Established | State::Closed => {}
+                _ => return self.close(CloseReason::ConnectTimeout),
             }
         }
         if self.cfg.request_timeout_ms == 0 {
@@ -534,6 +552,15 @@ impl Association {
         self.outstanding.insert(invoke_id, deadline);
         self.stats.requests_sent = self.stats.requests_sent.saturating_add(1);
         Ok(invoke_id)
+    }
+
+    /// Give an outstanding request a fresh timeout from `now` — for a request whose answer is
+    /// legitimately slow while the peer is visibly working on it (an `ObtainFile` during which
+    /// the server reads the file from this end).
+    pub fn extend_deadline(&mut self, invoke_id: i64, now: Instant) {
+        if let Some(deadline) = self.outstanding.get_mut(&invoke_id) {
+            *deadline = now.plus_millis(self.cfg.request_timeout_ms);
+        }
     }
 
     /// Answer a confirmed request (server role).
@@ -737,6 +764,20 @@ impl Association {
             self.close(CloseReason::ProtocolError);
             return Ok(());
         };
+        // A server with a password admits only a client that presents it; the comparison takes
+        // the same time however much of the password matches.
+        let authenticated = match self.cfg.password.as_deref() {
+            None => false,
+            Some(expected) => {
+                if !a.authentication_value.and_then(password_of).is_some_and(|given| same_secret(given, expected.as_bytes())) {
+                    self.refuse_associate(&cp, acse_context)?;
+                    self.emit(AssociationEvent::Refused { layer: "acse", code: Some(13) });
+                    self.close(CloseReason::Refused);
+                    return Ok(());
+                }
+                true
+            }
+        };
         self.peer_max_pdu = usize::try_from(init.local_detail.unwrap_or(0)).unwrap_or(0);
         // The **called** end's budget: how many requests the client agreed this server may
         // have outstanding toward it, capped by what this server negotiated back.
@@ -747,8 +788,36 @@ impl Association {
             max_outstanding: mine,
             tpdu_data: self.tpdu_data,
             mms_context,
+            authenticated,
         });
         Ok(())
+    }
+
+    /// Server: refuse the association at ACSE with `authentication-failure (13)`.
+    fn refuse_associate(&mut self, cp: &Cp<'_>, acse_context: u16) -> Result<()> {
+        let diagnostic = acse::diagnostic_service_user(13);
+        let aare = Associate {
+            protocol_version: Some((7, &[0x80])),
+            context_name: Some(Oid::MMS_APPLICATION_CONTEXT),
+            result: Some(acse::RESULT_REJECTED_PERMANENT),
+            result_diagnostic: Some(&diagnostic),
+            ..Associate::default()
+        };
+        let aare_bytes = Apdu::AssociateResponse(aare).to_vec()?;
+        let results: Vec<ContextResult<'_>> =
+            cp.contexts.iter().map(|_: &ContextDefinition<'_>| ContextResult { result: RESULT_ACCEPTANCE, transfer_syntax: Some(Oid::BER) }).collect();
+        let cpa = Cp {
+            protocol_version: Some((7, &[0x80])),
+            responding_psel: Some(&self.cfg.local.p_sel),
+            results,
+            requirements: Some((6, &[0x00])),
+            user_data: alloc::vec![Pdv::single(acse_context, &aare_bytes)],
+            ..Cp::default()
+        };
+        let ppdu = Ppdu::Accept(cpa).to_vec()?;
+        let mut spdu = Vec::new();
+        Spdu::Accept(session::Connect::new(Some(&self.cfg.local.s_sel), Some(&self.cfg.remote.s_sel), &ppdu)).write(&mut spdu)?;
+        self.send_tsdu(&spdu)
     }
 
     /// Client: the CPA with the AARE and the MMS `Initiate` response.
@@ -801,6 +870,7 @@ impl Association {
                     max_outstanding: mine.clamp(1, usize::from(self.cfg.max_outstanding)),
                     tpdu_data: self.tpdu_data,
                     mms_context: self.mms_context,
+                    authenticated: self.cfg.password.is_some(),
                 });
                 Ok(())
             }
@@ -1614,5 +1684,36 @@ mod tests {
         let ids: Vec<i64> = (0..4).map(|_| c.call(Instant::ZERO, &ConfirmedRequest::Identify).unwrap()).collect();
         // It wraps past the ceiling to 1, and then skips the values still outstanding.
         assert_eq!(ids, [i64::from(u32::MAX) - 1, i64::from(u32::MAX), 1, 2]);
+    }
+
+    /// A server with a password admits only a client that presents it, and refuses the rest at
+    /// ACSE with `authentication-failure`.
+    #[test]
+    fn a_server_with_a_password_refuses_a_client_without_it() {
+        let with = |password: Option<&str>| AssociationConfig { password: password.map(String::from), ..AssociationConfig::default() };
+        for (client, admitted) in [(None, false), (Some("wrong"), false), (Some("s3cret"), true)] {
+            let mut c = Association::client(with(client));
+            let mut s = Association::server(with(Some("s3cret")));
+            c.start(Instant(0)).unwrap();
+            for _ in 0..8 {
+                while let Some(p) = c.poll_transmit() {
+                    let p = p.to_vec();
+                    s.on_bytes(Instant(1), &p);
+                }
+                while let Some(p) = s.poll_transmit() {
+                    let p = p.to_vec();
+                    c.on_bytes(Instant(1), &p);
+                }
+            }
+            let server_events = events(&mut s);
+            let client_events = events(&mut c);
+            if admitted {
+                assert!(server_events.iter().any(|e| matches!(e, AssociationEvent::Established(n) if n.authenticated)), "{server_events:?}");
+            } else {
+                assert!(!server_events.iter().any(|e| matches!(e, AssociationEvent::Established(_))), "{client:?}: {server_events:?}");
+                assert!(client_events.iter().any(|e| matches!(e, AssociationEvent::Refused { layer: "acse", code: Some(_) })), "{client:?}: {client_events:?}");
+            }
+        }
+        assert!(same_secret(b"abc", b"abc") && !same_secret(b"abc", b"abd") && !same_secret(b"abc", b"ab"));
     }
 }

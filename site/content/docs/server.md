@@ -219,7 +219,10 @@ Ed 1    RptID RptEna Resv DatSet ConfRev OptFlds BufTm SqNum TrgOps IntgPd GI
 ```
 
 `--edition 1|2|2.1` or `Ied::with_edition` overrides the file. The edition also sets the
-object-reference length limit.
+object-reference length limit and the `AddCause` values a refusal may carry: Edition 1 defines
+0–18, so an Edition 1 server sends `ObjectAlreadySelected` as `SelectFailed` and any other newer
+cause — including one the control hook returns — as `Unknown`. `AddCause::for_edition` is the
+mapping; `AddCause::since` names the edition that introduced a value.
 
 ## Errors and rejects
 
@@ -285,8 +288,9 @@ server.set_file_store(Box::new(DirectoryStore::new("/var/lib/ied/records")));
 
 `DirectoryStore` refuses absolute paths, drive letters, UNC prefixes, backslashes and `..`
 components, and checks that the canonicalised path is still inside the root. Every refusal is
-`object-non-existent`, indistinguishable from a missing file. It is read-only unless
-`.writable()`, which allows `FileDelete`.
+`object-non-existent`, indistinguishable from a missing file. Nothing whose path has a
+component starting with `.` is ever listed, read or deleted. It is read-only unless
+`.writable()`, which allows `FileDelete` and receiving files.
 
 Files are read in ranges: `FileStore` is `list`, `info` and `read_at(path, offset, len)`, so a
 `FileRead` costs one chunk whatever the file's size. Implement it to serve records from anywhere:
@@ -301,6 +305,39 @@ impl FileStore for MyArchive {
 
 The default is `NoFiles`.
 
+### Receiving files (`SetFile`)
+
+A client sends a file with ACSI `SetFile` (MMS `ObtainFile`); the server then reads it from the
+client with `FileOpen`/`FileRead`/`FileClose` on the same association and stores it. Nobody may
+by default: `AcsiConfig::set_file` is `SetFilePolicy::Off`, `Authenticated` (only an association
+that presented the server's ACSE password) or `Anyone`, and the store must be writable.
+
+```rust
+use iec61850_rs::server::{AcsiConfig, DirectoryStore, ServerConfig, SetFilePolicy};
+
+let mut cfg = ServerConfig { acsi: AcsiConfig { set_file: SetFilePolicy::Authenticated, ..AcsiConfig::default() }, ..ServerConfig::default() };
+cfg.association.password = Some("s3cret".into());          // every association must present it
+let mut server = Server::bind_with("0.0.0.0:102", ied, &cfg)?;
+server.set_file_store(Box::new(DirectoryStore::new("/var/lib/ied/settings").writable()));
+```
+
+`DirectoryStore` applies the read rules to the destination and more: no component may start
+with `.`, the directory must already exist inside the root after symlinks are resolved, and an
+existing file is not replaced (`duplicate-filename`) unless `.allow_overwrite()`. The file is
+written to a hidden temporary beside its destination and appears under its name only complete;
+a refused, failed, timed-out or abandoned transfer leaves nothing. `.with_limits(file, total)`
+bounds one file (default 16 MiB) and the whole store (256 MiB); the declared size is checked
+before the first read and every chunk after it.
+
+Transfers never hold up the server: the connection loop issues each request and goes on, one
+transfer per association and `AcsiConfig::max_obtains` (2) in all, each finished within
+`obtain_timeout_ms` (30 s) or answered with an error. A refusal carries the ISO 9506 `file`
+error and says which side failed (`ObtainFile-Error`: source or destination). A request naming a
+third-party `sourceFileServer` is refused.
+
+A server with `AssociationConfig::password` refuses any association that does not present it,
+at ACSE with `authentication-failure`; the comparison is constant-time.
+
 ## Logs
 
 Log entries use the same trigger evaluation as reports. The log control block tracks
@@ -309,15 +346,27 @@ Log entries use the same trigger evaluation as reports. The log control block tr
 When the file's `reasonCode` asks for it (the SCL default), an entry records why it was made, as
 a variable under the reserved name `ReasonCode`; the client returns it as `LogEntry::reason`.
 
-Entries live in a `LogStore`. The default is a bounded in-memory ring; supply your own for
-durability:
+Entries live in a `LogStore`. The default, `MemoryLog`, is a bounded in-memory ring. With the
+`log-redb` feature, `RedbLog` keeps them in a file that survives a restart:
 
 ```rust
-server.set_log_store(Box::new(MyFlashRing::new()));
+use iec61850_rs::server::RedbLog;
+
+let logs = server.log_references();
+server.set_log_store(Box::new(RedbLog::open("relay-log.redb", logs, 10_000)?));
 ```
 
-The trait is `append` plus the two queries. The `EntryID` belongs to the store, which must keep
-it ordered across restarts.
+Each append is one transaction — entry, counter and eviction together — and is on disk before it
+returns (`SyncPolicy::Deferred` plus `RedbLog::sync` trades that for fewer flushes). A restarted
+server publishes `OldEnt`/`NewEnt` from the file before it logs anything new, and `EntryID`s keep
+counting up. The file is created readable by its owner only, and is locked to one store; a file
+of another format version is refused, not migrated. `ied sim --log-db` does the same from the
+command line.
+
+A store of your own implements the trait (`append`, `by_time`, `after_entry`, `bounds`, `len`,
+`purge`, all fallible) and should pass `check_log_store`, the contract both shipped stores pass.
+A query the store cannot answer is refused with `resource`/`mass-storage-unavailable`; an entry
+it cannot keep moves no bound and is counted in `Acsi::failed_log_appends`.
 
 ## Supervising what this IED subscribes to
 
@@ -363,9 +412,7 @@ select expiry or time-activated command.
 
 ## Limits
 
-Not implemented: `ObtainFile` (ACSI `SetFile`), TLS (IEC 62351-3), and edition-specific
-enumeration values (`AddCause`). `GoEna`/`SvEna` drive no publisher. The default `LogStore` is
-in memory.
+Not implemented: TLS (IEC 62351-3). `GoEna`/`SvEna` drive no publisher.
 
 The server is tested against this crate's client, Wireshark and libiec61850's client — see
 [Verification](@/docs/verification.md).

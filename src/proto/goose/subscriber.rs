@@ -374,12 +374,13 @@ impl Subscriber {
     /// without this the application would see the counter jump backwards with nothing
     /// telling it that the values it was holding had become invalid.
     fn check_expiry(&mut self, now: Instant) {
-        if let Some(s) = self.state {
-            if !self.expired && now >= s.expires_at {
-                self.expired = true;
-                self.stats.expiries = self.stats.expiries.saturating_add(1);
-                self.emit(SubscriberEvent::Expired);
-            }
+        if let Some(s) = self.state
+            && !self.expired
+            && now >= s.expires_at
+        {
+            self.expired = true;
+            self.stats.expiries = self.stats.expiries.saturating_add(1);
+            self.emit(SubscriberEvent::Expired);
         }
     }
 

@@ -157,8 +157,10 @@ serving; ^C to stop
 | `--bind` | `127.0.0.1` | Address to listen on |
 | `--port` | 102 | First port; each further IED takes the next |
 | `--files` | — | Serve this directory through the MMS file services, read-only and sandboxed |
-| `--writable` | off | Also allow `FileDelete` in that directory |
+| `--writable` | off | Also allow `FileDelete` in that directory, and receiving files (`SetFile`) |
+| `--password` | none | Require this ACSE password of every association; with `--writable`, only those may send files |
 | `--edition` | from the file | `1`, `2` or `2.1` |
+| `--log-db` | in memory | Keep the logs in this file across restarts (a directory of `<IED>.redb` files when serving several IEDs) |
 
 The edition is the file's own: `2003` is Edition 1, `2007B` Edition 2, `2007B4` and later
 Edition 2.1. An Edition 1 server's report control blocks have no `ResvTms` and no `Owner`.
@@ -275,6 +277,9 @@ $ ied mms files 10.0.0.5
 $ ied mms get 10.0.0.5 COMTRADE/rec0001.cfg rec0001.cfg
 4096 octets -> rec0001.cfg
 
+$ ied mms put 10.0.0.5 settings.xml SETTINGS/settings.xml --password s3cret
+settings.xml -> SETTINGS/settings.xml (2048 octets)
+
 $ ied mms log 10.0.0.5 'IED1LD0/LLN0$GeneralLog' --lcb IED1LD0/LLN0.lcb01
 IED1LD0/LLN0$LG$lcb01  enabled
   LogRef  IED1LD0/LLN0$GeneralLog
@@ -298,6 +303,7 @@ IED1LD0/LLN0$SP$SGCB
 
 - `mms type` is `GetVariableAccessAttributes`.
 - `mms get` writes to a file, or to standard output without a destination.
+- `mms put` is `SetFile`: the server reads the local file from `ied` as it stores it.
 - `mms log` prints entries oldest first, following `moreFollows`, with each entry's reason
   code when recorded; `--lcb` also reads the log control block.
 - `mms sg` prints the setting group control block; without a reference it uses the `SGCB` of
