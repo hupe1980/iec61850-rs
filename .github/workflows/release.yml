@@ -212,7 +212,7 @@ jobs:
   # The Homebrew formula follows the GitHub release it points at, for a release only (a `-` in
   # the version is a pre-release). Owner setup, once: a GitHub App installed on
   # hupe1980/homebrew-tap only, with contents read and write, and a GitHub environment
-  # `release` (deployment rule: tags `v*`) holding its HOMEBREW_APP_ID and
+  # `homebrew` (deployment rule: tags `v*`) holding its HOMEBREW_APP_ID and
   # HOMEBREW_APP_PRIVATE_KEY. Third-party actions here are pinned by commit: the job holds a
   # write token.
   tap:
@@ -220,7 +220,7 @@ jobs:
     needs: [guard, github-release]
     if: github.event_name == 'push' && !contains(needs.guard.outputs.version, '-')
     runs-on: ubuntu-latest
-    environment: release
+    environment: homebrew
     env:
       VERSION: ${{ needs.guard.outputs.version }}
     steps:
