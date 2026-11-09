@@ -48,7 +48,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use std::time::Duration;
 
-pub use rawether::{RxMode as Receive, RxPath};
+pub use rawether::{RingConfig, RxMode as Receive, RxPath};
 
 use crate::common::{Error, Instant, MacAddr, Result, monotonic_now};
 
@@ -316,4 +316,21 @@ impl std::os::fd::AsFd for Link {
 /// capabilities are per thread: call this before spawning threads. A no-op on macOS.
 pub fn drop_capabilities() -> Result<()> {
     rawether::drop_capabilities().map_err(|e| io(&e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SR-007: the presets never put an interface into promiscuous mode; without joined groups
+    /// they admit the IEC multicast range through the kernel filter.
+    #[test]
+    fn the_presets_are_not_promiscuous() {
+        for o in [LinkOptions::goose(), LinkOptions::sv(), LinkOptions::process_bus()] {
+            assert!(!o.promiscuous && o.join.is_empty() && !o.prefixes.is_empty(), "{o:?}");
+        }
+        assert!(LinkOptions::goose().promiscuous(true).promiscuous);
+        assert_eq!(LinkOptions::goose().prefixes, [GOOSE_MULTICAST_PREFIX]);
+        assert_eq!(LinkOptions::sv().prefixes, [SV_MULTICAST_PREFIX]);
+    }
 }
