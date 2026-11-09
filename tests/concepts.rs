@@ -255,7 +255,14 @@ fn nothing_published_cites_the_internal_tree() {
                     && !before.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
                     && !after.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
             });
-            if cites || cites_id {
+            // Spec Kit requirement ids (`SR-004`, `FR-012`, `SC-003`) point into the same specs.
+            let cites_spec_id = ["SR-", "FR-", "SC-"].iter().any(|prefix| {
+                line.match_indices(prefix).any(|(at, _)| {
+                    let digits = bytes[at + 3..].iter().take_while(|b| b.is_ascii_digit()).count();
+                    digits == 3 && !at.checked_sub(1).and_then(|i| bytes.get(i)).is_some_and(u8::is_ascii_alphanumeric)
+                })
+            });
+            if cites || cites_id || cites_spec_id {
                 let file = file.strip_prefix(root).unwrap_or(file).display();
                 leaks.push(format!("{file}:{}", n + 1));
             }
