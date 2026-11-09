@@ -23,6 +23,7 @@ hyphen-to-underscore rule implies. (`iec61850` on crates.io belongs to an unrela
 | `server` *(default)* | The blocking MMS server: an SCL file is the namespace, with a report engine, the four control models, setting groups, a sandboxed file store and logs. Implies `std`, `mms` and `scl` |
 | `scl` *(default)* | Load an IED model from ICD/CID/SCD files. Pulls in `roxmltree` |
 | `pcap` *(default)* | Read and write classic pcap capture files |
+| `net` | GOOSE and SV on a live interface (Linux AF_PACKET, macOS/FreeBSD BPF) through [`rawether`](https://crates.io/crates/rawether) |
 | `cli` | The `ied` command line. Implies every other feature |
 
 There is no `alloc` feature: the crate is `no_std` **+ alloc** in every configuration. Every
@@ -210,8 +211,8 @@ server.run()?;
 
 ## Where the frames come from
 
-The library does not open raw sockets ([why](@/docs/protocols.md#sans-io)). Capture files are a
-ready source and sink:
+The protocol cores never open a socket ([why](@/docs/protocols.md#sans-io)); frames come from
+wherever you get them. Capture files are a ready source and sink:
 
 ```rust
 use iec61850_rs::pcap::Capture;
@@ -221,8 +222,22 @@ for (nanos, frame) in Capture::read("bay.pcap")?.frames {
 }
 ```
 
-On a live network, bind an `AF_PACKET` socket (Linux) and pass what it receives to the same
-`on_frame`; nothing else changes.
+On a live network, the `net` feature's `Link` hands frames to the same `on_frame`, with the
+monotonic instant they arrived at:
+
+```rust
+use iec61850_rs::net::{Link, LinkOptions};
+
+let mut link = Link::open("eth1", &LinkOptions::goose().join(key.dst))?;
+iec61850_rs::net::drop_capabilities()?;      // CAP_NET_RAW is not needed any more
+while let Some(rx) = link.recv(Some(Duration::from_millis(10)))? {
+    sub.on_frame(rx.at, rx.frame);           // rx.wire_time: the kernel's timestamp
+}
+```
+
+The kernel filters on the EtherType and the joined groups before a frame reaches user space.
+Grant the capability to the binary (`setcap cap_net_raw+ep`) rather than running as root; on
+macOS the program needs access to `/dev/bpf*`.
 
 ## Runnable examples
 

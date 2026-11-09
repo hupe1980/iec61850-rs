@@ -282,6 +282,19 @@ Three things in `goose.asn` that a strict reader gets wrong on real traffic:
 
 The encoder is strict; the decoder accepts what deployed publishers send.
 
+## On a live interface
+
+With the `net` feature, `Link::open(iface, &LinkOptions::goose())` sends what `poll_transmit`
+returns and receives what `on_frame` takes; the kernel admits only GOOSE to the GOOSE
+multicast range (or to the groups joined with `.join(mac)`), VLAN-tagged or not.
+
+A server publishes its own GoCBs: once a client writes `GoEna` — or the application does,
+through a transaction — the block's data set goes out from the address the SCL file gives it,
+a member change is a new state, and the retransmission curve runs on its own.
+`Server::publish_on(link)` sends on an interface, `Server::publish_to(sink)` anywhere else
+(a capture, a test). Writing `true` again restarts nothing; a block the file gives no address
+is refused with `object-value-invalid`.
+
 ## Not included
 
 *Emitting* fixed-length encoded GOOSE (`GSEControl.fixedOffs`, Edition 2.1 — decoding it

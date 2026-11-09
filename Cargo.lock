@@ -85,6 +85,7 @@ name = "iec61850-rs"
 version = "0.3.0"
 dependencies = [
  "proptest",
+ "rawether",
  "redb",
  "roxmltree",
 ]
@@ -222,6 +223,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
 dependencies = [
  "rand_core",
+]
+
+[[package]]
+name = "rawether"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

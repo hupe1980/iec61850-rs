@@ -30,8 +30,8 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant as StdInstant};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Duration;
 
 use super::acsi::{Acsi, AcsiConfig, AssocId};
 use super::ied::Ied;
@@ -86,6 +86,35 @@ struct Shared {
     /// reports and command terminations. Bounded; see [`ServerConfig::outbound_queue`].
     outbound: BTreeMap<AssocId, Outbound>,
     next_assoc: AssocId,
+    /// Wakes the process-bus publisher thread when a commit may have produced a frame.
+    wake: Option<Arc<Wake>>,
+}
+
+/// A flag and the condition variable the publisher thread sleeps on.
+#[derive(Debug, Default)]
+struct Wake {
+    pending: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Wake {
+    fn notify(&self) {
+        *self.pending.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.cv.notify_one();
+    }
+
+    /// Sleep until notified or until `timeout` (`None`: until notified) has passed.
+    fn wait(&self, timeout: Option<Duration>) {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if !*pending {
+            pending = match timeout {
+                Some(t) if t.is_zero() => pending,
+                Some(t) => self.cv.wait_timeout(pending, t).unwrap_or_else(PoisonError::into_inner).0,
+                None => self.cv.wait(pending).unwrap_or_else(PoisonError::into_inner),
+            };
+        }
+        *pending = false;
+    }
 }
 
 /// One association's outbound queue, and the flag that says it overflowed.
@@ -111,9 +140,7 @@ impl Outbound {
 /// Nanoseconds on a monotonic origin shared by every association of this process, so that a
 /// report's gathering window means the same thing whichever thread closes it.
 fn now_nanos() -> u64 {
-    use std::sync::OnceLock;
-    static EPOCH: OnceLock<StdInstant> = OnceLock::new();
-    EPOCH.get_or_init(StdInstant::now).elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+    crate::common::monotonic_now().0
 }
 
 /// A blocking IEC 61850 server.
@@ -155,7 +182,7 @@ impl Server {
         let listener = TcpListener::bind(target).map_err(|e| Error::Io(format!("{addr}: {e}")))?;
         let mut acsi = Acsi::with_config(ied, cfg.acsi.clone());
         acsi.set_max_pdu(cfg.association.max_pdu as usize);
-        Ok(Server { listener, shared: Arc::new(Mutex::new(Shared { acsi, outbound: BTreeMap::new(), next_assoc: 1 })), cfg: cfg.clone() })
+        Ok(Server { listener, shared: Arc::new(Mutex::new(Shared { acsi, outbound: BTreeMap::new(), next_assoc: 1, wake: None })), cfg: cfg.clone() })
     }
 
     /// The address the server is listening on, which is how a caller learns the port it got
@@ -209,6 +236,45 @@ impl Server {
     /// real time quality.
     pub fn set_clock(&mut self, clock: Box<dyn crate::common::Clock + Send + Sync>) {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_clock(clock);
+    }
+
+    /// Publish this IED's GOOSE and sampled values on `link` (feature `net`).
+    ///
+    /// The `GoCB`s and `MSVCB`s the file declares publish once a client — or the application, with
+    /// [`Txn::set`] — writes `GoEna`/`SvEna`. Frames go out from one thread that wakes on the
+    /// publishers' deadlines and on every commit, so a state change is on the wire without
+    /// waiting for a timer. The source address is the link's.
+    #[cfg(feature = "net")]
+    pub fn publish_on(&mut self, link: crate::net::Link) -> Result<()> {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_source_mac(link.mac());
+        self.publish_to(move |frame| {
+            let _ = link.send(frame);
+        })
+    }
+
+    /// Hand this IED's GOOSE and sampled-value frames to `sink` as they become due, from one
+    /// thread — the same seam [`Server::publish_on`] uses for a live interface, for anything
+    /// else that takes frames: a capture file, a test, another transport. Frames carry the
+    /// source address set with [`Server::set_source_mac`] (all zeros by default).
+    pub fn publish_to(&mut self, mut sink: impl FnMut(&[u8]) + Send + 'static) -> Result<()> {
+        let wake = Arc::new(Wake::default());
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).wake = Some(Arc::clone(&wake));
+        let shared = Arc::clone(&self.shared);
+        std::thread::Builder::new()
+            .name(String::from("process-bus"))
+            .spawn(move || publish_loop(&shared, &wake, &mut sink))
+            .map_err(|e| Error::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    /// The source address of published GOOSE and sampled-value frames.
+    pub fn set_source_mac(&mut self, mac: crate::common::MacAddr) {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_source_mac(mac);
+    }
+
+    /// The system frequency for sampled-value blocks whose `smpRate` counts samples per period.
+    pub fn set_nominal_hz(&mut self, hz: u32) {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_nominal_hz(hz);
     }
 
     /// Accept associations for ever, one thread each.
@@ -385,6 +451,40 @@ fn peer_identity(stream: &TcpStream) -> Vec<u8> {
 fn publish(shared: &mut Shared, now: Instant) {
     let due = shared.acsi.commit(now);
     dispatch(shared, due);
+    if let Some(w) = &shared.wake {
+        w.notify();
+    }
+}
+
+/// The process-bus thread: run the publishers' timers, hand what they produced to `sink`
+/// outside the lock, and sleep until the next deadline or the next commit.
+fn publish_loop(shared: &Arc<Mutex<Shared>>, wake: &Wake, sink: &mut dyn FnMut(&[u8])) {
+    // One reusable buffer per frame of a tick: after the first ticks nothing is allocated.
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let (count, next) = {
+            let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
+            let now = Instant(now_nanos());
+            let due = guard.acsi.on_timeout(now);
+            dispatch(&guard, due);
+            let mut count = 0;
+            guard.acsi.drain_frames(|f| {
+                if let Some(buf) = frames.get_mut(count) {
+                    buf.clear();
+                    buf.extend_from_slice(f);
+                } else {
+                    frames.push(f.to_vec());
+                }
+                count += 1;
+            });
+            (count, guard.acsi.next_timeout())
+        };
+        for frame in frames.iter().take(count) {
+            sink(frame);
+        }
+        let wait = next.map(|t| Duration::from_nanos(t.0.saturating_sub(now_nanos())));
+        wake.wait(wait);
+    }
 }
 
 /// Hand each PDU to the association it belongs to.

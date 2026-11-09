@@ -34,6 +34,44 @@ fn tempdir(name: &str) -> PathBuf {
     dir
 }
 
+/// Every subcommand answers `--help` with its own usage, and an option is never taken for a
+/// file name: `ied mu --help` once wrote a capture called `--help`.
+#[test]
+fn every_subcommand_answers_help_and_no_option_becomes_a_file() {
+    let dir = tempdir("help");
+    let commands: [&[&str]; 12] = [
+        &["mu"],
+        &["sim"],
+        &["goose", "sniff"],
+        &["goose", "publish"],
+        &["sv", "monitor"],
+        &["pcap", "info"],
+        &["scl", "validate"],
+        &["scl", "show"],
+        &["scl", "subs"],
+        &["mms", "sniff"],
+        &["mms", "read"],
+        &["mms", "report"],
+    ];
+    for command in commands {
+        for flag in ["--help", "-h"] {
+            let args: Vec<&str> = command.iter().copied().chain([flag]).collect();
+            let out = Command::new(ied()).args(&args).current_dir(&dir).output().expect("run ied");
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{args:?} failed");
+            assert!(text.contains(&format!("ied {}", command.join(" "))), "{args:?} printed no usage line for itself:\n{text}");
+        }
+    }
+    let mu = Command::new(ied()).args(["mu", "--frames", "--help"]).current_dir(&dir).output().expect("run ied");
+    assert!(mu.status.success());
+    assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "--help wrote a file");
+    let refused = run(&["pcap", "info", "--nope"]);
+    assert!(!refused.ok && refused.stderr.contains("expected a file name"), "{}", refused.stderr);
+    let refused = run(&["mu", "--frames", "3"]);
+    assert!(!refused.ok && refused.stderr.contains("usage: ied mu"), "{}", refused.stderr);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn help_and_version() {
     let h = run(&["--help"]);

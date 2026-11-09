@@ -44,13 +44,17 @@ client = ["std", "mms"]
 server = ["std", "mms", "scl"]
 # A durable `LogStore` on redb: the server's log survives a restart.
 log-redb = ["server", "dep:redb"]
+# GOOSE and SV on a live interface: raw Ethernet through `rawether` (Linux AF_PACKET, macOS
+# and FreeBSD BPF), with the IEC 61850 presets.
+net = ["std", "dep:rawether"]
 # The `ied` command-line tool.
-cli = ["std", "pcap", "scl", "goose", "sv", "mms", "client", "server", "log-redb"]
+cli = ["std", "pcap", "scl", "goose", "sv", "mms", "client", "server", "log-redb", "net"]
 
 [dependencies]
 # 0.21.2 parses nested elements iteratively; 0.21.1 overflows the stack on deep input.
 roxmltree = { version = "0.21.2", optional = true }
 redb = { version = "4.5", optional = true }
+rawether = { version = "0.1", path = "../rawether", optional = true }
 
 [dev-dependencies]
 proptest = "1.11"
@@ -173,6 +177,16 @@ required-features = ["client", "server"]
 name = "log_store"
 path = "tests/log_store.rs"
 required-features = ["client", "log-redb"]
+
+[[test]]
+name = "net_link"
+path = "tests/net_link.rs"
+required-features = ["net", "goose", "sv"]
+
+[[test]]
+name = "process_bus_server"
+path = "tests/process_bus_server.rs"
+required-features = ["client", "server", "goose", "sv", "pcap"]
 
 # Examples state the features they use, so `cargo test --no-default-features` does not try to
 # build a GOOSE example without the GOOSE codec.

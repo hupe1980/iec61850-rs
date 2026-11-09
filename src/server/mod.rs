@@ -35,6 +35,7 @@ mod log;
 mod log_redb;
 mod net;
 mod obtain;
+mod process_bus;
 mod rcb;
 mod sg;
 mod supervision;
