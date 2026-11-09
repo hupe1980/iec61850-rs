@@ -1,12 +1,8 @@
 //! File services, server side: a **sandboxed** store and the handle protocol over it.
 //!
-//! This is the service an IED exposes to hand a COMTRADE record to a SCADA system, and it is
-//! the one with the worst safety record in the field: libiec61850's changelog lists a path
-//! traversal here, and it is the obvious one — a client sends `../../etc/shadow` as a
-//! `FileName` and a server that joins it onto a root directory serves it.
-//!
-//! So the sandbox is the type, not a check a caller might forget. [`DirectoryStore`] takes a
-//! root and **every** path it accepts is validated the same way:
+//! A client names files, so a `FileName` such as `../../etc/shadow` must never reach outside
+//! the served directory. The sandbox is the type, not a check a caller might forget:
+//! [`DirectoryStore`] takes a root and **every** path it accepts is validated the same way:
 //!
 //! - no absolute paths, no Windows drive letters, no UNC prefixes;
 //! - no `..` component anywhere, before or after normalisation;
@@ -21,6 +17,9 @@
 //! received file is written to a hidden temporary beside its destination, which no read,
 //! listing or delete can see, and appears under its name only complete; an aborted transfer
 //! leaves nothing behind.
+//!
+//! Whether a client may create, replace or delete anything is the server's
+//! [`FileWritePolicy`](super::FileWritePolicy) (`AcsiConfig::file_write`), off by default.
 
 use alloc::string::String;
 use alloc::vec::Vec;

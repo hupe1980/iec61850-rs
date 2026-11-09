@@ -323,7 +323,7 @@ pub fn drop_capabilities() -> Result<()> {
 mod tests {
     use super::*;
 
-    /// SR-007: the presets never put an interface into promiscuous mode; without joined groups
+    /// The presets never put an interface into promiscuous mode; without joined groups
     /// they admit the IEC multicast range through the kernel filter.
     #[test]
     fn the_presets_are_not_promiscuous() {

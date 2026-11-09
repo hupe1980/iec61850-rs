@@ -422,13 +422,11 @@ impl AddCause {
         }
     }
 
-    /// This value as a server of `edition` sends it: itself if the edition defines it,
-    /// otherwise the nearest value the edition does define.
+    /// This value, or the nearest one `edition` defines if it does not define this one.
     ///
-    /// The only Edition 2 value with an exact Edition 1 counterpart is
-    /// `ObjectAlreadySelected`, which an Edition 1 server reports as `SelectFailed`; every
-    /// other newer value becomes `Unknown`, the code each edition defines for "no better
-    /// answer". The boundary and the fallbacks are ⚠ until IEC 61850-8-1 Ed2.1 Table 110 is
+    /// The only Edition 2 value with an Edition 1 counterpart is `ObjectAlreadySelected`,
+    /// which maps to `SelectFailed`; every other newer value maps to `Unknown`, the code each
+    /// edition has for "no better answer". The boundary and the fallbacks are ⚠ until IEC 61850-8-1 Ed2.1 Table 110 is
     /// read, so the server does **not** apply this: it sends every cause as it is, as
     /// libiec61850 does. Map with it yourself if an Edition 1 client needs it.
     #[must_use]

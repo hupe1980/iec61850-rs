@@ -76,7 +76,7 @@ fn drive(link: &Link, publisher: &mut Publisher, until: Instant) -> Vec<Vec<u8>>
     }
 }
 
-/// SR-001, SR-002: the retransmission curve arrives intact through the kernel filter, every
+/// The retransmission curve arrives intact through the kernel filter, every
 /// frame stamped and tagged as it was sent; a replayed frame is judged a replay by the same
 /// subscriber; other EtherTypes and unjoined groups never arrive; drop counters are readable.
 #[test]
@@ -177,7 +177,7 @@ fn a_second_of_sampled_values_arrives_without_a_gap() {
     assert_eq!((frames, gaps), (4800, 0), "no gap at 4800 frames/s");
 }
 
-/// SR-004: dropping the capability keeps an open link working.
+/// Dropping the capability keeps an open link working.
 #[test]
 fn an_open_link_survives_dropping_the_capability() {
     let Some((iface, peer)) = pair() else { return };
@@ -219,7 +219,7 @@ impl Drop for Sim {
     }
 }
 
-/// SR-004, for the whole process: `ied sim --iface` opens its link, drops the capability and
+/// For the whole process: `ied sim --iface` opens its link, drops the capability and
 /// only then starts serving and publishing, so no thread of it — effective or permitted, task by
 /// task — keeps `CAP_NET_RAW`. Linux capabilities are per thread, so this is a property of the
 /// program's order, and the program is what is checked (`IEC61850_IED` names the binary).
@@ -255,7 +255,7 @@ fn no_thread_of_ied_sim_keeps_the_capability() {
     assert!(seen.iter().any(|n| n == "process-bus"), "the publisher thread is running: {seen:?} ({banner:?})");
 }
 
-/// SC-004: retransmitting and receiving in the steady state allocates nothing.
+/// Retransmitting and receiving in the steady state allocates nothing.
 #[test]
 fn the_live_steady_state_does_not_allocate() {
     let Some((iface, peer)) = pair() else { return };

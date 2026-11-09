@@ -241,7 +241,7 @@ fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
     })
 }
 
-/// `YYYY-MM-DDTHH:MM:SSZ` for now.
+/// The current time as `YYYY-MM-DDTHH:MM:SSZ`.
 fn now_rfc3339() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let (days, rem) = (secs / 86_400, secs % 86_400);

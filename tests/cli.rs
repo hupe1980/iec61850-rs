@@ -729,7 +729,6 @@ fn scl_edit_renames_to_stdout_and_leaves_the_file_alone() {
     std::fs::remove_dir_all(dir).ok();
 }
 
-// SR-004
 #[test]
 fn scl_edit_refuses_input_above_the_size_limit() {
     let (dir, file) = scratch_file("size", EDIT_FIXTURE);
@@ -738,7 +737,6 @@ fn scl_edit_refuses_input_above_the_size_limit() {
     std::fs::remove_dir_all(dir).ok();
 }
 
-// SR-008
 #[test]
 fn scl_edit_refuses_an_edit_that_adds_a_validation_error_unless_forced() {
     let second = "\t\t\t\t<GSE ldInst=\"LD0\" cbName=\"gcb2\">\n\t\t\t\t\t<Address>\n\t\t\t\t\t\t<P type=\"MAC-Address\">01-0C-CD-01-00-01</P>\n\t\t\t\t\t\t<P type=\"APPID\">0002</P>\n\t\t\t\t\t</Address>\n\t\t\t\t</GSE>\n\t\t\t</ConnectedAP>\n\t\t\t<ConnectedAP iedName=\"Sub\"";
@@ -765,7 +763,6 @@ fn scl_edit_refuses_an_edit_that_adds_a_validation_error_unless_forced() {
     std::fs::remove_dir_all(dir).ok();
 }
 
-// SR-009
 #[test]
 fn scl_edit_in_place_is_atomic() {
     let (dir, file) = scratch_file("inplace", EDIT_FIXTURE);
@@ -789,7 +786,6 @@ fn scl_edit_in_place_is_atomic() {
     std::fs::remove_dir_all(dir).ok();
 }
 
-// SR-010
 #[test]
 fn scl_edit_dry_run_prints_a_diff_and_writes_nothing() {
     let (dir, file) = scratch_file("dry", EDIT_FIXTURE);
@@ -803,7 +799,6 @@ fn scl_edit_dry_run_prints_a_diff_and_writes_nothing() {
     std::fs::remove_dir_all(dir).ok();
 }
 
-// SR-011
 #[test]
 fn scl_edit_records_who_and_why_in_the_header_history() {
     let (dir, file) = scratch_file("history", EDIT_FIXTURE);

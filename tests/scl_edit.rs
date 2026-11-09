@@ -118,7 +118,6 @@ fn input_that_is_not_utf8_or_not_well_formed_is_refused() {
     assert!(matches!(Document::parse("<SCL><IED></SCL>"), Err(Error::Scl(_))));
 }
 
-// SR-001
 #[test]
 fn a_dtd_is_refused_so_no_entity_is_expanded_or_fetched() {
     let laughs = "<?xml version=\"1.0\"?><!DOCTYPE SCL [<!ENTITY a \"aaaaaaaaaa\"><!ENTITY b \"&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;\">\
@@ -132,7 +131,6 @@ fn a_dtd_is_refused_so_no_entity_is_expanded_or_fetched() {
     }
 }
 
-// SR-002
 #[test]
 fn deep_nesting_is_parsed_or_refused_without_overflowing_the_stack() {
     let depth = 200_000;
@@ -388,7 +386,7 @@ fn history_items_append_in_order() {
     assert_eq!(added_lines(&before, d.as_str()), [hitem("B")]);
 }
 
-// SR-007, on files this repository did not write.
+// On files this repository did not write.
 #[test]
 fn renaming_every_corpus_ied_leaves_no_reference_behind_and_no_new_error() {
     let Some(dir) = common::reference_dir("fixtures/openscd") else { return };
@@ -429,7 +427,7 @@ fn xsd_errors(xsd: &std::path::Path, text: &str, dir: &std::path::Path, tag: &st
     Some(map)
 }
 
-// FR-004, judged by a validating parser this crate did not write.
+// Judged by a validating parser this crate did not write.
 #[test]
 fn edited_corpus_files_gain_no_schema_error() {
     let (Some(dir), Some(xsd)) = (common::reference_dir("fixtures/openscd"), common::reference("scl/SCL.xsd")) else { return };
@@ -494,7 +492,6 @@ fn fixture_is_schema_valid_before_and_after_every_operation() {
     std::fs::remove_dir_all(&tmp).ok();
 }
 
-// SR-005
 #[test]
 fn a_large_station_renames_in_linear_time() {
     let (ieds, refs_per_ied) = (2_000, 25);
@@ -517,7 +514,7 @@ fn a_large_station_renames_in_linear_time() {
     eprintln!("rename of {} references in {} bytes: {took:?}", ieds * refs_per_ied, d.as_str().len());
 }
 
-// --- SR-006 / SC-004: undo after any sequence of edits is exact ------------------------------
+// --- undo after any sequence of edits is exact ------------------------------
 
 #[derive(Clone, Debug)]
 enum Op {

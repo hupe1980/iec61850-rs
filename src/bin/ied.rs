@@ -1,8 +1,8 @@
 //! `ied` — one command-line tool for IEC 61850.
 //!
-//! Subcommands mirror the library: decode and inspect process-bus traffic, load, check and
-//! resolve SCL files, and generate sampled values. One binary rather than a family of them,
-//! because `ip`, `tc` and `cargo` are what users' hands already know.
+//! Subcommands mirror the library: decode, publish and subscribe to process-bus traffic, talk
+//! MMS as a client or serve an SCL file as a simulated IED, load, check, resolve and edit SCL
+//! files, and generate sampled values.
 //!
 //! `goose sniff` and `sv monitor` drive the library's own subscriber state machines rather
 //! than re-deciding anything, so what the tool reports about a frame is what a subscribing

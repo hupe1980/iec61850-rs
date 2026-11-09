@@ -55,7 +55,7 @@ fn goose(frame: &[u8]) -> (u16, String, String, u32, u32, u32, Vec<Value>) {
     (f.appid, v.gocb_ref.to_string(), v.dat_set.to_string(), v.conf_rev, v.st_num, v.sq_num, v.all_data_owned(&Limits::default()).unwrap())
 }
 
-/// SR-005, SR-006: enabling publishes the file's data set; a change is a new state; enabling
+/// Enabling publishes the file's data set; a change is a new state; enabling
 /// again restarts nothing; disabling stops the stream; an unpublishable block is refused; the
 /// published data set cannot be deleted.
 #[test]
