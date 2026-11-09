@@ -370,7 +370,7 @@ impl Ied {
     ///
     /// An `Enum` attribute names an SCL `EnumType`, and that type says which number each name
     /// is. Service tracking needs exactly this: IEC 61850-7-2 gives the `serviceType` and
-    /// `errorCode` names ✅ and IEC 61850-8-1 gives the numbers, behind the paywall (R2), so
+    /// `errorCode` names ✅ and IEC 61850-8-1 gives the numbers, behind the paywall, so
     /// asking the file is the only way to answer without inventing one — and a file that has
     /// answered must win, or the server and its own engineering document disagree.
     pub fn enum_ordinal(&self, reference: &str, name: &str) -> Option<i64> {

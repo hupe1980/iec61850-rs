@@ -915,7 +915,7 @@ mod arrays {
     fn a_write_with_an_index_changes_one_element() {
         let (addr, handle) = spawn();
         let mut c = Client::connect(&addr).expect("associate");
-        // `MX` is a measurand and a client may not write one (D39), so this goes through the
+        // `MX` is a measurand and a client may not write one, so this goes through the
         // application's own path — which is the point of the test: the *reference* addresses
         // one element, whichever side writes it.
         handle.txn().set("IED1LD0/MHAI1$MX$HA$phsAHar(5)$cVal$ang$f", Value::Float32(-1.5)).commit();
@@ -988,7 +988,7 @@ mod service_tracking {
         assert!(handle.read("IED1LD0/LLN0$SR$UrcbTrk$originatorID").is_some());
 
         // A **refused** service is the case tracking exists for. `SqNum` is the server's to
-        // count (D39), so writing it is an access violation — and the tracker says so.
+        // count, so writing it is an access violation — and the tracker says so.
         assert!(c.write("IED1LD0/LLN0$RP$urcb$SqNum", Fc::RP, &Value::Unsigned(9)).is_err());
         assert_eq!(ordinal(&handle, "UrcbTrk", "errorCode"), Some(2), "access-violation, as the file numbers it");
         c.release().unwrap();
@@ -1229,7 +1229,7 @@ mod publisher_control_blocks {
         assert_eq!(c.read("IED1LD0/LLN0$MS$msvMU$MsvID", Fc::MS).unwrap().as_str().map(str::to_owned), Some(String::from("MU01")));
         assert_eq!(c.read("IED1LD0/LLN0$US$usvMU$UsvID", Fc::US).unwrap().as_str().map(str::to_owned), Some(String::from("MU02")));
 
-        // Only the enable flag is a client's to write (D39) — the rest is engineering.
+        // Only the enable flag is a client's to write — the rest is engineering.
         c.write("IED1LD0/LLN0$US$usvMU$SvEna", Fc::US, &Value::Boolean(true)).expect("SvEna is writable");
         assert!(c.write("IED1LD0/LLN0$US$usvMU$SmpRate", Fc::US, &Value::Unsigned(96)).is_err(), "SmpRate is not");
         c.release().unwrap();
@@ -1297,16 +1297,15 @@ fn the_vmd_answers_for_itself() {
 
 /// A `Cancel` for a request that is not outstanding is *answered*, not ignored.
 ///
-/// Before this it fell through to the unconfirmed catch-all and nothing was sent back, which
-/// is the reject defect (D35) on a different PDU: the peer waits out its whole request
-/// timeout for a reply that was never coming.
+/// A cancel that goes unanswered leaves the peer waiting out its whole request timeout for a
+/// reply that was never coming.
 #[test]
 fn a_cancel_for_a_finished_request_is_refused_rather_than_swallowed() {
     use iec61850_rs::common::{Instant, Limits};
     use iec61850_rs::proto::mms::association::{Association, AssociationConfig};
     use iec61850_rs::proto::mms::{Mms, ServiceError, service_error};
 
-    // Sans-IO, both roles, no socket: the association is its own test peer (D25).
+    // Sans-IO, both roles, no socket: the association is its own test peer.
     let mut client = Association::client(AssociationConfig::default());
     let mut server = Association::server(AssociationConfig::default());
     let mut now = Instant::ZERO;
@@ -1465,8 +1464,8 @@ mod functionally_constrained_data {
     }
 
     /// A report longer than what the client said it would accept is **segmented**, not
-    /// dropped. Before this the server encoded it whole, the association refused to frame it,
-    /// and the client waited for a report that was never sent and never reported missing.
+    /// dropped: a report the association cannot frame is never sent and never reported
+    /// missing.
     #[test]
     fn a_report_too_large_for_the_negotiated_pdu_is_split_into_segments() {
         let (addr, handle) = spawn(1);
@@ -1572,7 +1571,7 @@ mod report_engine {
         };
         assert_eq!(report.time_of_entry, Some(wall));
         assert_eq!(report.time_of_entry.map(EntryTime::to_unix_millis), Some(WALL_MS));
-        assert_ne!(report.time_of_entry, Some(EntryTime::default()), "1984-01-01 is what the monotonic instant used to produce");
+        assert_ne!(report.time_of_entry, Some(EntryTime::default()), "1984-01-01 would mean the monotonic instant was published");
     }
 
     /// IEC 61850-8-1 reports every `InformationReport` under the VMD-specific name `RPT`;
@@ -1582,7 +1581,7 @@ mod report_engine {
     #[test]
     fn a_report_is_reported_under_the_name_the_mapping_gives_it() {
         let (mut ied, mut engine) = enabled();
-        // Exactly what an engineer writes in the SCD, and what used to break the encoding.
+        // Exactly what an engineer writes in the SCD.
         ied.write_leaf(&format!("{BLOCK}$RptID"), Value::VisibleString("Trip report".into())).expect("write RptID");
         ied.take_dirty();
         ied.write_leaf(MEMBER, Value::Boolean(true)).expect("write");
@@ -1602,10 +1601,9 @@ mod report_engine {
     }
 
     /// The engine writes `SqNum`, `EntryID` and `TimeOfEntry` back into the model as it
-    /// publishes. It used to clear the *whole* dirty set afterwards to stop those counters
-    /// triggering another report — which also threw away any application write that had
-    /// landed in between. With more than one association that is a race, and the write is
-    /// lost from the report **and** from the log.
+    /// publishes, and those counters must not trigger another report — but clearing the
+    /// *whole* dirty set to stop them would throw away an application write that landed in
+    /// between, losing it from the report **and** from the log.
     #[test]
     fn publishing_a_report_does_not_swallow_a_write_that_has_not_been_committed() {
         let (mut ied, mut engine) = enabled();
@@ -1654,10 +1652,9 @@ mod controls {
         r.to_value()
     }
 
-    /// The status timestamp an operate writes is a **date**. It used to be the monotonic
-    /// instant reinterpreted as a Unix time, which put every operated breaker's `Pos.t` a few
-    /// microseconds after 1970-01-01 — the same defect as the report engine's `TimeOfEntry`,
-    /// in a fourth place (D33).
+    /// The status timestamp an operate writes is a **date** from the wall clock, not the
+    /// monotonic instant reinterpreted as a Unix time (which would put `Pos.t` just after
+    /// 1970-01-01).
     #[test]
     fn an_operate_stamps_the_status_with_the_wall_clock() {
         let (mut ied, mut controls) = (model(), Controls::default());
@@ -1669,8 +1666,8 @@ mod controls {
     }
 
     /// IEC 61850-7-2 time-activated operate: an `operTm` in the future arms the command
-    /// instead of running it. The server used to ignore `operTm` and operate immediately —
-    /// which is the one behaviour a time-activated command must not have.
+    /// instead of running it; operating immediately is the one behaviour a time-activated
+    /// command must not have.
     #[test]
     fn an_operate_with_a_future_oper_tm_waits_for_it() {
         let (mut ied, mut controls) = (model(), Controls::default());
@@ -2115,7 +2112,7 @@ fn a_goose_subscription_is_supervised_by_the_lgos_the_file_declares() {
 }
 
 /// The log's entries live behind a trait, so an IED that must survive a restart replaces a
-/// backend rather than the engine (D5).
+/// backend rather than the engine.
 ///
 /// This is the seam, exercised: a store of the caller's own is written to by the trigger
 /// evaluation and read back by both ACSI queries, with nothing above the trait changed.

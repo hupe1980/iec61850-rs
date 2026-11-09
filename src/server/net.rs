@@ -58,9 +58,8 @@ pub struct ServerConfig {
     ///
     /// Reports and command terminations are produced by whichever thread committed the change
     /// and drained by the connection thread, so a client that stops reading its socket makes
-    /// that queue grow — an unbounded one is a remote memory exhaustion with a protocol in
-    /// front of it, which is the defect the [`FileStore`](super::FileStore) trait was reshaped to
-    /// remove for one service at a time. When the queue fills, the **association is closed**: a buffered report control
+    /// that queue grow, and an unbounded one is a remote memory exhaustion. When the queue
+    /// fills, the **association is closed**: a buffered report control
     /// block keeps its entries and the client resumes from its `EntryID` when it comes back,
     /// which is precisely what `BR` is for, and dropping reports silently instead would leave
     /// a SCADA client believing it had seen everything.
@@ -316,9 +315,8 @@ impl ServerHandle {
 /// A batch of model updates that becomes visible all at once.
 ///
 /// The application never locks anything: writes are collected here and [`Txn::commit`]
-/// publishes them to reporting and logging together. That is the whole update model — what
-/// was wrong with a lock-and-unlock discipline is not its granularity but that forgetting it
-/// tears a report across two states of the model.
+/// publishes them to reporting and logging together, so a report never straddles two states
+/// of the model — which a lock-and-unlock discipline allows the moment a caller forgets it.
 #[derive(Debug)]
 pub struct Txn<'a> {
     handle: &'a ServerHandle,

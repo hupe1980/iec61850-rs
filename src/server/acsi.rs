@@ -512,7 +512,7 @@ impl Acsi {
     }
 
     /// Both clocks at once — the monotonic instant the caller drove this with, and this
-    /// server's wall-clock reading (D33). They travel together so a signature cannot let one
+    /// server's wall-clock reading. They travel together so a signature cannot let one
     /// stand in for the other.
     fn now(&self, mono: Instant) -> Now {
         Now::new(mono, self.clock.now())
@@ -521,7 +521,7 @@ impl Acsi {
     /// This server's wall clock, for a timestamp that leaves the process.
     ///
     /// Every absolute time a server publishes comes from here rather than from the monotonic
-    /// instant its timers run on (D33), including the `t` a supervision logical node stamps
+    /// instant its timers run on, including the `t` a supervision logical node stamps
     /// its status with.
     pub fn wall_clock(&self) -> crate::common::UtcTime {
         self.clock.now()
@@ -718,7 +718,7 @@ impl Acsi {
         let held = self.reports.held_by(assoc);
         self.reports.on_association_closed(&mut self.ied, assoc, now);
         // `Owner` names a client, so it has to stop naming one that has gone — but a
-        // `ResvTms` reservation deliberately outlives its association (D44), and while it does
+        // `ResvTms` reservation deliberately outlives its association, and while it does
         // the block is still that client's. So the answer is recomputed rather than cleared:
         // an operator asking who holds the block gets the truth in both cases.
         for block in held {
@@ -874,7 +874,7 @@ impl Acsi {
     ///
     /// The specific half is the query's own parameters under §14.1's rule — the service
     /// parameter with a lower-case first letter — and only the leaves the file declares are
-    /// written ⚠ (the `OTS` attribute table is paywalled, R2).
+    /// written ⚠ (the `OTS` attribute table is paywalled).
     fn track_log_query(&mut self, assoc: AssocId, now: Instant, request: &crate::proto::mms::ReadJournal<'_>, answer: &Answer) {
         use crate::proto::mms::journal::{RangeStart, RangeStop};
         if self.tracking.is_empty() {
@@ -968,7 +968,7 @@ impl Acsi {
             };
             // Tracked here rather than inside `write_reference`, because *every* write goes
             // through this one loop and a hook per branch is a hook somebody forgets to add
-            // to the next branch (D32's rule: one decision about one question).
+            // to the next branch.
             self.track_write(assoc, now, reference, decoded_for_tracking.as_ref(), &result);
             out.push(result);
         }

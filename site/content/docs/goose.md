@@ -48,15 +48,11 @@ loop {
 
 `publish` is a **state change**: `stNum` increments, `sqNum` restarts at 0, and the
 retransmission curve begins again. `on_timeout` is a repeat: `sqNum` increments and the
-interval grows. That distinction is the protocol, and getting it wrong is the classic GOOSE
-implementation bug — a publisher that increments `stNum` on every frame tells every
-subscriber the world changed 250 times a second.
+interval grows.
 
-If your application has a scan cycle rather than an event, hand the whole data set to
-`publish_if_changed` instead. It encodes into a buffer it keeps, compares with the one
-already on the wire, and returns `false` without touching `stNum` when nothing moved — so the
-classic bug is not something you have to remember not to write. It allocates nothing either
-way.
+If your application has a scan cycle rather than events, hand the whole data set to
+`publish_if_changed`. It compares the encoding with the one already on the wire and returns
+`false` without touching `stNum` when nothing moved. It allocates nothing either way.
 
 ### The retransmission curve
 
@@ -74,13 +70,10 @@ one frame and still hear the following one in time.
 
 ### Frames are borrowed, not allocated
 
-`poll_transmit` returns a slice of a buffer the publisher owns and rewrites. In the steady
-state — a frame every 4 ms — nothing is allocated, and neither is anything on a state change:
-the encoded data set and the APDU are cleared and rewritten into buffers the publisher
-already holds, because a state change during a fault is the worst possible moment to visit
-the allocator. If you do not collect a frame before the
-next is built, the older one is dropped and `pubr.dropped()` counts it; a publisher that
-drops frames is telling you its event loop is too slow.
+`poll_transmit` returns a slice of a buffer the publisher owns and rewrites. Nothing is
+allocated in the steady state or on a state change: both rewrite buffers the publisher already
+holds. A frame not collected before the next is built is dropped and counted by
+`pubr.dropped()`.
 
 ## Subscribing
 
@@ -130,9 +123,8 @@ match pos.member(0).and_then(Typed::as_dbpos) {
 let quality = pos.member(1).and_then(Typed::as_quality);
 ```
 
-Nothing is coerced. An integer where a boolean was engineered returns `None` — that is a
-fault to report, not a number to reinterpret — and a thirteen-bit `Quality` will not read as
-a two-bit `Dbpos`, so a mislabelled member cannot decode silently into the wrong thing.
+Nothing is coerced: an integer where a boolean was engineered returns `None`, and a
+thirteen-bit `Quality` does not read as a two-bit `Dbpos`.
 
 Three events matter to a protection scheme:
 
@@ -142,7 +134,7 @@ Three events matter to a protection scheme:
 - **`NeedsCommissioning`** — the publisher set `ndsCom`; its data is not usable yet.
 
 Everything else is filtered before it reaches you. Frames for other streams are counted, not
-reported — a raw socket delivers the whole segment, and that is not an error.
+reported.
 
 ### What the subscriber rejects
 
@@ -155,15 +147,12 @@ reported — a raw socket delivers the whole segment, and that is not an error.
 | `ConfRevMismatch` | The publisher's configuration revision is not the one you expect |
 
 `ConfRevMismatch` and `IgnoredSimulation` are **edge-triggered**: reported once per
-transition, not once per frame. A misconfigured stream at 250 frames a second would otherwise
-bury the log.
+transition, not once per frame.
 
 ### The replay rule
 
-Every subscriber runs the IEC 62351-6 §6.2.1 state machine, with no way to switch it off,
-because a conforming subscriber must run it whether or not the stream carries security. The
-rule itself — and why it is about liveness rather than about counters — is in
-[How GOOSE and Sampled Values work](@/docs/protocols.md#replay-protection).
+Every subscriber runs the IEC 62351-6 §6.2.1 state machine, with no way to switch it off. The
+rule itself is in [How GOOSE and Sampled Values work](@/docs/protocols.md#replay-protection).
 
 Two consequences show up in the API:
 
@@ -171,25 +160,19 @@ Two consequences show up in the API:
   stream never sees `stNum` jump backwards without first being told that the values it was
   holding had gone invalid.
 - **A restarted publisher gets through immediately**, even if it comes back on the `stNum` it
-  was already using with `sqNum` at 0. A counter-only reading of the rule would lock it out
-  for a whole retransmission curve; a regression test restarts a publisher exactly that way
-  and requires the very next frame through.
+  was already using with `sqNum` at 0.
 
-The publisher's own timestamp is deliberately not part of the decision — it is
-attacker-controlled and depends on a clock you do not own. That is a defensible reading of a
-clause whose second half is paywalled, and
-[Verification](@/docs/verification.md#what-this-does-not-prove) says so rather than claiming
-conformance.
+The publisher's own timestamp is not part of the decision. This is a reading of the clause,
+not a conformance claim; see [Verification](@/docs/verification.md#what-is-not-proven).
 
-Two limits of the rule, neither of them a bug:
+Two limits of the rule:
 
 - **After an expiry, an old frame is admissible.** Nothing is live, so the next frame is a new
-  state whatever its counters say. That is what lets a restarted publisher back in, and
-  equally what lets an attacker who can silence a publisher for one `timeAllowedtoLive` replay
-  a captured frame afterwards. Only the IEC 62351-6 authentication extension closes that.
-- **A duplicate and a replay are the same octets arriving twice**, so the subscriber calls
-  both `Replay`. On a PRP network every frame legitimately arrives twice, so duplicate discard
-  belongs below this, in the link redundancy entity where IEC 62439-3 puts it.
+  state whatever its counters say — which also lets an attacker who silences a publisher for
+  one `timeAllowedtoLive` replay a captured frame. Only the IEC 62351-6 authentication
+  extension closes that.
+- **A duplicate and a replay are the same octets**, so the subscriber calls both `Replay`. On a
+  PRP network, discard duplicates below this, in the link redundancy entity (IEC 62439-3).
 
 ### Simulation
 
@@ -211,27 +194,23 @@ counters with it.
 `sub.stats()` returns every count the subscriber keeps: accepted frames, state changes,
 retransmissions, replays, malformed frames, simulation mismatches, member-count mismatches,
 `confRev` drops, expiries, commissioning transitions, frames for other streams, and events
-dropped because the application stopped draining. Every rejection moves a counter, so an
-application that cannot keep up with the event queue still sees which check failed.
+dropped because the application stopped draining. Counters survive even when the bounded event
+queue drops events.
 
 Two of them are worth calling out:
 
 - **`state_gaps` / `states_missed`** — a new state whose `stNum` is more than one above the
   last, *while the previous state was still live*: changes the publisher sent and this
-  subscriber never saw. It is the one thing the delta features below cannot express, and on
-  a healthy bus it is zero.
+  subscriber never saw. On a healthy bus it is zero.
 - **`malformed`** means *this* stream. A frame that fails to parse is attributed through the
-  destination and APPID that survive the failure, so another publisher's broken frame is
-  other traffic rather than an attack on you. A counter an IDS acts on has to mean what it
-  says.
+  destination and APPID that survive the failure, so another publisher's broken frame counts
+  as other traffic.
 
-Everything that can repeat is edge-triggered — `ConfRevMismatch`, `IgnoredSimulation` and
-`NeedsCommissioning` are events on the transition and counters on every frame. A publisher in
-commissioning retransmits every few milliseconds, and an event per frame would fill the
-bounded queue and push out the trip you were waiting for.
+`ConfRevMismatch`, `IgnoredSimulation` and `NeedsCommissioning` are events on the transition
+and counters on every frame, so a repeating condition cannot fill the bounded queue.
 
-These are exactly the semantic checks a rule-based substation intrusion-detection system
-performs. And `sub.deltas()` returns what the *learned* detectors want:
+These are the semantic checks a rule-based substation intrusion-detection system performs, and
+`sub.deltas()` returns the features learned detectors use:
 
 ```rust
 if let Some(d) = sub.deltas() {
@@ -247,26 +226,15 @@ if let Some(d) = sub.deltas() {
 | `t_delta` | `tDiff` — between the publisher's timestamps, which are attacker-controlled |
 | `since_state_change` | `timeFromLastChange` |
 
-Those five are not arbitrary. A 2026 evaluation of detectors on the ERENO IEC 61850 dataset
-([arXiv 2604.14233](https://arxiv.org/abs/2604.14233)) finds the informative reduced feature
-set is exactly these deltas rather than the raw protocol fields — and that a supervised
-forest reaching F1 0.9516 needs 21.8 ms per prediction, missing the 4 ms GOOSE budget
-outright. A subscriber has already computed all five to reach its verdict, so reading them
-here costs nothing; recovering them on a mirror port costs a second parser and a second
-chance to disagree with the device that actually acted on the frame.
+These five are the reduced feature set found informative on the ERENO IEC 61850 dataset
+([arXiv 2604.14233](https://arxiv.org/abs/2604.14233)). The subscriber has already computed
+them to reach its verdict, so reading them costs nothing. `arrival_delta` is your clock and
+`t_delta` the publisher's; a divergence between them is worth watching.
 
-`arrival_delta` against `t_delta` is the pair to watch: the first is your clock, the second
-is the publisher's. On the reference SEL capture they diverge by 1.5 ms per second, and the
-publisher marks its own clock unsynchronised.
+### Publishing the status as an `LGOS`
 
-Counters survive even when the bounded event queue drops events, so a busy application loses
-notifications but never statistics.
-
-### And somewhere to say it
-
-A number a device computes and cannot be asked for is not a diagnostic. IEC 61850-7-4 gives
-every subscription an `LGOS` — one logical node per GOOSE subscription — so a SCADA client can
-read what this subscriber thinks of its stream, and a report control block can carry it:
+IEC 61850-7-4 gives every GOOSE subscription an `LGOS` logical node, so a SCADA client can read
+what this subscriber thinks of its stream, and a report control block can carry it:
 
 ```rust
 use iec61850_rs::server::SubscriptionStatus;
@@ -275,10 +243,9 @@ updates.txn().supervise("IED2LD0/LGOS1", &SubscriptionStatus::from_goose(&subscr
 ```
 
 `St` is whether the stream is live, `NdsCom` the publisher's own flag, `SimSt` the simulation
-takeover, and `LastStNum`/`ConfRevNum`/`RxConfRevNum` what the subscriber already holds. The
-details — including why an unchanged status writes nothing — are in
-[Server](@/docs/server.md#supervising-what-this-ied-subscribes-to), and
-`cargo run --example supervised_subscriber` runs the whole thing with no network.
+takeover, and `LastStNum`/`ConfRevNum`/`RxConfRevNum` what the subscriber already holds. Details are in
+[Server](@/docs/server.md#supervising-what-this-ied-subscribes-to);
+`cargo run --example supervised_subscriber` runs it with no network.
 
 ## From SCL
 
@@ -303,28 +270,20 @@ for s in &subs.goose {
 
 ## What the decoder tolerates
 
-Three things in `goose.asn` that a strict reader gets wrong on real traffic, and this one
-does not:
+Three things in `goose.asn` that a strict reader gets wrong on real traffic:
 
 - `simulation [7]` and `ndsCom [9]` are `DEFAULT FALSE`, so BER lets a publisher leave them
-  out. The default is applied. (The encoder still writes them, because every publisher we
-  have a capture of does.)
+  out. The default is applied; the encoder always writes them.
 - `security [12]` is `ANY`, which cannot carry an implicit tag — the IEC 62351-6 extension
   therefore arrives *constructed*. Both spellings are accepted.
 - Fixed-length encoded GOOSE writes every integer at the width of its `bType`, so an
   `INT32U` above `0x7FFF_FFFF` arrives as four octets with the top bit set. Unsigned values
-  are read as big-endian unsigned regardless of that bit, which is what Wireshark does.
+  are read as big-endian unsigned regardless of that bit, as Wireshark does.
 
-Strictness on decode buys nothing on a multicast bus where you cannot ask the sender to
-retry. It belongs in the encoder, and that is where it stays.
+The encoder is strict; the decoder accepts what deployed publishers send.
 
 ## Not included
 
 *Emitting* fixed-length encoded GOOSE (`GSEControl.fixedOffs`, Edition 2.1 — decoding it
 works), the IEC 62351-6 layer-2 authentication extension, routable GOOSE over UDP
 (IEC TR 61850-90-5), and Edition 1 GSSE.
-
-The first and third are blocked on evidence, not effort: the widths table (IEC 61850-8-1
-Table A.2) is paywalled, and the R-GOOSE session header is described one way by the TR text
-and another by Wireshark's dissector. Emitting a guess would put frames on a bus that a
-conforming subscriber parses at the wrong offsets.

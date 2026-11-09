@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
-# Fetch the freely available reference documents used by this project into specs/ (git-ignored).
-# Only public material is fetched: ITU-T Recommendations, RFCs, Wireshark ASN.1 modules (GPL-2,
-# reference only), public preview/sample PDFs of IEC standards (front matter + TOC), the UCAIug
-# 9-2LE guideline (via the Wayback Machine), a community mirror of the SCL XSD, and sample pcaps.
-# Paid IEC/ISO standards and IEC code components (SCL XSD / NSD packages) must be obtained
-# manually; see concepts/SPECS.md.
+# Fetch the freely available reference material into $IEC61850_REFERENCE (default: a
+# git-ignored directory in the checkout; the tests use the same default). Idempotent.
+# Public material only: ITU-T Recommendations, RFCs, Wireshark ASN.1 modules (GPL-2, reference
+# only), IEC preview PDFs, the UCAIug 9-2LE guideline, a community mirror of the SCL XSD, sample
+# captures and OpenSCD fixtures. Paid IEC standards and the IEC code components (SCL XSD / NSD
+# packages) must be obtained manually.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+R="${IEC61850_REFERENCE:-concepts/reference}"
 UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-mkdir -p specs/{osi-itu,rfc,asn1-wireshark,iec-previews,scl,pcap,ucaiug}
+mkdir -p $R/{osi-itu,rfc,asn1-wireshark,iec-previews,scl,pcap,ucaiug}
 
 dl() { # url dest
   if [ -s "$2" ]; then echo "skip   $2"; return; fi
   if curl -fsSL --retry 3 --max-time 180 -A "$UA" -o "$2" "$1"; then echo "ok     $2"; else echo "FAILED $2 ($1)" >&2; rm -f "$2"; fi
 }
-itu() { dl "https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-$1!!PDF-E&type=items" "specs/osi-itu/$2"; }
-rfc() { dl "https://www.rfc-editor.org/rfc/rfc$1.txt" "specs/rfc/rfc$1-$2.txt"; }
-ws()  { dl "https://raw.githubusercontent.com/wireshark/wireshark/master/epan/dissectors/$1" "specs/asn1-wireshark/$(basename "$1")"; }
+itu() { dl "https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-$1!!PDF-E&type=items" "$R/osi-itu/$2"; }
+rfc() { dl "https://www.rfc-editor.org/rfc/rfc$1.txt" "$R/rfc/rfc$1-$2.txt"; }
+ws()  { dl "https://raw.githubusercontent.com/wireshark/wireshark/master/epan/dissectors/$1" "$R/asn1-wireshark/$(basename "$1")"; }
 
 # ITU-T OSI upper layers + ASN.1
 itu X.214-199511-I X.214-transport-service.pdf
@@ -46,7 +47,7 @@ for f in asn1/mms/mms.asn asn1/mms/mms.cnf asn1/mms/packet-mms-template.c \
          asn1/acse/acse.asn asn1/pres/ISO8823-PRESENTATION.asn asn1/pres/ISO9576-PRESENTATION.asn \
          packet-ses.c packet-tpkt.c packet-ositp.c; do ws "$f"; done
 # Public preview / sample PDFs (front matter + TOC only)
-P=specs/iec-previews; I=https://cdn.standards.iteh.ai/samples
+P=$R/iec-previews; I=https://cdn.standards.iteh.ai/samples
 dl "$I/16230/d2b7e3585c4d435ba62f912e2b9ea603/IEC-61850-7-2-2010.pdf"                 $P/IEC-61850-7-2-Ed2.1-2020-preview.pdf
 dl "$I/16341/1d1bdc2df9aa49a3a7192146daa3146c/IEC-61850-8-1-2011.pdf"                 $P/IEC-61850-8-1-Ed2.1-2020-preview.pdf
 dl "$I/23452/baf1f49507d64dd4960ef151d66ebe00/IEC-61850-9-2-2011-AMD1-2020.pdf"       $P/IEC-61850-9-2-Amd1-2020-preview.pdf
@@ -64,24 +65,24 @@ dl "$I/105100/b7a344cdd98f47e4a67e4a94e9df50b5/IEC-62351-3-2023.pdf"            
 dl "https://www.sis.se/api/document/preview/571807/"                                    $P/IEC-TR-61850-90-5-2012-preview-sis.pdf
 dl "https://content.nettedautomation.com/n/download/2025/IEC61850-Series_KHS_2025-01-07.pdf" $P/IEC61850-Series-overview-KHS-2025-01-07.pdf
 # UCAIug 9-2LE (the 2019/2020 Wayback snapshots are truncated at 1 MiB; 2016 is complete) + 90-5 thesis
-dl "https://web.archive.org/web/2016id_/http://iec61850.ucaiug.org/Implementation%20Guidelines/DigIF_spec_9-2LE_R2-1_040707-CB.pdf" specs/ucaiug/IEC61850-9-2LE-DigIF_spec_R2-1.pdf
-dl "https://sites.ecse.rpi.edu/~vanfrl/documents/mscthesis/2015_Seyed_Reza%20Firouzi_MSc%20thesis%20report.pdf" specs/ucaiug/RPI-2015-Firouzi-IEC61850-90-5-R-GOOSE-R-SV-thesis.pdf
+dl "https://web.archive.org/web/2016id_/http://iec61850.ucaiug.org/Implementation%20Guidelines/DigIF_spec_9-2LE_R2-1_040707-CB.pdf" $R/ucaiug/IEC61850-9-2LE-DigIF_spec_R2-1.pdf
+dl "https://sites.ecse.rpi.edu/~vanfrl/documents/mscthesis/2015_Seyed_Reza%20Firouzi_MSc%20thesis%20report.pdf" $R/ucaiug/RPI-2015-Firouzi-IEC61850-90-5-R-GOOSE-R-SV-thesis.pdf
 # SCL XSD (community mirror of the IEC code component; prefer the official IEC package when available)
 for f in SCL.xsd SCL_BaseTypes.xsd SCL_Enums.xsd SCL_IED.xsd SCL_Substation.xsd SCL_Communication.xsd SCL_DataTypeTemplates.xsd; do
-  dl "https://raw.githubusercontent.com/rte-france/SCL_Loader/master/src/scl_loader/resources/SCL_Schema/$f" "specs/scl/$f"; done
+  dl "https://raw.githubusercontent.com/rte-france/SCL_Loader/master/src/scl_loader/resources/SCL_Schema/$f" "$R/scl/$f"; done
 # Sample captures
-dl "https://wiki.wireshark.org/uploads/__moin_import__/attachments/SampleCaptures/mms.pcap.gz" specs/pcap/mms.pcap.gz
+dl "https://wiki.wireshark.org/uploads/__moin_import__/attachments/SampleCaptures/mms.pcap.gz" $R/pcap/mms.pcap.gz
 # The MMS capture arrives gzipped; the tests read plain pcap, so unpack it beside the archive.
-[ -f specs/pcap/mms.pcap.gz ] && gunzip -kf specs/pcap/mms.pcap.gz 2>/dev/null || true
-dl "https://raw.githubusercontent.com/mdehus/goose-IEC61850-scapy/master/wireshark2.pcap"      specs/pcap/goose-mdehus.pcap
-dl "https://raw.githubusercontent.com/mgadelha/Sampled_Values/master/SV_Normal_Traffic.cap"     specs/pcap/sv-9-2LE-normal-traffic.cap
-dl "https://raw.githubusercontent.com/mgadelha/Sampled_Values/master/README.md"                 specs/pcap/sv-README.md
+[ -f $R/pcap/mms.pcap.gz ] && gunzip -kf $R/pcap/mms.pcap.gz 2>/dev/null || true
+dl "https://raw.githubusercontent.com/mdehus/goose-IEC61850-scapy/master/wireshark2.pcap"      $R/pcap/goose-mdehus.pcap
+dl "https://raw.githubusercontent.com/mgadelha/Sampled_Values/master/SV_Normal_Traffic.cap"     $R/pcap/sv-9-2LE-normal-traffic.cap
+dl "https://raw.githubusercontent.com/mgadelha/Sampled_Values/master/README.md"                 $R/pcap/sv-README.md
 
 # OpenSCD test fixtures (Apache-2.0) — the first SCL round-trip corpus
-mkdir -p specs/fixtures/openscd
+mkdir -p $R/fixtures/openscd
 curl -fsSL -A "$UA" "https://api.github.com/repos/openscd/open-scd/contents/packages/openscd/test/testfiles" \
   | python3 -c 'import sys,json;[print(x["name"],x["download_url"]) for x in json.load(sys.stdin) if x["type"]=="file"]' \
-  | while read -r name url; do dl "$url" "specs/fixtures/openscd/$name"; done
+  | while read -r name url; do dl "$url" "$R/fixtures/openscd/$name"; done
 echo
-echo "Manual: IEC code components (SCL XSD 2007B4/2007C5, NSD) from https://www.iec.ch/tc57/supportdocuments -> specs/iec-code-components/"
-echo "Manual: purchased standards -> specs/iec-purchased/"
+echo "Manual: IEC code components (SCL XSD 2007B4/2007C5, NSD) from https://www.iec.ch/tc57/supportdocuments -> $R/iec-code-components/"
+echo "Manual: purchased standards -> $R/iec-purchased/"

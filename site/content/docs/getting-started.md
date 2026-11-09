@@ -25,21 +25,16 @@ hyphen-to-underscore rule implies. (`iec61850` on crates.io belongs to an unrela
 | `pcap` *(default)* | Read and write classic pcap capture files |
 | `cli` | The `ied` command line. Implies every other feature |
 
-There is no `alloc` feature: the encoder is a `Vec`, the model owns `String`s, and the bounded
-event queue every core hands its events through is a `VecDeque`, so the crate is `no_std`
-**+ alloc** and there is no configuration without an allocator.
-
-Every feature builds on its own — and so does none of them — and CI checks that on every push.
+There is no `alloc` feature: the crate is `no_std` **+ alloc** in every configuration. Every
+feature builds on its own, and so does none of them; CI checks both on every push.
 
 ```bash
 cargo add iec61850-rs --no-default-features --features goose   # GOOSE on an MCU
 cargo install iec61850-rs --features cli                       # the command line
 ```
 
-The protocol core has **no mandatory dependencies**, and only one optional: `roxmltree`, which
-arrives with `scl` and which a device configured at build time does not need. The MMS client is
-blocking, so there is no async runtime in the tree either — the cores are sans-IO, so an async
-wrapper would be an adapter over the same state machines rather than a second implementation.
+The crate has **no mandatory dependencies** and one optional: `roxmltree`, which arrives with
+`scl`. The MMS client is blocking, so there is no async runtime in the tree.
 
 ## Decode a frame
 
@@ -57,14 +52,12 @@ if frame.ethertype == ETHERTYPE_GOOSE {
 }
 ```
 
-`GoosePduView` **borrows** the frame. Nothing is copied until you ask for owned values with
-`all_data_owned`, which is what keeps a subscriber allocation-free while a publisher is only
-retransmitting.
+`GoosePduView` **borrows** the frame; nothing is copied until you ask for owned values with
+`all_data_owned`.
 
 ## Subscribe to a stream
 
-A subscriber is a state machine, not a callback registry. You feed it frames and timer ticks
-and drain its events:
+A subscriber is a state machine: feed it frames and timer ticks, and drain its events:
 
 ```rust
 use iec61850_rs::common::Instant;
@@ -87,13 +80,12 @@ for event in sub.feed(now, &frame) {
 sub.on_timeout(now);   // call again by sub.next_timeout()
 ```
 
-`Expired` is the one you must handle: it means no frame arrived within the publisher's
-`timeAllowedtoLive`, so the values you are holding are no longer trustworthy. Everything
-else — replays, `confRev` mismatches, simulated frames — is filtered out before it reaches
-you, and counted in `sub.stats()`.
+`Expired` is the one you must handle: no frame arrived within the publisher's
+`timeAllowedtoLive`, so the values you hold are no longer trustworthy. Replays, `confRev`
+mismatches and simulated frames are filtered out before they reach you, and counted in
+`sub.stats()`.
 
-The values are the data set's members, and the `Typed` trait reads each one as the
-IEC 61850-7-3 type it claims to be rather than making you match on the wire encoding:
+The values are the data set's members; the `Typed` trait reads each as its IEC 61850-7-3 type:
 
 ```rust
 use iec61850_rs::proto::data::{Dbpos, Typed};
@@ -102,8 +94,7 @@ let closed = values[0].member(0).and_then(Typed::as_dbpos) == Some(Dbpos::On);
 let quality = values[0].member(1).and_then(Typed::as_quality);
 ```
 
-Nothing is coerced: an integer where a boolean was engineered returns `None`, because that
-is a fault to report rather than a number to reinterpret.
+Nothing is coerced: an integer where a boolean was engineered returns `None`.
 
 ## Publish sampled values
 
@@ -120,15 +111,13 @@ if let Some(frame) = mu.poll_transmit() {
 }
 ```
 
-`poll_transmit` hands back a slice of a buffer the publisher owns and rewrites, so the
-steady state allocates nothing. See [Sampled Values](@/docs/sampled-values.md) for the
-profiles and the sample layout.
+`poll_transmit` returns a slice of a buffer the publisher owns, so the steady state allocates
+nothing. [Sampled Values](@/docs/sampled-values.md) has the profiles and the sample layout.
 
 ## Subscribe to sampled values, with the channels named
 
-An ASDU's sample block is the data set's members written back to back with nothing on the
-wire to separate them, so a subscriber has to be told the shape. The engineering file is
-where the shape is written, and `scl::subscriptions` brings it along:
+An ASDU's sample block is the data set's members written back to back, so a subscriber has to
+be told the shape. `scl::subscriptions` reads it from the engineering file:
 
 ```rust
 use iec61850_rs::proto::sv::Subscriber;
@@ -144,17 +133,14 @@ sv.on_frame(now, &frame, |sample| {
 });
 ```
 
-That works for any fixed-width data set, not only 9-2LE's — and it costs nothing, because
-the values are read straight out of the frame's octets on the receiving thread. Without a
-layout `sample.asdu.sample` is still there as raw octets, and 9-2LE's fixed set has
-`le::PhsMeas1::decode` for exactly that.
+That works for any fixed-width data set, and the values are read straight out of the frame
+without allocating. Without a layout `sample.asdu.sample` holds the raw octets, and 9-2LE's
+fixed set has `le::PhsMeas1::decode`.
 
 ## Talk to a server
 
-The process bus is multicast frames; the station bus is a connection. `Client::connect` opens
-all six OSI layers, the ACSE association and the MMS `Initiate` in one call — and needs no
-async runtime, because the state machine underneath it is sans-IO and the socket is a
-ninety-line adapter:
+The station bus is a connection. `Client::connect` opens all six OSI layers, the ACSE
+association and the MMS `Initiate` in one call, with no async runtime:
 
 ```rust
 use iec61850_rs::{Fc, client::Client};
@@ -169,8 +155,7 @@ let w = c.read("IED1LD0/MMXU1.TotW.mag.f", Fc::MX)?;
 c.release()?;
 ```
 
-Reports come back decoded, with every field the control block's `OptFlds` promised — and no
-field it did not, because on the wire there is nothing to tell them apart:
+Reports come back decoded, with exactly the fields the control block's `OptFlds` selects:
 
 ```rust
 use iec61850_rs::client::{RcbSettings, TrgOps};
@@ -185,9 +170,8 @@ while let Some(r) = c.next_report(Duration::from_secs(5))? {
 }
 ```
 
-And a control is one call whichever of the four models the object is engineered with. A
-command the substation *refuses* comes back as a refusal with its `AddCause`, never as a
-successful write:
+A control is one call whichever of the four models the object uses. A refused command comes
+back as `Error::ControlRejected` with its `AddCause`, never as a successful write:
 
 ```rust
 use iec61850_rs::client::{Check, ControlModel, OriginCategory};
@@ -200,8 +184,7 @@ c.control("IED1LD0/CSWI1.Pos")
     .execute(&Value::dbpos(Dbpos::On))?;
 ```
 
-The three things a commissioning engineer reaches for after the values are a COMTRADE record,
-a log and a setting group, and each is one call:
+Files, logs and setting groups are one call each:
 
 ```rust
 let bytes = c.read_file("COMTRADE/rec0001.cfg", 16 << 20)?;   // the handle is closed either way
@@ -214,9 +197,8 @@ c.edit_setting_group("IED1LD0/LLN0$SP$SGCB", 2,               // select ▸ writ
                      &[("IED1LD0/PTOC1.StrVal.setMag.f", Value::Float32(1.25))])?;
 ```
 
-[MMS](@/docs/mms.md) has the layers, the association, the report format, the control models,
-the file and log services and the setting-group rules in full — and [Server](@/docs/server.md)
-has the other half, which is an SCL file and a socket:
+[MMS](@/docs/mms.md) covers the client in full; [Server](@/docs/server.md) covers the other half,
+which is an SCL file and a socket:
 
 ```rust
 use iec61850_rs::server::{Ied, Server};
@@ -228,8 +210,8 @@ server.run()?;
 
 ## Where the frames come from
 
-The library does not open sockets — see [the protocol primer](@/docs/protocols.md#sans-io) for why. Until
-the raw-socket adapters land, capture files are the practical source and sink:
+The library does not open raw sockets ([why](@/docs/protocols.md#sans-io)). Capture files are a
+ready source and sink:
 
 ```rust
 use iec61850_rs::pcap::Capture;
@@ -239,8 +221,8 @@ for (nanos, frame) in Capture::read("bay.pcap")?.frames {
 }
 ```
 
-On Linux you would bind an `AF_PACKET` socket and pass what it gives you to the same
-`on_frame`; nothing above changes.
+On a live network, bind an `AF_PACKET` socket (Linux) and pass what it receives to the same
+`on_frame`; nothing else changes.
 
 ## Runnable examples
 
@@ -258,7 +240,7 @@ repository and `cargo run --example <name>`.
 
 ## Next
 
-- [How GOOSE and Sampled Values work](@/docs/protocols.md) — what they actually are, and the
-  vocabulary the rest of the guide uses.
+- [How GOOSE and Sampled Values work](@/docs/protocols.md) — the vocabulary the rest of the
+  guide uses.
 - [MMS](@/docs/mms.md) and [Server](@/docs/server.md) — the station bus, from each end.
 - [Command line](@/docs/cli.md) — the same operations without writing any code.

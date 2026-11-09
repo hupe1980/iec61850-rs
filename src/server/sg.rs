@@ -47,8 +47,8 @@ struct Groups {
     ///
     /// A client that selects a group for editing and then goes quiet without closing its
     /// association would otherwise hold the whole logical device's settings for ever;
-    /// `ResvTms` is the attribute that exists to stop it, and a server that publishes it and
-    /// never acts on it is the case D40 is about.
+    /// `ResvTms` is the attribute that exists to stop it, so the server acts on it rather than
+    /// only publishing it.
     editor_until: Option<Instant>,
 }
 

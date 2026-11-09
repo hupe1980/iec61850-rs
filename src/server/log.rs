@@ -7,7 +7,7 @@
 //!
 //! Where the entries actually live is a [`LogStore`]. The default, [`MemoryLog`], is a bounded
 //! ring: right for a simulator and wrong for a device that must survive a restart, which is
-//! why it is behind a trait rather than behind a `Vec` (D5). Everything above it — the trigger
+//! why it is behind a trait rather than behind a `Vec`. Everything above it — the trigger
 //! evaluation, the control-block bookkeeping, the two queries — is the same whichever store is
 //! underneath, and `OldEnt` moving is how a client that comes back after a long absence learns
 //! that the gap it wanted is gone.

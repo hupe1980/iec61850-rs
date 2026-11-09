@@ -1514,7 +1514,7 @@ impl<'a> Mms<'a> {
     ///
     /// A response this codec cannot decode still answers the request it names: the peer has
     /// spoken and will say nothing more, so the caller has to fail now rather than wait out
-    /// its whole request timeout on octets that have already arrived (D46). Reading the
+    /// its whole request timeout on octets that have already arrived. Reading the
     /// identifier is cheap and independent of everything after it — it is the first field of
     /// all four confirmed PDU types — so the failure can be attributed even when the rest is
     /// unreadable. `None` for an unconfirmed PDU, a reject, or bytes that are not a PDU at all.
@@ -1688,10 +1688,8 @@ mod tests {
     /// A name list is the namespace of a whole logical device, not a data set.
     ///
     /// libiec61850's own `LTRK` test model has 643 names in one device, and every real IED has
-    /// more. Applying the data-set limit here made the client refuse a page of them — and,
-    /// because a refused answer used to leave the request outstanding, report that the server
-    /// had never replied. The bound that matters is the reassembled TSDU, which is enforced a
-    /// layer down; `max_list_items` is what says so at the decoder.
+    /// more, so the data-set limit must not apply to a name list. The bound that matters is the
+    /// reassembled TSDU, enforced a layer down; `max_list_items` is what says so at the decoder.
     #[test]
     fn a_name_list_may_be_larger_than_a_data_set() {
         use crate::ber::{Encoder, Tag};
@@ -1834,10 +1832,9 @@ mod tests {
     /// `listOfDirectoryEntry [0]` is the one file-service field that is **not** implicitly
     /// tagged, so the entries sit inside an inner universal `SEQUENCE`.
     ///
-    /// Both halves of this crate had it wrong in the same way and therefore agreed with each
-    /// other, which is precisely the failure the Wireshark oracle exists to catch — it did,
-    /// on its first run (`tests/tshark_mms.rs`). The octets asserted here are the shape
-    /// `mms.asn` states ✅ and libiec61850 writes 🌐: `bf 4d { a0 { 30 { 30 … } } }`.
+    /// A mistake here would be shared by both halves of this crate, so `tests/tshark_mms.rs`
+    /// checks it too. The octets asserted here are the shape `mms.asn` states ✅ and
+    /// libiec61850 writes 🌐: `bf 4d { a0 { 30 { 30 … } } }`.
     #[test]
     fn a_file_directory_response_wraps_its_entries_in_a_sequence() {
         let response = ConfirmedResponse::FileDirectory {

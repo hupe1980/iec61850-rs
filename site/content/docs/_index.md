@@ -42,16 +42,11 @@ These pages are the guide. The per-item API reference lives on
 
 ## Status
 
-The process bus is built and tested. On the station bus **both halves** are: the association
-state machine over all six OSI layers, and above it a SCADA client and a server that answers
-every service it asks for, straight from an SCL file (`ied sim relay.icd`).
+The process bus and both halves of the station bus — the association over all six OSI layers,
+a SCADA client and a server built from an SCL file (`ied sim relay.icd`) — are implemented and
+tested, the station bus against **libiec61850 in both roles** in CI.
 
-The station bus is checked against **libiec61850 in both roles** in CI — its client driving
-this server, and this client driving its server — which is the only oracle here that reads a
-*sequence* rather than octets.
-
-Not included: `ObtainFile`, TLS and the raw-socket adapters — so on the process bus the library
-encodes and decodes what something else puts on the wire, and the interop oracle stops at the
-station bus.
-[Verification](@/docs/verification.md) is explicit about the difference between what is tested
-and what is certified: nothing here has been through a conformance laboratory.
+Not included: `ObtainFile`, TLS and raw-socket adapters, so on the process bus the library
+encodes and decodes frames that something else puts on the wire. Nothing here has been through
+a conformance laboratory; [Verification](@/docs/verification.md) says what is and is not
+proven.

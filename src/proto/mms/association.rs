@@ -246,8 +246,7 @@ pub enum AssociationEvent {
     /// `invoke_id` is present when the undecodable PDU was a confirmed one and named a request
     /// this end has outstanding. That request is **over**: the peer has answered and will not
     /// answer again, so the identifier is released here and the caller fails at once with the
-    /// decode error instead of waiting out its request timeout on octets that already arrived
-    /// (D46's rule, applied to the third PDU that ends a call without answering it).
+    /// decode error instead of waiting out its request timeout on octets that already arrived.
     Malformed {
         /// The request it ends, if it named one.
         invoke_id: Option<i64>,
@@ -889,8 +888,8 @@ impl Association {
             // turn it arrives, so by the time a cancel is decoded the thing it names has
             // already been answered or never existed. The honest answer is a `cancel-Error`
             // saying so — and it has to be *an* answer, because a cancel the peer never hears
-            // back from is the reject defect (D35) on a different PDU: the caller waits out
-            // its whole timeout for a reply that was never coming.
+            // back from leaves the caller waiting out its whole timeout for a reply that was
+            // never coming.
             Mms::CancelRequest(invoke_id) => {
                 let invoke_id = *invoke_id;
                 // `serviceError [1]` inside a `Cancel-ErrorPDU`, which is not the `[2]` a
@@ -1181,12 +1180,9 @@ mod tests {
 
     /// An answer this codec cannot decode **ends** the call it names.
     ///
-    /// This is D46's rule applied to the third PDU that finishes a call without answering it,
-    /// and it was found the hard way: a `GetNameList` page with more identifiers than the
-    /// decoder's limit allowed produced a `Malformed` nobody could attribute, the invoke
-    /// identifier stayed outstanding, and the caller waited out its whole request timeout and
-    /// reported that the server had not replied — about a server whose answer was already in
-    /// the buffer.
+    /// Here a `GetNameList` page with more identifiers than the decoder's limit: the invoke
+    /// identifier is released and the caller fails at once, instead of waiting out its request
+    /// timeout and reporting that a server whose answer is already in the buffer did not reply.
     #[test]
     fn an_answer_that_does_not_decode_fails_its_call_rather_than_hanging() {
         let (mut c, mut s) = connect();

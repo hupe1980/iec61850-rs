@@ -1,14 +1,29 @@
-//! Shared helpers for the integration tests: a tiny pcap reader and locating `specs/`.
+//! Shared helpers for the integration tests: a tiny pcap reader and locating the reference
+//! corpus (third-party captures, fixtures and schemas fetched by `scripts/fetch-references.sh`).
 #![allow(dead_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::path::{Path, PathBuf};
 
-/// Path to a file under `specs/`, or `None` (tests skip) when the directory is absent —
-/// which is what CI sees, because `specs/` is git-ignored.
-pub fn spec(rel: &str) -> Option<PathBuf> {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("specs").join(rel);
+/// The reference corpus: `$IEC61850_REFERENCE`, or the maintainer's local copy inside the
+/// repository when it is unset or empty. Neither exists in CI or in a fresh clone — the corpus is
+/// third-party material that is fetched, not committed — so every test that reads it skips.
+pub fn reference_root() -> PathBuf {
+    std::env::var_os("IEC61850_REFERENCE")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("concepts").join("reference"), PathBuf::from)
+}
+
+/// Path to a file in the reference corpus, or `None` (the test skips) when it is absent.
+pub fn reference(rel: &str) -> Option<PathBuf> {
+    let p = reference_root().join(rel);
     p.is_file().then_some(p)
+}
+
+/// Path to a directory in the reference corpus, or `None` (the test skips) when it is absent.
+pub fn reference_dir(rel: &str) -> Option<PathBuf> {
+    let p = reference_root().join(rel);
+    p.is_dir().then_some(p)
 }
 
 /// Frames of a classic pcap file (link type Ethernet), as `(timestamp_ns, bytes)`.

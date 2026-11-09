@@ -97,7 +97,7 @@ pub struct Termination {
 ///
 /// `operTm` is an **absolute** time and the deadline is a **monotonic** one, so the wait is
 /// computed once, at acceptance, from the difference between `operTm` and the wall clock then
-/// (D33: the two are different questions and neither may be derived from the other). The
+/// (the two clocks answer different questions and neither is derived from the other). The
 /// command's own `wall` is kept so the status it eventually writes is stamped with the moment
 /// it was *asked for*, which is what an operator reconstructing a sequence needs.
 #[derive(Clone, Debug)]

@@ -16,7 +16,7 @@
 //!     alternateAccess AlternateAccess },
 //!   selectAccess CHOICE { component [1], index [2], indexRange [3], allElements [4] } }
 //! ```
-//! ✅ (`../specs/asn1-wireshark/mms.asn`).
+//! ✅ (Wireshark's `asn1/mms/mms.asn`).
 //!
 //! The recursion says one thing twice. A step with more after it is `selectAlternateAccess`
 //! and tags its selection `[0]`–`[3]`; the last step is `selectAccess` and tags the same four

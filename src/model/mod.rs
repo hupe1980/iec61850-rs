@@ -765,8 +765,7 @@ impl core::fmt::Display for Diagnostic {
 /// subscription an `LSVS` (TISSUE 1396/1401 🌐), and the *binding* between the two is in the
 /// file: the logical node's `GoCBRef`/`SvCBRef` setting names the publisher's control block.
 /// Reading it here is what lets an application wire a subscriber to its supervision node
-/// without typing either name a second time — the same rule the rest of the configuration
-/// follows (D17).
+/// without typing either name a second time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Supervision {
     /// The logical node, as a reference: `IED2LD0/LGOS1`.
@@ -1047,8 +1046,8 @@ impl IedModel {
     /// means. And it means more than the schema says: `doName` is meant to carry the whole data
     /// object path and `daName` to start at the first attribute, but libiec61850's own tool
     /// writes a **sub data object** into `daName` 🌐, so each component is looked up as a sub
-    /// object first and as an attribute second. That is D50's rule — the loader reads what the
-    /// field writes, and the validator is where the finding goes.
+    /// object first and as an attribute second. The loader reads what the field writes; the
+    /// validator is where the finding goes.
     ///
     /// Yields one [`FcdaStep`] per component.
     fn fcda_walk(&self, ld_name: &str, fcda: &Fcda) -> core::result::Result<Vec<FcdaStep>, String> {

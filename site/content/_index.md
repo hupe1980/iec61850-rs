@@ -29,31 +29,31 @@ let w = c.read("IED1LD0/MMXU1.TotW.mag.f", Fc::MX)?;   // one round trip, typed 
 # structured data from this one source, so the two cannot drift apart.
 [[extra.faq]]
 q = "Is there an IEC 61850 library for Rust?"
-a = "This is one. It implements the process bus — GOOSE and Sampled Values — and the MMS station bus on both sides: the whole OSI stack, the association state machine over it, and above that a client and a server that browse, read, write, report, control, transfer files, read logs and edit setting groups. It is tested against real substation captures, against Wireshark, and against libiec61850's own client and server in CI. It is pre-1.0 and has not been through a conformance laboratory. libiec61850 (C, GPLv3 or commercial) is the mature alternative if you need a certified stack today and its licence suits you."
+a = "This is one: GOOSE and Sampled Values on the process bus, and an MMS client and server on the station bus, tested against real captures, Wireshark and libiec61850 in CI. It is pre-1.0 and has not been through a conformance laboratory; libiec61850 (C, GPLv3 or commercial) is the mature alternative if you need a certified stack today."
 
 [[extra.faq]]
 q = "Which parts of IEC 61850 does it cover?"
-a = "GOOSE (IEC 61850-8-1), Sampled Values (IEC 61850-9-2 with the 9-2LE guideline and IEC 61869-9), the MMS station bus with its whole OSI stack — TPKT, COTP, session, presentation, ACSE — and the ACSI services above it in both directions: browse, read, write, report control blocks, all four control models, file services, logs, setting groups, LGOS/LSVS subscription supervision, IEC 61850-7-2 service tracking and type discovery. SCL (IEC 61850-6) loads an IED model, resolves what an IED subscribes to, and configures the server. Edition 2.1 semantics throughout, including the Edition 2 simulation bit and the IEC 62351-6 replay-protection state machine."
+a = "GOOSE (IEC 61850-8-1), Sampled Values (IEC 61850-9-2, 9-2LE, IEC 61869-9), and MMS over its full OSI stack with the ACSI services in both directions: browse, read, write, reporting, all four control models, files, logs, setting groups, LGOS/LSVS supervision, service tracking and type discovery. SCL (IEC 61850-6) loads the IED model, resolves subscriptions and configures the server, with Edition 2.1 semantics throughout."
 
 [[extra.faq]]
 q = "Can I run an IEC 61850 server or IED simulator with it?"
-a = "Yes, and the SCL file is the whole configuration — there is no generated model and no build step. `ied sim relay.icd` serves every IED in a file, each on its own port, with a report engine, all four control models, setting groups, a sandboxed file store and logs. In code it is `Server::bind(addr, Ied::from_scl_file(path, None)?)`, plus a hook where your application decides whether the breaker actually moves."
+a = "Yes, and the SCL file is the whole configuration — no generated model, no build step. `ied sim relay.icd` serves every IED in a file, each on its own port; in code it is `Server::bind(addr, Ied::from_scl_file(path, None)?)`, plus a hook where your application decides whether the breaker actually moves."
 
 [[extra.faq]]
 q = "Can it run on a microcontroller?"
-a = "Yes. The protocol cores — including the MMS association state machine — build `no_std` (with `alloc`; every module needs an allocator and none pretends otherwise), and CI compiles them for `thumbv7em-none-eabihf` on every push. They own no socket, spawn no thread and never read a clock, so the same code runs under an async runtime, on a bare-metal timer, or in a simulation."
+a = "Yes. The protocol cores, including the MMS association state machine, build `no_std` + `alloc`, and CI compiles them for `thumbv7em-none-eabihf` on every push. They own no socket, spawn no thread and never read a clock."
 
 [[extra.faq]]
 q = "How fast is it, and does it allocate?"
-a = "It allocates nothing once running — a counting allocator asserts zero allocations across a thousand GOOSE retransmissions and a second of IEC 61869-9 publishing at 2400 frames per second. Timing has not been measured on reference hardware, so no latency figure is claimed."
+a = "It allocates nothing once running: a counting allocator asserts zero allocations across a thousand GOOSE retransmissions and a second of IEC 61869-9 publishing at 2400 frames per second. No latency figure is claimed, because timing has not been measured on reference hardware."
 
 [[extra.faq]]
 q = "Does it do the IEC 62351 security extensions?"
-a = "The IEC 62351-6 replay-protection state machine, yes — it is mandatory for a conforming subscriber whether or not the stream carries security, so it is always on. The layer-2 authentication extension and TLS (IEC 62351-3) are not implemented: the extension's field layout is behind the IEC paywall, and guessing it would be worse than leaving it out."
+a = "The IEC 62351-6 replay-protection state machine, yes, and it is always on, because a conforming subscriber must run it whether or not the stream carries security. The layer-2 authentication extension and TLS (IEC 62351-3) are not implemented."
 
 [[extra.faq]]
 q = "What licence is it under, and can I use it commercially?"
-a = "MIT or Apache-2.0, at your option. That is deliberate: a permissive licence is the single biggest reason a device vendor cannot use the established open-source stack."
+a = "MIT or Apache-2.0, at your option, so it can ship inside commercial devices."
 +++
 
 <section class="band soft">
@@ -70,9 +70,6 @@ OSI that IEC 61850-8-1 inherited whole.
 The mature implementations are C ([libiec61850][lib], GPLv3 or a commercial licence) and
 Java ([IEC61850bean][bean], MMS only). Both are good; neither is a permissively licensed,
 memory-safe core you can put in a merging unit, a WebAssembly analyser or a bare-metal IED.
-Nor one without the memory-safety defect class — stack overflows, out-of-bounds accesses,
-double frees, integer overflows in a BER decoder — that a bounded, fuzzed, `unsafe`-free
-decoder cannot have.
 
 `iec61850-rs` is that core. `#![forbid(unsafe_code)]` across the library, a `no_std` build
 for microcontrollers, and MIT or Apache-2.0.
@@ -88,37 +85,33 @@ for microcontrollers, and MIT or Apache-2.0.
 
 ## What makes it correct
 
-<p class="sub">Each of these is a property the protocol demands and a plausible-looking
-implementation gets wrong. Each is held in place by a test against real traffic, a
-third-party dissector, or an adversarial simulation.</p>
+<p class="sub">Properties the protocol demands, each held by a test against real traffic, a
+third-party dissector or an adversarial simulation.</p>
 
 <div class="grid">
 <div class="card">
 <h3>Captures re-encode exactly</h3>
 <p>Every frame of a two-IED SEL GOOSE capture and all 10,161 frames of a 9-2LE sampled-value
 capture are decoded, encoded again, and required to match <strong>byte for byte</strong>.
-Configure the publisher as the captured merging unit was configured and it reproduces that
-hardware's frames. A real MMS association is held to the same standard through all six of its
-layers.</p>
+A real MMS association is held to the same standard through all six of its layers.</p>
 </div>
 <div class="card">
 <h3>Both ends, tested against each other</h3>
 <p>The association is one type with a <code>Role</code>, so the suite loads an SCL file into
 the real server and runs the real client against it over a loopback socket — browse, report,
-control, setting groups, files. That proves the two halves agree about the mapping. It does
-not prove either is right, and <a href="@/docs/verification.md">Verification</a> says so.</p>
+control, setting groups, files. That proves the two halves agree, not that either is right;
+see <a href="@/docs/verification.md">Verification</a>.</p>
 </div>
 <div class="card">
 <h3>Wireshark is the judge</h3>
 <p>Frames the encoders emit are dissected by <code>tshark</code> on every push. A malformed
-marker or an expert error fails the build — and so does a field that does not dissect back to
-the value we put in, which is the half that finds things. An implementation that only agrees
-with itself has proved nothing.</p>
+marker or an expert error fails the build, and so does a field that does not dissect back to
+the value that was encoded.</p>
 </div>
 <div class="card">
 <h3>And libiec61850 is the second opinion</h3>
-<p>A dissector says whether a PDU is well formed. Only a peer says whether it is the PDU that
-was expected, in the order it was expected. CI builds libiec61850 and runs its client against
+<p>A dissector says whether a PDU is well formed; a peer says whether it was the PDU expected,
+in the order expected. CI builds libiec61850 and runs its client against
 this server — browse, type discovery, all four control models, array elements, reporting — and
 this client against its server, logs included.</p>
 </div>
@@ -127,8 +120,8 @@ this client against its server, logs included.</p>
 <p>IEC 62351-6 requires a conforming subscriber to run its replay state machine
 <em>whether or not</em> the stream carries security extensions. And the rule is about
 liveness, not counters: a frame is rejected while the current state is inside its
-<code>timeAllowedtoLive</code> and admitted once that has elapsed — that is a restarted
-publisher, not an attacker, even when it comes back on the counter it was already using.</p>
+<code>timeAllowedtoLive</code> and admitted once that has elapsed, so a restarted publisher gets
+straight back in.</p>
 </div>
 <div class="card">
 <h3>The simulation bit means what Ed2 says</h3>
@@ -141,14 +134,12 @@ header S bit disagrees with its PDU flag is rejected either way.</p>
 <p>Decoders enforce depth, member and length limits <em>before</em> allocating. Event queues
 and the report reassembler are bounded and count what they drop, so a 4.8 kHz stream and an
 application that stops draining cannot exhaust memory. Files are served in ranges, so an open
-handle costs a name rather than a hundred-megabyte record — and the store is sandboxed by
-construction, not by a check a caller might forget.</p>
+handle costs a name rather than a hundred-megabyte record, and the store is sandboxed.</p>
 </div>
 <div class="card">
 <h3>Adversarial simulation, not just unit tests</h3>
 <p>Publisher against subscriber under virtual time with loss, reordering, duplication,
-replay and partition, across 512 seeds in CI. The invariants are mutation-tested: breaking
-the expiry rule makes them fail.</p>
+replay and partition, across 512 seeds in CI.</p>
 </div>
 <div class="card">
 <h3>Zero allocations is a measured number</h3>
@@ -167,19 +158,19 @@ reception.</p>
 ## The engineering file is the configuration
 
 An SCD says where every stream goes, what every data set holds and how every breaker is
-controlled. Most stacks make you say it a second time — in a generated model, a `.cfg`, or a
-build script. Here the file *is* the configuration, for all four roles:
+controlled. Here the file *is* the configuration — no generated model, no `.cfg`, no build
+script — for all four roles:
 
 ```rust
 let subs = iec61850_rs::scl::subscriptions(&scd, "IED2", 50)?;   // what IED2 listens to
 let server = Server::bind("0.0.0.0:102", Ied::from_scl_file("relay.cid", None)?)?;
-let client = Client::connect_scl(&scd, "IED1", None, None)?;     // address, selectors, AP-title
+let client = Client::connect_scl(&Scl::parse(&scd)?, "IED1", None, None)?; // address, selectors, AP-title
 let mu     = model.sv_publisher_config("IED1LD0/LLN0.msvcb01", src, 50)?;
 ```
 
 A sampled-value subscription carries the publisher's **channel layout** with it, so samples
-arrive decoded — for any engineered data set, not only 9-2LE's fixed four currents and four
-voltages. The server browses out of the same file, so it cannot drift from its own SCD.
+arrive decoded for any engineered data set, not only 9-2LE's. The server browses out of the
+same file, so it cannot drift from its own SCD.
 
 </div>
 </section>
@@ -190,8 +181,7 @@ voltages. The server browses out of the same file, so it cannot drift from its o
 ## Sans-IO, so the hard parts are testable
 
 Every protocol core takes inputs with the caller's notion of *now*, yields outputs, and says
-when it wants to be called again. No sockets, no threads, no clock reads — and no trait to
-implement.
+when it wants to be called again. No sockets, no threads, no clock reads.
 
 ```rust
 let events = subscriber.feed(now, &frame);   // or on_frame + poll_event
@@ -199,14 +189,10 @@ subscriber.on_timeout(now);
 let deadline = subscriber.next_timeout();
 ```
 
-The same code then runs under a tokio task, on a bare-metal timer, or inside a deterministic
-simulation with no I/O at all. It is also why the sampled-value publisher can encode a frame
-**once** and patch only the counter, the samples and the clock fields
-(<code>smpSynch</code>, <code>refrTm</code>, <code>gmIdentity</code>) — 2400 frames a second
-with no encoding and no allocation in the steady state.
-
-The station bus works the same way: the server's whole service layer is a function from a
-request to an answer, tested with no socket and no byte on a wire.
+The same code runs under a tokio task, on a bare-metal timer, or in a deterministic simulation.
+The sampled-value publisher encodes a frame **once** and patches only the counter, the samples
+and the clock fields — 2400 frames a second with no encoding and no allocation. On the station
+bus the server's service layer is a function from request to answer, tested with no socket.
 
 </div>
 </section>
@@ -233,13 +219,9 @@ ied scl validate relay.icd                           # the engineering errors th
 ied scl subs bay.scd IED2                            # every ExtRef resolved to its publisher
 ```
 
-That is what makes the tool testable: `ied mu` generates a stream, `ied sv monitor` reads it
-back, `ied sim` serves a file and `ied mms browse` browses it — all in one CI job, on every
-push, with no device.
-
-`goose sniff` and `sv monitor` are not second implementations: they drive the library's own
-subscriber state machines, so what the tool says about a frame is what a subscribing IED would
-decide about it.
+`goose sniff` and `sv monitor` drive the library's own subscriber state machines, so what the
+tool says about a frame is what a subscribing IED would decide. CI runs `ied mu` into
+`ied sv monitor` and `ied sim` against `ied mms browse` on every push, with no device.
 
 </div>
 </section>
@@ -278,9 +260,9 @@ subscriber, a merging unit, an MMS client against an MMS server in one process, 
 from an SCL file, an SCD as the configuration, and a subscription supervised by an
 <code>LGOS</code>. Each needs no device and no network.</p>
 
-<p class="sub">The API is pre-1.0 and will change. Nothing here has been through a
-conformance laboratory; see <a href="@/docs/verification.md">Verification</a> for exactly
-what is and is not proven.</p>
+<p class="sub">The API is pre-1.0 and changes between minor versions. Nothing here has been
+through a conformance laboratory; <a href="@/docs/verification.md">Verification</a> says what
+is and is not proven.</p>
 
 </div>
 </section>

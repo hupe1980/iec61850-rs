@@ -1,7 +1,7 @@
 //! A real IEC 61850 server from an SCL file, and a real client against it — in one process,
 //! with no device, no network interface and no arguments.
 //!
-//! This is the whole design in forty lines: the engineering file is the model, the model is
+//! This is the whole design in one file: the engineering file is the model, the model is
 //! the namespace, and both ends of the association are the same state machine in different
 //! roles. Run it with `cargo run --example server_from_scl`.
 

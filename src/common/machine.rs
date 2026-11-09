@@ -33,7 +33,7 @@ impl Instant {
 
 /// The two clocks a server needs at once, carried together so they cannot be swapped.
 ///
-/// There are exactly two kinds of time here and they answer different questions (D33):
+/// There are exactly two kinds of time here and they answer different questions:
 /// [`Now::mono`] is a monotonic [`Instant`] and is what every deadline, window and duration is
 /// measured on; [`Now::wall`] is an absolute [`UtcTime`] and is what every *published*
 /// timestamp carries — a report's `TimeOfEntry`, a log entry, an `SGCB`'s `LActTm`, the status

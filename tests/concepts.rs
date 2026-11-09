@@ -6,7 +6,12 @@
 //!
 //! Checks: `D`/`R` identifiers are numbered contiguously from 1, every citation resolves,
 //! every relative link between the documents resolves, the counts the prose states agree
-//! with the entries there are.
+//! with the entries there are, and every open roadmap item names exactly one feature
+//! specification under `specs/` while every specification there is named by exactly one item.
+//!
+//! One check needs no notes and so is the one CI sees: nothing published — `src/`, `tests/`,
+//! `examples/`, the fuzz targets, the site, the README, the changelog, `Cargo.toml` — cites `concepts/`, `specs/` or `.specify/`, because a
+//! reader of the crate cannot open any of them (D54).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
@@ -171,4 +176,90 @@ fn stated_counts_match() {
             "{file}: the prose should state `{word} things …` or `{word} of them` for {n} entries"
         );
     }
+}
+
+/// The roadmap is the spec of specs: an open item is a `` ### `#anchor` `` heading naming one
+/// folder on a `**Specified as:**` line, and a folder under `specs/` that no item names is work
+/// nobody has scheduled. `specs/archive/` holds the shipped, superseded and refused.
+#[test]
+fn every_roadmap_item_names_its_specification() {
+    let Some(dir) = concepts() else { return };
+    let specs = Path::new(env!("CARGO_MANIFEST_DIR")).join("specs");
+    if !specs.is_dir() {
+        return;
+    }
+    let roadmap = fs::read_to_string(dir.join("ROADMAP.md")).expect("read ROADMAP.md");
+
+    let items = roadmap.lines().filter(|l| l.starts_with("### `#")).count();
+    let named: Vec<&str> = roadmap.lines().filter_map(|l| l.strip_prefix("**Specified as:** `")?.split('`').next()).collect();
+    assert_eq!(items, named.len(), "ROADMAP.md: {items} items but {} **Specified as:** lines", named.len());
+
+    let unique: BTreeSet<&str> = named.iter().copied().collect();
+    assert_eq!(unique.len(), named.len(), "ROADMAP.md names a specification twice: {named:?}");
+
+    let missing: Vec<_> = unique.iter().filter(|s| !specs.join(s).join("spec.md").is_file()).collect();
+    assert!(missing.is_empty(), "ROADMAP.md names specifications that do not exist: {missing:?}");
+
+    let orphans: Vec<_> = fs::read_dir(&specs)
+        .expect("read specs/")
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.as_bytes().first().is_some_and(u8::is_ascii_digit))
+        .filter(|name| !unique.contains(name.as_str()))
+        .collect();
+    assert!(orphans.is_empty(), "specs/ holds specifications no roadmap item names: {orphans:?}");
+}
+
+/// The published tree stands on its own. A path into the internal notes, the specifications or
+/// the Spec Kit machinery renders as a reference and leads nowhere for every reader who is not
+/// a maintainer.
+#[test]
+fn nothing_published_cites_the_internal_tree() {
+    fn walk(path: &Path, out: &mut Vec<PathBuf>) {
+        if path.is_dir() {
+            for entry in fs::read_dir(path).expect("read dir").flatten() {
+                walk(&entry.path(), out);
+            }
+        } else if path.extension().is_some_and(|e| e == "rs" || e == "md" || e == "toml") {
+            out.push(path.to_path_buf());
+        }
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    for published in ["src", "examples", "tests", "fuzz/fuzz_targets", "site/content", "README.md", "CHANGELOG.md", "Cargo.toml"] {
+        walk(&root.join(published), &mut files);
+    }
+    // This file is the guard, and has to name what it guards.
+    files.retain(|f| !f.ends_with("tests/concepts.rs"));
+
+    let mut leaks = Vec::new();
+    for file in &files {
+        let text = fs::read_to_string(file).expect("read published file");
+        for (n, line) in text.lines().enumerate() {
+            let cites = ["concepts/", "specs/", ".specify/"].iter().any(|internal| {
+                line.match_indices(internal).any(|(at, _)| {
+                    // `specs/` as a path, not the tail of `nsd-specs/` or `.specify/`'s `specify/`.
+                    !line[..at].chars().next_back().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                })
+            });
+            // A decision or risk id (`D12`, `R2`) points into the same notes, just without a path.
+            // `R2-1` (the 9-2LE guideline's revision) is a version, not an id.
+            let bytes = line.as_bytes();
+            let cites_id = line.match_indices(['D', 'R']).any(|(at, _)| {
+                let before = at.checked_sub(1).and_then(|i| bytes.get(i)).copied();
+                let digits = bytes[at + 1..].iter().take_while(|b| b.is_ascii_digit()).count();
+                let after = bytes.get(at + 1 + digits).copied();
+                (1..=2).contains(&digits)
+                    && !before.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    && !after.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+            });
+            if cites || cites_id {
+                let file = file.strip_prefix(root).unwrap_or(file).display();
+                leaks.push(format!("{file}:{}", n + 1));
+            }
+        }
+    }
+    assert!(leaks.is_empty(), "published files cite a path their reader does not have: {leaks:?}");
 }

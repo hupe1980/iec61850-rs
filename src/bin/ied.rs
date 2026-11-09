@@ -130,7 +130,7 @@ COMMANDS:
     --frames <N>        frames to generate (default 1000)
     --sv-id <ID>        svID to publish (default MU01)
     --appid <HEX>       APPID (default 4000)
-    --freq <N>          nominal frequency of the synthetic waveform in Hz (default 50)
+    --freq <N>          nominal frequency of the synthetic waveform in Hz (default: 60 for a 60 Hz 9-2LE profile, else 50)
     --amplitude <N>     peak of the synthetic sinusoid, raw units (default 100000)
     --gm <HEX>          publish gmIdentity, 8 octets as 16 hex digits
     --refr-tm           publish refrTm on every ASDU

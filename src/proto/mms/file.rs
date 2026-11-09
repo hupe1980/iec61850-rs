@@ -7,7 +7,7 @@
 //! DirectoryEntry ::= SEQUENCE { filename [0] FileName, fileAttributes [1] FileAttributes }
 //! ```
 //!
-//! Structures from ISO 9506-2 as `../specs/asn1-wireshark/mms.asn` states them ✅. A file is
+//! Structures from ISO 9506-2 as Wireshark's `asn1/mms/mms.asn` states them ✅. A file is
 //! read by opening it (which returns an `frsmID`), reading until `moreFollows` is false, and
 //! closing it — the `frsmID` is a server-side handle and leaking one leaks a file descriptor
 //! in an IED, so [`crate::client::Client::read_file`] closes it even when a read fails.

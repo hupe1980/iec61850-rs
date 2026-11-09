@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 /// The `ied` binary built alongside this test.
@@ -110,7 +110,7 @@ fn generated_frames_dissect_cleanly_in_wireshark() {
 
 #[test]
 fn goose_sniff_reads_a_real_capture() {
-    let Some(capture) = common::spec("pcap/goose-mdehus.pcap") else { return };
+    let Some(capture) = common::reference("pcap/goose-mdehus.pcap") else { return };
     let o = run(&["goose", "sniff", capture.to_str().unwrap()]);
     assert!(o.ok, "{}", o.stderr);
     assert!(o.stdout.contains("16 GOOSE frames"), "{}", o.stdout);
@@ -177,7 +177,7 @@ fn mms_sniff_reads_a_real_association() {
     // The reference capture is an ICCP association — MMS over ACSE over presentation over
     // session over COTP over TPKT. Decoding it end to end is the check that the whole OSI
     // stack works on traffic nobody here produced.
-    let Some(capture) = common::spec("pcap/mms.pcap") else { return };
+    let Some(capture) = common::reference("pcap/mms.pcap") else { return };
     let o = run(&["mms", "sniff", capture.to_str().unwrap()]);
     assert!(o.ok, "{}", o.stderr);
     // The handshake, layer by layer.
@@ -258,11 +258,7 @@ fn scl_subs_resolves_a_subscriber_against_its_publishers() {
 
 #[test]
 fn scl_validate_reports_dangling_types_from_the_openscd_corpus() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/fixtures/openscd");
-    let file = dir.join("valid2007B4.scd");
-    if !file.is_file() {
-        return;
-    }
+    let Some(file) = common::reference("fixtures/openscd/valid2007B4.scd") else { return };
     let o = run(&["scl", "validate", file.to_str().unwrap()]);
     // The corpus is known to reference types it does not define; the tool must name them
     // rather than either crashing or silently accepting.

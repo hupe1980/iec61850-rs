@@ -20,7 +20,7 @@
 //!                                                annotation [3] VisibleString } }
 //! ```
 //!
-//! Structures from ISO 9506-2 as `../specs/asn1-wireshark/mms.asn` states them ✅; that
+//! Structures from ISO 9506-2 as Wireshark's `asn1/mms/mms.asn` states them ✅; that
 //! `entryToStartAfter` is the field IEC 61850's `QueryLogAfterEntry` uses, and that a log
 //! entry's variables are `(tag, Data)` pairs where the tag is the data attribute's reference,
 //! from libiec61850's `mms_client_journals.c` 🌐.

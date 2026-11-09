@@ -12,8 +12,7 @@ If you already know what a merging unit publishes and why `stNum` matters, skip 
 
 ## Two buses, three protocols
 
-An IEC 61850 substation carries three kinds of traffic, and they have almost nothing in
-common but the standard they come from.
+An IEC 61850 substation carries three kinds of traffic:
 
 | | Carries | Over | Timing |
 |---|---|---|---|
@@ -21,15 +20,11 @@ common but the standard they come from.
 | **GOOSE** (IEC 61850-8-1) | Protection signals: trips, interlocks, blocking | Raw Ethernet, `0x88B8` | **3 ms** end to end |
 | **Sampled Values** (IEC 61850-9-2) | Instrument-transformer currents and voltages | Raw Ethernet, `0x88BA` | 4000–14 400 samples/s |
 
-The **station bus** is where MMS lives: a SCADA client browsing an IED's data model, over six
-layers of OSI that IEC 61850-8-1 inherited whole — see [MMS](@/docs/mms.md), which is also
-where the association state machine and the blocking client over it are. The **process
-bus** is where GOOSE and Sampled Values live: multicast frames straight over Ethernet, with no
-IP, no TCP and no retransmission by anybody but the publisher.
-
-That last point is the whole design. There is no acknowledgement, so a publisher cannot know
-it was heard; instead it repeats itself, and a subscriber decides for itself when the
-publisher has gone quiet.
+The **station bus** carries MMS: a SCADA client browsing an IED's data model over six OSI
+layers (see [MMS](@/docs/mms.md)). The **process bus** carries GOOSE and Sampled Values:
+multicast frames straight over Ethernet, with no IP, no TCP and no acknowledgement. A
+publisher therefore repeats itself, and a subscriber decides for itself when the publisher has
+gone quiet.
 
 ## GOOSE: repeat until something changes
 
@@ -46,8 +41,7 @@ arrives several times within the 3 ms budget even if the first copy is lost.
 Every frame also carries **`timeAllowedtoLive`**: how long the subscriber should wait before
 concluding the publisher is dead. Conventionally it is twice the interval to the next frame,
 so losing one frame is survivable and losing two is not. When it elapses, the subscriber must
-treat the values it holds as invalid — a protection scheme that keeps acting on a stale trip
-signal is worse than one that knows it is blind.
+treat the values it holds as invalid.
 
 ## Sampled Values: a metronome
 
@@ -55,14 +49,12 @@ A **merging unit** digitises the current and voltage transformers of a bay and p
 samples continuously. There is no "change"; there is only the next sample.
 
 **`smpCnt`** counts samples within a second and wraps at the sample rate — 3999 for 80
-samples per cycle at 50 Hz, 4799 at 60 Hz. A subscriber that sees a step of anything but one
-has lost samples, and for a protection algorithm reconstructing a waveform, knowing *how
-many* it lost is the difference between compensating and being wrong.
+samples per cycle at 50 Hz, 4799 at 60 Hz. A step of anything but one means samples were lost,
+and the size of the step says how many.
 
 **`smpSynch`** says what the samples are timed against: `0` unsynchronised, `1` a local
 clock, `2` a global clock that is time-traceable, and `5`–`254` a specific identified local
-clock. Two merging units feeding one differential protection must agree, or the algorithm
-compares samples that were never simultaneous.
+clock. Two merging units feeding one differential protection must agree.
 
 Frames may carry several **ASDUs** — several consecutive samples — to keep the frame rate
 down. IEC 61869-9 picks the count precisely so the wire always sees 2400 frames a second:
@@ -80,9 +72,8 @@ protocol it is:
 | Sampled Values | `01-0C-CD-04-00-00` … `01-0C-CD-04-01-FF` | `0x4000`–`0x7FFF` |
 
 Frames are normally 802.1Q-tagged with priority 4, so a switch can give protection traffic
-its own queue. `ied scl validate` checks all of this against an SCL file, because the schema
-happily permits a sampled-value control block with a GOOSE APPID, and a switch will happily
-forward it into the wrong queue.
+its own queue. `ied scl validate` checks these ranges in an SCL file, which the schema does
+not.
 
 ## The simulation bit
 
@@ -93,10 +84,9 @@ mirrored by a field inside the PDU.
 The rule is a preference, not a filter. A device whose `LPHD.Sim` is set processes simulated
 streams **instead of** the real ones: until a test set speaks it follows the real publisher,
 and from the first simulated frame onwards it ignores it. A device with `LPHD.Sim` clear
-ignores simulated frames entirely. It is a property of the *subscribing* device, so it
-applies to sampled values exactly as it does to GOOSE — only GOOSE also mirrors the bit
-inside the PDU, and a frame whose header bit disagrees with that field is malformed either
-way, because something rewrote one of them in flight.
+ignores simulated frames entirely. The rule belongs to the *subscribing* device, so it applies
+to sampled values as it does to GOOSE. Only GOOSE mirrors the bit inside the PDU, and a GOOSE
+frame whose header bit disagrees with that field is rejected either way.
 
 ## Replay protection
 
@@ -112,9 +102,8 @@ The rule is about **liveness**, not about counters:
   state whatever its counters say — a device that reboots begins again, and it may well come
   back on a counter it was already using.
 
-Notice what is *not* consulted: the timestamp the publisher put in the frame. It is
-attacker-controlled and depends on a clock you do not own. Time to live is measured against
-the subscriber's own arrival times.
+The publisher's timestamp is not consulted: time to live is measured against the subscriber's
+own arrival times.
 
 ## Sans-IO {#sans-io}
 
@@ -129,13 +118,9 @@ while let Some(event) = subscriber.poll_event() { /* … */ }
 let wake_at = subscriber.next_timeout();
 ```
 
-That is what makes a state machine testable: the same code runs under a tokio task, on a
-bare-metal timer, and inside a deterministic simulation that delays, duplicates and replays
-frames across hundreds of seeds — with no I/O to mock and no wall clock to wait for. It is
-also what allows a `no_std` build.
-
-There is deliberately no `Machine` trait to implement: every core exposes the same four
-inherent methods, and a trait would only have forced the frame type to be owned.
+The same code runs under a tokio task, on a bare-metal timer, or inside a deterministic
+simulation with no I/O to mock, and it builds `no_std`. There is no trait to implement: every
+core exposes the same four inherent methods.
 
 ## What the standards are called
 

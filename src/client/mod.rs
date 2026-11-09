@@ -868,8 +868,7 @@ impl Client {
                 // telling us it could not read what we sent — and it will not answer.
                 AssociationEvent::Rejected { invoke_id: None, reject } => return Err(rejected(&reject)),
                 // The peer withdrew the request this call is waiting on. Nothing else is
-                // coming, so failing now beats waiting out the request timeout — the reject
-                // rule (D35) applied to the other PDU that ends a call without answering it.
+                // coming, so the call fails now rather than waiting out the request timeout.
                 AssociationEvent::Cancelled { invoke_id: id } if id == invoke_id => {
                     return Err(Error::Io(String::from("the peer cancelled the request")));
                 }

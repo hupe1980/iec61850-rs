@@ -8,8 +8,8 @@ nav_title = "SCL"
 +++
 
 SCL is the XML that describes a substation: which IEDs exist, what data each holds, which
-data sets they publish, and on which multicast addresses. It is the configuration, so it is
-what this library configures from.
+data sets they publish, and on which addresses. The library configures servers, publishers,
+subscribers and clients from it.
 
 ## Loading
 
@@ -24,7 +24,7 @@ let model = IedModel::from_scl(&xml, None)?;
 The loader reads ICD, IID, CID and SCD files, schema versions 2003 through 2007B4. It matches
 elements by local name, so a file with unusual namespace prefixes still loads.
 
-What you get is the model a server answers from and a publisher takes its addresses from:
+The model:
 
 ```rust
 for ld in &model.logical_devices {                     // IED1LD0, or an explicit ldName
@@ -39,11 +39,8 @@ for ld in &model.logical_devices {                     // IED1LD0, or an explici
 
 ## Lenient by default
 
-Real SCL files are not clean. OpenSCD's own test corpus — files named `valid2007B4.scd` —
-references `LNodeType`s and `DOType`s that the file never defines. A loader that refuses the
-whole IED for one dangling reference is a loader nobody can use.
-
-So the default is lenient: what cannot be resolved is skipped, recorded, and the rest loads.
+Real SCL files reference types they never define (OpenSCD's `valid2007B4.scd` does). By
+default, what cannot be resolved is skipped and recorded as a diagnostic, and the rest loads.
 
 ```rust
 let model = IedModel::from_scl(&xml, Some("IED1"))?;
@@ -63,8 +60,10 @@ Every diagnostic carries a **stable code** you can match on, and an SCL path say
 | `BadAddress` | A `GSE` or `SMV` address is incomplete or unparsable |
 | `MissingAttribute` | A required `name`, `type`, `inst` or `lnType` is absent |
 | `NestingTooDeep` | Type nesting deeper than the loader follows |
+| `UnresolvedArrayCount` | A `count` naming an attribute that does not resolve; loaded as a scalar |
+| `ArrayTooLarge` | A `count` above `scl::MAX_ARRAY`; loaded as a scalar |
 
-When you need the opposite — a build step that must reject a file rather than work around it:
+Strict loading rejects instead:
 
 ```rust
 use iec61850_rs::scl::LoadOptions;
@@ -75,9 +74,7 @@ let model = IedModel::from_scl_with(&xml, Some("IED1"), LoadOptions { strict: tr
 
 ## Building publishers from it
 
-This is the point of loading SCL at all: the addresses, APPIDs, VLAN tags and timings live in
-the engineering file, and typing them a second time into your code is how a bay ends up
-publishing to the wrong multicast group.
+Addresses, APPIDs, VLAN tags and timings come from the engineering file:
 
 ```rust
 // Everything a GOOSE publisher needs, from one control-block reference.
@@ -96,25 +93,18 @@ from the `Communication` section, the `gocbRef` and `datSet` from the control bl
 `MinTime`/`MaxTime` from the `GSE` element when the file gives them — with the SI
 `multiplier` applied, so a `MaxTime` written in seconds is not read as milliseconds.
 
-`sv_publisher_config` does the same for a merging unit, and works out the ASDU sample length
-by **summing the widths of the data set's members**. 9-2LE's `PhsMeas1` comes out at 64
-octets because the file says so, not because it is special-cased — so a merging unit with its
-own fixed-width data set configures itself too. A data set with a member whose width is not
-fixed is an error rather than a guess.
+`sv_publisher_config` does the same for a merging unit and computes the ASDU sample length by
+summing the widths of the data set's members (9-2LE's `PhsMeas1` comes out at 64 octets). A
+member whose width is not fixed is an error.
 
-### Why the frequency is a parameter
-
-SCL does not record the system frequency, and `smpRate` counts samples per *nominal cycle*
-unless `smpMod` says `SmpPerSec`. `smpRate="80"` therefore means 4000 samples a second at
-50 Hz and 4800 at 60 Hz, and nothing in the file distinguishes them. Passing it in is honest;
-guessing would produce a subscriber whose gap detection is wrong once per second.
+The frequency is a parameter because SCL does not record it: `smpRate` counts samples per
+nominal cycle unless `smpMod` is `SmpPerSec`, so `smpRate="80"` is 4000 samples/s at 50 Hz and
+4800 at 60 Hz.
 
 ## What an IED subscribes to
 
-`Inputs/ExtRef` says which signal this IED consumes and which control block publishes it —
-but the multicast address, the APPID and the `confRev` live in the *publisher's* part of the
-same file. Resolving a subscription is therefore a whole-document operation, not a per-IED
-one:
+`Inputs/ExtRef` names the signal an IED consumes; the address, APPID and `confRev` are in the
+publisher's part of the file, so subscriptions are resolved over the whole document:
 
 ```rust
 let subs = iec61850_rs::scl::subscriptions(&scd, "IED2", 50)?;
@@ -128,15 +118,12 @@ for s in &subs.sv {
 }
 ```
 
-One entry per source control block, carrying the `ExtRef`s bound to it — so you can see which
-members of the data set this IED actually wired up, and to which internal address.
+One entry per source control block, with the `ExtRef`s bound to it and their internal
+addresses. A sampled-value subscription carries the publisher's sample layout, so the
+subscriber decodes named channels — see
+[Sampled Values](@/docs/sampled-values.md#what-the-octets-of-an-asdu-mean).
 
-A sampled-value subscription brings the publisher's **sample layout** with it: the data set's
-`bType`s give every channel of the ASDU a name, a type and an offset, so the subscriber
-decodes named channels rather than a block of octets, for any fixed-width data set and not
-only 9-2LE's. See [Sampled Values](@/docs/sampled-values.md#what-the-octets-of-an-asdu-mean).
-
-### Two ways a binding is written, and both work
+### Both binding forms
 
 ```xml
 <!-- Bound to the control block: what a finished system configuration looks like. -->
@@ -148,27 +135,14 @@ only 9-2LE's. See [Sampled Values](@/docs/sampled-values.md#what-the-octets-of-a
         doName="Pos" daName="stVal"/>
 ```
 
-The first names its control block and is taken as written. The second names only the
-attribute, so the publisher's data sets are searched for a member covering it — a member
-that names only a data object covers every attribute under it, which is how most data sets
-are written — and the control block publishing that data set is the answer.
+The first is taken as written. For the second, the publisher's data sets are searched for a
+member covering the attribute (a member naming a data object covers every attribute under it),
+and the control block publishing that data set is the answer. If two control blocks publish
+the same signal, the binding is reported as ambiguous.
 
-This is not a nicety. In OpenSCD's `valid2007B4.scd`, **one of seven `ExtRef`s carries
-`srcCBName`**; a resolver that handled only the first form would report six of them as
-unbound.
-
-If two control blocks publish the same signal, the file is ambiguous and says so rather than
-picking one — add a `srcCBName`.
-
-### What comes back unresolved
-
-`ExtRef`s that resolve to nothing come back in `subs.unresolved` rather than being dropped: a
-binding that names a publisher the file does not hold, or a control block with no
-`Communication` address, is a commissioning finding.
-
-An `ExtRef` with **no `iedName` at all** is not reported. That is an input an engineer has
-given a place and not yet a source, which is the normal state of an SCD under construction —
-flagging it would bury the findings that matter.
+`ExtRef`s that resolve to nothing — an unknown publisher, a control block with no
+`Communication` address — come back in `subs.unresolved`. An `ExtRef` with no `iedName` is an
+unbound input and is not reported.
 
 Control blocks resolve by either reference form:
 
@@ -188,9 +162,7 @@ unsigned integer and an attribute *name*, so both of these are legal and mean th
 <SDO name="sqHar"   type="CMV_T" count="numHar"/>   <!-- a sibling whose Val holds the number -->
 ```
 
-The loader resolves both to a number, which is what `DataAttribute::count` and
-`DataObject::count` carry. A `count` that names nothing, or one larger than the loader expands
-(`MAX_ARRAY`), is a diagnostic and the attribute loads as a scalar.
+Both resolve to a number in `DataAttribute::count` and `DataObject::count`.
 
 A data set may name **one element** of an array with `FCDA/@ix`:
 
@@ -198,11 +170,9 @@ A data set may name **one element** of an array with `FCDA/@ix`:
 <FCDA ldInst="LD0" lnClass="MHAI" lnInst="1" doName="HA" daName="phsAHar.cVal" fc="MX" ix="1"/>
 ```
 
-`ix` says *which element* and never *which component is the array* — only the type does — so
-the index is placed by walking the model until something has a `count`.
-`IedModel::fcda_reference` returns `IED1LD0/MHAI1$MX$HA$phsAHar(1)$cVal`, and `ied scl validate`
-reports an index past the end of its array or on something that is not one. Some tools write
-the index into `daName` as well; that is read too.
+The index is placed on the component the type marks with a `count`:
+`IedModel::fcda_reference` returns `IED1LD0/MHAI1$MX$HA$phsAHar(1)$cVal`. An index written into
+`daName` is read too, and `ied scl validate` reports an index out of range or on a non-array.
 
 ## Object references
 
@@ -217,16 +187,14 @@ let m = ObjectReference::parse("IED1LD0/LLN0$ST$Mod$stVal")?;
 assert_eq!(m.fc, Some(Fc::ST));
 ```
 
-Both the dotted form and the MMS `$FC$` form parse into the same type, and it borrows the
-input — no allocation. `model.attribute(&r)` resolves one against the loaded model, following
-sub-data-objects and `Struct` attributes, and returns `None` if the functional constraint does
-not match.
+Both forms parse into the same borrowing type. `model.attribute(&r)` resolves one against the
+model, through sub-data-objects and `Struct` attributes, and returns `None` if the functional
+constraint does not match.
 
 ## Instance values, not just type defaults
 
-A `DataTypeTemplates` `<Val>` is the **type's** default. What a device actually does is in the
-`DOI` / `SDI` / `DAI` / `Val` tree under the logical node instance — and for a controllable
-object the two very often differ:
+A `DataTypeTemplates` `<Val>` is the type's default; the instance's value is in the
+`DOI`/`SDI`/`DAI`/`Val` tree under the logical node, and the model carries the effective one:
 
 ```xml
 <LN lnClass="CSWI" inst="1" lnType="CSWI_T">
@@ -236,8 +204,6 @@ object the two very often differ:
 </LN>
 ```
 
-The loader walks that tree, so the model carries the *effective* value:
-
 ```rust
 let model = IedModel::from_scl_file("relay.cid", Some("IED1"))?;
 match model.control_model("IED1LD0/CSWI1.Pos") {
@@ -246,14 +212,10 @@ match model.control_model("IED1LD0/CSWI1.Pos") {
 }
 ```
 
-That matters because a control sequence built on the wrong model does nothing and says
-nothing: an object engineered for select-before-operate answers an unselected `Oper` with
-`AddCause::ObjectNotSelected`. Reading the file costs no round trip; guessing costs a command.
+### Enumerations
 
-### An enumerated value is a symbol, not a number
-
-`sbo-with-enhanced-security` above is the **symbol**; the wire carries the ordinal `4`. The
-mapping is in the document's own `EnumType` table, which the loader keeps:
+An enumerated `Val` is a symbol; the wire carries the ordinal from the document's own
+`EnumType` table, which the loader keeps:
 
 ```xml
 <EnumType id="CtlModel_E">
@@ -261,29 +223,23 @@ mapping is in the document's own `EnumType` table, which the loader keeps:
 </EnumType>
 ```
 
-Without it every enumerated `Val` in the file parses as zero — and zero is `status-only`, so a
-server built from that model refuses every command in the substation for a reason that is not
-the real one. `IedModel::enum_ord` resolves one; `control_model` uses it.
+`IedModel::enum_ord` resolves one; `control_model` uses it.
 
-### Settings have a value per group
+### Settings per group
 
-A `DAI` under a setting-group control carries one `<Val sGroup="n">` per group, and the model
-keeps them all in `DataAttribute::group_values` — that is what lets a server answer with
-group 2's pickup after `SelectActiveSG(2)`. A setting written once, without `sGroup`, means the
-same value in every group.
+A `DAI` under a setting-group control carries one `<Val sGroup="n">` per group, kept in
+`DataAttribute::group_values`. A value without `sGroup` applies to every group.
 
-### What a server needs, the file already has
+### Control blocks and logs
 
-The model carries the rest of what an IED is, not only its data: a report control block's
-engineered `TrgOps` and `OptFields` (and `indexed`, which decides whether `RptEnabled max="3"`
-means three blocks named `urcb01`…`urcb03` or one), log control blocks and the logs they write
-into, and the setting-group control block. That is why
-[the server](@/docs/server.md) needs nothing but the file.
+The model also carries report control blocks with their `TrgOps`, `OptFields` and `indexed`
+(whether `RptEnabled max="3"` means `urcb01`…`urcb03` or one block), log control blocks and
+their logs, and the setting-group control block — everything
+[the server](@/docs/server.md) needs.
 
 ## The address a client associates over
 
-`Communication/ConnectedAP/Address` holds what an MMS association needs, and it is engineered
-once, in the file:
+`Communication/ConnectedAP/Address` holds what an MMS association needs:
 
 ```rust
 let a = model.osi_address(None)?;      // None = the only access point
@@ -293,10 +249,8 @@ a.ap_title;                            // [1, 3, 9999, 23] — ACSE, as arcs
 a.ae_qualifier;
 ```
 
-The three selectors go into the COTP connection request, the session CONNECT and the
-presentation CP; the AP-title and AE-qualifier into the ACSE AARQ
-(`osi::oid::encode` turns the arcs into the identifier ACSE carries). `ied scl show` prints
-them — and the [client](@/docs/mms.md#the-client) opens an association straight from them:
+The selectors go into the COTP CR, session CONNECT and presentation CP; the AP-title and
+AE-qualifier into the ACSE AARQ. The [client](@/docs/mms.md#the-client) connects from them:
 
 ```rust
 let mut c = Client::connect_scl(&scl, "IED1", None, None)?;   // address and selectors from the file
@@ -306,17 +260,10 @@ let mut c = Client::connect_scl(&scl, "IED1", None, None)?;   // address and sel
 $ ied mms browse - --scd bay.scd --ied IED1
 ```
 
-Every one of those fields has to match or the server refuses the association at a layer whose
-error message says nothing useful, which is why reading them out of the file rather than
-retyping them is worth a section of its own.
+## Parsing once
 
-## Asking one document many questions
-
-Every function above takes SCL text and parses it. That is the right shape for one question,
-and the wrong shape for a station file with a hundred IEDs: `validate` alone would re-parse
-the document once per IED, and once more per publisher each of them names.
-
-`Scl` is the parsed document, and every function above is a method on it:
+The free functions parse the SCL text on every call. `Scl` is the parsed document, with the
+same operations as methods — use it for a station file with many IEDs:
 
 ```rust
 use iec61850_rs::scl::Scl;
@@ -329,12 +276,9 @@ for name in scl.ied_names() {
 let report = scl.validate(50, Edition::Ed2_1)?;   // builds each model exactly once
 ```
 
-The free functions are exactly this with the parse inlined; use whichever fits.
-
 ## Validating
 
-The schema permits things a substation cannot live with, and `scl::validate` is where they
-are caught — a library function, so a build script can run it without shelling out:
+`scl::validate` reports engineering errors the schema does not catch:
 
 ```rust
 use iec61850_rs::common::Edition;
@@ -347,29 +291,14 @@ for f in &report.findings {
 assert!(report.is_ok());         // no findings of Severity::Error
 ```
 
-Every finding carries a stable `FindingCode` and a severity, so a pipeline can forbid a
-class of them rather than matching on prose. What it looks for — duplicate streams,
-unresolvable data-set members and bindings, out-of-range addresses, retransmission times,
-sampled-value rates, object references too long for the edition, a report or log control block
-that writes nowhere, an unindexed block that asks for several instances, and a `ctlModel` that
-promises a service its own type does not declare — is tabulated in
-[Command line](@/docs/cli.md#inspect-and-validate-scl), which is the same checks with a
-printer in front of them.
+Every finding has a stable `FindingCode` and a severity; the full list is in
+[Command line](@/docs/cli.md#inspect-and-validate-scl).
 
-A few of them are things the schema **forbids** rather than permits, and they are here because
-the loader is a fast read path rather than a schema processor: it reads with `roxmltree` and
-validates nothing against `SCL.xsd`, so a file no validating parser would accept still loads.
-A `DOType` that declares `setMag` twice is the one that matters — `uniqueDAorSDOInDOType`
-forbids it, and a server that loaded it would publish two variables of one name and resolve
-every read to whichever came first.
+The loader does not validate against `SCL.xsd`, so `validate` also reports the one schema
+violation that changes server behaviour: a type template declaring a member name twice
+(`DuplicateTypeMember`).
 
-That last one is worth naming, because it is invisible until commissioning: a breaker
-engineered `sbo-with-enhanced-security` whose `DOType` declares no `SBOw` is schema-valid and
-impossible to operate. The client selects, the server answers `object-non-existent`, and
-nothing in `SCL.xsd` objects.
+## Limits
 
-
-## Not included
-
-The loader is read-only: no writing SCL back, no editing round-trips, no semantic validation
-against the IEC 61850-7-7 namespace files, and no typed Rust model generated at build time.
+The loader is read-only: it does not write SCL, does not validate against the IEC 61850-7-7
+namespace files, and generates no typed Rust model.

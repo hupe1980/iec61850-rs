@@ -1,14 +1,10 @@
-//! Wireshark as the oracle for the **station bus**, which is where it was missing.
+//! Wireshark as the oracle for the **station bus**.
 //!
-//! The process-bus oracle (`tshark_oracle.rs`) has checked GOOSE and SV frames from the
-//! start; the MMS side had nothing, and the two halves of this crate agreeing with each
-//! other is exactly the evidence the notes say is worth nothing (README rule 10). So this
-//! runs the real client against the real server through a recording proxy, writes the byte
-//! stream as a TCP capture and asks `tshark` what it is.
-//!
-//! It found a real defect on its first run: `FileDirectory`'s `listOfDirectoryEntry [0]` is
-//! **not** implicitly tagged, so the entries live inside an inner `SEQUENCE` — both halves
-//! of this crate had it wrong in the same way and therefore agreed.
+//! The two halves of this crate agreeing with each other proves nothing, because they share
+//! one codec. So this runs the real client against the real server through a recording proxy,
+//! writes the byte stream as a TCP capture and asks `tshark` what it is. That is how, for
+//! example, `FileDirectory`'s `listOfDirectoryEntry [0]` is known to be **not** implicitly
+//! tagged — a mistake both halves would share and therefore agree on.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
@@ -164,7 +160,7 @@ fn the_whole_station_bus_dissects_as_what_we_put_in() {
     for needle in [
         "\"mms.vendorName\": \"hupe1980\"",
         // `Status` and `GetCapabilityList` are new encodings that only this crate reads, so
-        // they get the oracle before they get a user (D38).
+        // they get the oracle before they get a user.
         "\"mms.vmdLogicalStatus\": \"0\"",
         "\"mms.vmdPhysicalStatus\": \"0\"",
         "\"mms.listOfCapabilities_item\": \"IEC 61850-8-1:2011+AMD1:2020\"",
@@ -184,12 +180,6 @@ fn the_whole_station_bus_dissects_as_what_we_put_in() {
     }
 }
 
-/// The two report shapes a third party is the only honest reader of.
-///
-/// A data set of **FCDs** reports each member as the structure it is, and a report longer than
-/// the negotiated PDU is split into segments. Both are encodings this crate's client is
-/// otherwise the only reader of, which is precisely the case rule 10 says proves nothing — so
-/// Wireshark reads them here.
 /// An `alternateAccess` — the one part of a `Read` that has no name of its own.
 ///
 /// A dissector is the only third party that can say the two tag sets are the right way round:
@@ -241,6 +231,11 @@ fn an_array_element_read_dissects_as_the_element_it_names() {
     }
 }
 
+/// The two report shapes a third party is the only honest reader of.
+///
+/// A data set of **FCDs** reports each member as the structure it is, and a report longer than
+/// the negotiated PDU is split into segments. This crate's client is otherwise the only reader
+/// of both encodings, so Wireshark reads them here.
 #[test]
 fn segmented_and_structured_reports_dissect_as_what_we_put_in() {
     if common::tshark().is_none() {

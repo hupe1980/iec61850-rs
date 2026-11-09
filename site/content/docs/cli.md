@@ -8,18 +8,14 @@ weight = 60
 cargo install iec61850-rs --features cli
 ```
 
-One binary, `ied`, with subcommands — the shape `ip`, `tc` and `cargo` already taught your
-hands.
-
-Every subcommand works on **capture files**. That is deliberate: it needs no network
-interface, no privileges and no particular operating system, which is why all of it is
-covered by tests on every push. Live capture arrives with the raw-socket adapters and will
-sit behind the same subcommands.
+One binary, `ied`, with subcommands. The process-bus subcommands read and write **capture
+files**, so they need no network interface and no privileges; `ied` does not capture from a
+live interface. The `mms` subcommands and `sim` use TCP.
 
 ## Generate a stream
 
-`ied mu` is a virtual merging unit. It writes a synthetic three-phase sampled-value stream —
-useful for exercising a subscriber, feeding a dissector, or producing a fixture.
+`ied mu` is a virtual merging unit: it writes a synthetic three-phase sampled-value stream into
+a capture.
 
 ```bash
 ied mu stream.pcap --profile f4800s2 --frames 2000
@@ -37,13 +33,9 @@ ied mu stream.pcap --profile f4800s2 --frames 2000
 | `--gm` | — | Publish `gmIdentity`: eight octets as 16 hex digits |
 | `--refr-tm` | off | Publish `refrTm` on every ASDU |
 
-The waveform is three phases 120° apart at nominal frequency, with the currents a tenth of
-the voltages. It is not a power-system simulation; it is a signal that exercises the whole
-encode path and looks like a merging unit to a dissector.
-
-The 9-2LE profiles count samples per *cycle*, so `le80-60` implies a 60 Hz waveform and
-`le80-50` a 50 Hz one; the IEC 61869-9 profiles fix the rate in absolute terms and default to
-50 Hz. `--freq` overrides either.
+The waveform is three phases 120° apart, currents a tenth of the voltages. The 9-2LE profiles
+count samples per cycle, so `le80-60` implies 60 Hz and `le80-50` 50 Hz; the IEC 61869-9
+profiles default to 50 Hz. `--freq` overrides either.
 
 ## Monitor sampled values
 
@@ -53,20 +45,14 @@ svID=MU01 appid=0x4000 dst=01-0C-CD-04-00-00 confRev=1 smpCnt wraps at 4800 (smp
   frames=2000 asdus=4000 (2/frame) last smpCnt=Some(3999) smpSynch=Some(Global) gaps=0 samples lost=0
 ```
 
-This runs **the library's own subscriber state machine** over the capture, so what it reports
-is what a subscribing IED would see — not a second implementation of the same checks that
-could drift from the first.
+It runs the library's own subscriber state machine over the capture. Per stream: frames,
+ASDUs per frame, the last sample counter, the synchronisation state, `gaps` (discontinuities)
+and `samples lost` (the samples inside them). Sync and grandmaster changes are listed
+underneath as timestamped events.
 
-Per stream: how many frames and ASDUs, how many ASDUs each frame carried, where the sample
-counter got to, the synchronisation state, and how many samples went missing. `gaps` counts
-discontinuities; `samples lost` counts the samples inside them, which is the number a
-protection algorithm would need in order to decide whether it can interpolate. Sync and
-grandmaster changes are listed underneath as timestamped events.
-
-Gap detection is modulo the value `smpCnt` wraps at, and the line says where that came from:
-`smpRate` when the stream advertises its rate, `observed` when it does not (9-2LE sends no
-`smpRate`, so the wrap is taken from the highest counter the capture reached), or `given` when
-you pass one.
+Gaps are counted modulo the value `smpCnt` wraps at, and the line says where that came from:
+`smpRate` when the stream advertises it, `observed` when it does not (9-2LE sends no `smpRate`,
+so the highest counter seen is used), or `given` with `--rate`.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -77,8 +63,7 @@ you pass one.
 
 ### Name the channels, from the engineering file
 
-An ASDU's sample block is the data set's members written back to back with nothing on the
-wire to separate them, so without the file it is a run of octets. With it, it is channels:
+With the engineering file, each ASDU's sample block decodes into named channels:
 
 ```bash
 $ ied sv monitor stream.pcap --scd bay.scd
@@ -93,11 +78,9 @@ MU MULD0/LLN0.msvcb01
     …
 ```
 
-The rate, the `confRev` and the layout all come from the `SampledValueControl` and its data
-set, so this works for any fixed-width data set and not only for 9-2LE's. A stream whose
-ASDUs are not the length the file describes is reported rather than decoded — it is
-publishing something other than what it was engineered to publish, and that is a
-commissioning finding.
+The rate, `confRev` and layout come from the `SampledValueControl` and its data set, so any
+fixed-width data set works. A stream whose ASDUs are not the length the file describes is
+reported, not decoded.
 
 ## Decode GOOSE
 
@@ -114,10 +97,8 @@ publisher's timestamp. Frames carrying flags are marked — `sim` for the simula
 `ndsCom` for a publisher that needs commissioning, and `COUNT-MISMATCH` when
 `numDatSetEntries` disagrees with what is actually in the frame.
 
-Behind those lines it runs **the library's own subscriber state machine**, one per stream, so
-the verdict on a frame is what a subscribing IED would decide about it rather than a second
-implementation of the same checks. Anything the state machine rejects is printed where it
-happened:
+The library's subscriber state machine runs per stream, and anything it rejects is printed
+where it happened:
 
 ```text
      4.001ms IED1LD0/LLN0$GO$gcbTrip appid=0x0001 stNum=1 sqNum=0 tal=8ms conf=1 members=1 t=…
@@ -127,10 +108,9 @@ happened:
   last deltas: stDiff=1 sqDiff=0 arrival=0.001ms t=0.000ms sinceChange=0.001ms
 ```
 
-The closing per-stream block is the counters plus the five delta features a substation
-intrusion-detection system is built on — see [GOOSE](@/docs/goose.md#counters-and-the-numbers-an-ids-wants).
-A stream that lost state changes while it was live gets an extra line naming how many, because
-that is lost protection signalling rather than a decoding detail.
+The closing per-stream block is the counters plus five delta features — see
+[GOOSE](@/docs/goose.md#counters-and-the-numbers-an-ids-wants). A stream that lost state
+changes while live gets an extra line saying how many.
 
 ## Decode MMS
 
@@ -152,20 +132,17 @@ $ ied mms sniff station.pcap
 23 request(s), 23 response(s), 115 report(s), 823 value(s)
 ```
 
-The arrow is the direction relative to port 102. Reports repeat, so only the first twenty
-lines of them are printed; the summary counts all of them. A PDU that does not decode is
-counted and named rather than silently skipped — see [MMS](@/docs/mms.md) for what is
-modelled and what is kept as opaque octets.
+The arrow is the direction relative to port 102. Only the first twenty report lines are
+printed; the summary counts all. A PDU that does not decode is counted and named — see
+[MMS](@/docs/mms.md) for what is modelled.
 
-Unsolicited PDUs go through the **same classifier a live client uses**, so an IEC 61850 report
-is printed with its identifier, sequence number and member count, and a command termination is
-named as one. The capture above is an ICCP association, and its reports are data-set reports
-rather than IEC 61850 reports — which the tool says by *not* claiming otherwise.
+Unsolicited PDUs go through the classifier a live client uses: an IEC 61850 report is printed
+with its identifier, sequence number and member count, a command termination is named as one.
+The capture above is ICCP, so its reports are printed as plain data-set reports.
 
 ## Be a server
 
-An SCL file is a working IED. No generated model, no build step, no second description of the
-device to keep in step with the first:
+An SCL file is a working IED:
 
 ```bash
 $ ied sim bay.scd
@@ -174,22 +151,24 @@ IED2 on 127.0.0.1:103 — Edition 2.1 — logical device(s) IED2LD0, IED2LD1
 serving; ^C to stop
 ```
 
-Every IED in the file gets its own port. `--ied` serves just one, `--bind` and `--port` choose
-where, and `--files DIR` serves a directory through the MMS file services — read-only unless
-`--writable`, and sandboxed to that directory either way.
+| Option | Default | Meaning |
+|---|---|---|
+| `--ied` | every IED | Serve only this IED |
+| `--bind` | `127.0.0.1` | Address to listen on |
+| `--port` | 102 | First port; each further IED takes the next |
+| `--files` | — | Serve this directory through the MMS file services, read-only and sandboxed |
+| `--writable` | off | Also allow `FileDelete` in that directory |
+| `--edition` | from the file | `1`, `2` or `2.1` |
 
-The **edition** in the banner is the file's own: `2003` is Edition 1, `2007B` is Edition 2,
-`2007B4` and later Edition 2.1. It decides the report control block's attribute set, so an
-Edition 1 file serves a block with no `ResvTms` and no `Owner` — `--edition 1|2|2.1` overrides
-it.
+The edition is the file's own: `2003` is Edition 1, `2007B` Edition 2, `2007B4` and later
+Edition 2.1. An Edition 1 server's report control blocks have no `ResvTms` and no `Owner`.
 
 ```bash
 $ ied sim valid2003.scd
 IED1 on 127.0.0.1:102 — Edition 1 — logical device(s) IED1CircuitBreaker_CB1, IED1Disconnectors
 ```
 
-A file that engineers **service tracking** says so in the banner, because otherwise those
-objects are four more names in a browse:
+Service-tracking objects the file engineers are listed in the banner:
 
 ```bash
 $ ied sim tracking.icd
@@ -200,9 +179,7 @@ IED1 on 127.0.0.1:102 — Edition 2.1 — logical device(s) IED1LD0
 serving; ^C to stop
 ```
 
-It is a real server: browse it, enable a report control block on it, operate its breaker,
-activate a setting group. That is also how the `ied mms` subcommands are tested in CI — one
-binary talking to itself over a real association, with no device and no network interface.
+It is a full server — browse, report, control, setting groups, files, logs:
 
 ```bash
 $ ied sim relay.icd --port 10102 &
@@ -212,8 +189,8 @@ $ ied mms control 127.0.0.1:10102 IED1LD0/CSWI1.Pos true
 
 ## Talk to a live server
 
-The `mms` client subcommands open a real association — all six OSI layers, the ACSE handshake
-and the MMS `Initiate` — and then ask it something.
+The `mms` subcommands open an association (the OSI stack, ACSE and MMS `Initiate`) and run one
+service.
 
 ```bash
 $ ied mms status 10.0.0.5
@@ -274,9 +251,8 @@ $ ied mms control 10.0.0.5 IED1LD0/CSWI1.Pos true --interlock
 IED1LD0/CSWI1.Pos <- true (command termination + for IED1LD0/CSWI1$CO$Pos$Oper)
 ```
 
-The control model is **not** guessed: with neither `--model` nor `--scd`, the server's own
-`ctlModel` is read first, so a select-before-operate object gets its select. Give `--model` or
-`--scd` to save the round trip.
+With neither `--model` nor `--scd`, `mms control` reads the object's `ctlModel` from the
+server first, so a select-before-operate object gets its select.
 
 ```bash
 $ ied mms type 10.0.0.5 IED1LD0/CSWI1.Pos.Oper --fc CO
@@ -320,50 +296,51 @@ IED1LD0/LLN0$SP$SGCB
   CnfEdit false
 ```
 
-`mms type` is `GetVariableAccessAttributes` — the shape a write has to match, read from the
-device rather than remembered. `mms get` writes to a file, or to standard output when no
-destination is given, and `--max-size` bounds what it will hold. `mms log` prints the entries
-oldest first and follows `moreFollows` to the end, with the **reason** each was made for beside
-its `EntryID` when the log control block records one; `--lcb` also reads the log control block,
-which is where a log's own start time comes from. `mms sg` prints the setting group control
-block, and `--activate`/`--edit` are the two things you do to one; with no reference it finds
-the `SGCB` in the server's first logical device.
+- `mms type` is `GetVariableAccessAttributes`.
+- `mms get` writes to a file, or to standard output without a destination.
+- `mms log` prints entries oldest first, following `moreFollows`, with each entry's reason
+  code when recorded; `--lcb` also reads the log control block.
+- `mms sg` prints the setting group control block; without a reference it uses the `SGCB` of
+  the server's first logical device.
+- `mms report --rcb` enables the block and decodes every report field, joining segmented
+  reports. Without `--rcb` it only listens.
+- `browse` follows `moreFollows` paging to the end.
 
-`--rcb` enables the control block, `--gi` asks for a general interrogation, and every report
-field is decoded rather than printed as a list of anonymous values. A report the server splits
-across segments is joined before it is printed. Without `--rcb` the tool
-only listens, which is what you want when another client already enabled the block.
-
-A control that the substation **refuses** is an error with a name and a non-zero exit, not a
-successful write:
+A refused control is an error with a name and a non-zero exit:
 
 ```bash
 $ ied mms control 10.0.0.5 IED1LD0/CSWI1.Pos true --model sbo-enhanced
 ied: IED1LD0/CSWI1.Pos: refused — BlockedByInterlocking (AddCause 10)
 ```
 
-The engineering file can supply the addressing, which is the part most often wrong when an
-association is refused for no stated reason — and with a host of `-` it supplies the address
-too:
+`--scd` takes the OSI selectors and AP-title from the engineering file; with a host of `-`, the
+IP address too:
 
 ```bash
 $ ied mms browse - --scd bay.scd --ied IED1
 ```
 
-The host may omit the port; 102 is the default. A reference is either the dotted ACSI form
-with `--fc`, or the MMS `LN$FC$DO$DA` form, which carries its own. A read defaults to `ST`;
-`write` has no default and insists on `--fc`, because the constraint decides whether the write
-is allowed at all — `ST` and `MX` are what the process reports, and a conforming server refuses
-a client's write to them (IEC 61850-7-2 §5.7). Settings are `SP` or `SE`, configuration `CF`,
-descriptions `DC`, controls `CO`. `--password` sends the
-IEC 61850-8-1 ACSE password; `--local-tsel` and `--remote-tsel` set the OSI transport
-selectors when a device wants something other than `0001`.
+The port defaults to 102. A reference is either the dotted ACSI form with `--fc`, or the MMS
+`LN$FC$DO$DA` form, which carries its own. Reads default to `ST`; `write` requires `--fc`,
+because a conforming server refuses writes to `ST` and `MX` (IEC 61850-7-2 §5.7). Settings are
+`SP` or `SE`, configuration `CF`, descriptions `DC`, controls `CO`.
 
-`browse` follows `moreFollows` paging, so what it prints is the whole model and not the first
-page of it.
-
-Every one of these is exercised in CI against [`ied sim`](#be-a-server) — the binary talking
-to itself, with no device and no network interface.
+| Option | Default | Meaning |
+|---|---|---|
+| `--fc` | `ST` for reads | Functional constraint of a dotted reference |
+| `--type` | `bool` | How `write` encodes the value: `bool`, `int`, `uint`, `float`, `string` |
+| `--password` | — | IEC 61850-8-1 ACSE password |
+| `--timeout` | 30 s | How long to wait for an answer |
+| `--seconds` | 30 | How long `report` listens |
+| `--rcb`, `--buffered`, `--data-set`, `--intg-pd`, `--gi` | — | `report`: block to enable, BR, data set, integrity period, general interrogation |
+| `--model` | read from the server | `direct`, `sbo`, `direct-enhanced`, `sbo-enhanced` |
+| `--orcat`, `--orident` | `3`, `ied` | Originator category and identifier |
+| `--synchro`, `--interlock`, `--test` | off | Control check and test flags |
+| `--max-size` | 16 MiB | Largest file `get` reads |
+| `--activate`, `--edit` | — | `sg`: activate or reserve a setting group |
+| `--lcb`, `--entries` | —, 1000 | `log`: also read the control block; stop after N entries |
+| `--scd`, `--ied` | — | Addressing from the engineering file |
+| `--local-tsel`, `--remote-tsel` | `0001` | OSI transport selectors |
 
 ## Summarise a capture
 
@@ -374,9 +351,7 @@ bay.pcap: 79 frames over 8.261 s
   2 process-bus frames per second
 ```
 
-What is in the file, and at what rate. The frame rate is the first thing to check when a
-process bus misbehaves: a merging unit that should be sending 2400 frames a second and is
-sending 1200 has already told you what is wrong.
+What the capture contains, and at what rate.
 
 ## Inspect and validate SCL
 
@@ -395,13 +370,9 @@ IED IED1 (ACME Relay, config 1.0)
       ReportControl brcb01 buffered=true confRev=2 bufTime=50ms
 ```
 
-The bracketed name beside each data object is its **common data class** — `DPC` is a
-controllable double point, `MV` a measurand, `BTS` a buffered-report *tracker*. It is the first
-thing anyone reading an unfamiliar file wants next to the name, and it is what the server uses
-to find the service-tracking objects.
+The bracketed name beside each data object is its common data class (`DPC`, `MV`, `BTS`, …).
 
-`scl validate` loads every IED and reports what the file gets wrong. Not what the XML schema
-already catches — what it happily accepts:
+`scl validate` loads every IED and reports engineering errors the XML schema does not catch:
 
 ```bash
 $ ied scl validate bay.scd
@@ -420,9 +391,10 @@ bay.scd: SCL 2007B4, 3 IED(s)
 | `DuplicateAppid` | One APPID on two addresses — legal, and almost always a copy-and-paste (warning) |
 | `MissingDataSet` | A control block naming a data set that does not exist, or none at all — a report and log control block is checked as strictly as a publisher |
 | `MissingLog` | A `LogControl` whose `logName` names no `Log`: every entry it makes is dropped |
+| `ControlServicesMissing` | A `ctlModel` promising a service its type does not declare — select-before-operate with no `SBOw`, or any control model with no `Oper` |
 | `ReportTriggers` | An `intgPd` with no integrity trigger, a trigger with no period, or no `TrgOps` at all (warning) |
 | `IndexedReportControl` | `RptEnabled max` above one on a block that is not `indexed`: there is one instance whatever the number says, so the file promises clients the device cannot serve (warning) |
-| `DuplicateTypeMember` | A type template declares a member name twice — two `DA`s in one `DOType`, two `DO`s in one `LNodeType`. The schema forbids it; the loader is a fast read path and does not check against the XSD, and a server would publish two variables of one name |
+| `DuplicateTypeMember` | A type template declares a member name twice (two `DA`s in one `DOType`, two `DO`s in one `LNodeType`); a server would publish two variables of one name |
 | `UnresolvedFcda` | A data-set member that does not resolve against the IED's own types |
 | `ObjectReferenceTooLong` | Longer than the edition allows (`--edition 1` is stricter than `2.1`) |
 | `RetransmissionTimes` | `MinTime` at or above `MaxTime`, or absent (warning) |
@@ -430,10 +402,8 @@ bay.scd: SCL 2007B4, 3 IED(s)
 | `VlanPriority` | Below 4: it will not get a trip through a loaded switch (warning) |
 | `UnresolvedSubscription` | An `ExtRef` bound to something this file does not resolve |
 
-Every finding carries a stable code, so a pipeline can forbid a class of them rather than
-grepping prose, and a severity. It exits non-zero on any **error**; warnings alone pass
-unless you add `--strict`. That drops straight into a commissioning pipeline or a pre-commit
-hook.
+Every finding has a stable code and a severity. The command exits non-zero on any error, and
+on warnings with `--strict`.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -441,13 +411,11 @@ hook.
 | `--edition` | `2.1` | Whose object-reference length limit applies (`1`, `2`, `2.1`) |
 | `--strict` | off | Treat warnings as errors |
 
-The same checks are a library function, `scl::validate`, so a build script can run them
-without shelling out.
+The same checks are the library function `scl::validate`.
 
 ## Resolve what an IED subscribes to
 
-`scl subs` answers the question a subscriber actually has: given this SCD and my name, what
-am I supposed to receive and from where?
+`scl subs` lists what an IED receives, and from where:
 
 ```bash
 $ ied scl subs bay.scd IED2
@@ -463,26 +431,17 @@ supervision:
   IED2LD0/LSVS1 (LSVS) -> nothing engineered
 ```
 
-Each `Inputs/ExtRef` is resolved against the publisher's own control block and
-`Communication` address, and grouped by the control block that carries it — with the internal
-address each input is wired to in brackets. Bindings that name a `srcCBName` are taken as
-written; the ones that name only the signal — the majority in a real SCD — are resolved by
-finding which of the publisher's data sets carries that attribute and which control block
-publishes it. Bindings that resolve to nothing (a publisher the
-file does not hold, a control block with no address) are listed as `unresolved` and the
-command exits non-zero, because a dangling binding is a commissioning finding rather than a
-detail.
+Each `Inputs/ExtRef` is resolved against the publisher's control block and `Communication`
+address and grouped by control block, with the internal address in brackets. A binding without
+`srcCBName` is resolved by finding which of the publisher's data sets carries the signal and
+which control block publishes it. Bindings that resolve to nothing are listed as `unresolved`
+and the command exits non-zero.
 
-The `supervision:` section is the other half of the same question: which `LGOS` or `LSVS`
-watches which control block, read from the file's `GoCBRef`/`SvCBRef`. A node that names
-nothing, or names a control block this IED does not subscribe to (`[not subscribed]`), sits at
-`St = false` for ever without saying why.
+`supervision:` lists which `LGOS`/`LSVS` watches which control block (`GoCBRef`/`SvCBRef`);
+one that names nothing, or a block this IED does not subscribe to (`[not subscribed]`), is
+flagged. `--freq` (default 50) is the nominal frequency for reading `smpRate`.
 
-Takes `--freq` for the same reason `mu` does: `smpRate` counts samples per cycle.
-
-## A loop that tests itself
-
-The three commands compose into a check you can run anywhere:
+## Encode, decode, dissect
 
 ```bash
 ied mu /tmp/s.pcap --profile f14400s6 --frames 500   # encode
@@ -491,9 +450,4 @@ ied sv monitor /tmp/s.pcap --scd bay.scd             # …and name every channel
 tshark -r /tmp/s.pcap -Y sv                          # and have Wireshark judge it
 ```
 
-This is what runs in CI on every push. If the encoder and the decoder ever disagree, or if
-Wireshark stops accepting what we emit, it fails there rather than in a substation.
-
-## Not included
-
-Live capture from an interface, and COMTRADE replay in `ied mu`.
+CI runs this loop on every push.

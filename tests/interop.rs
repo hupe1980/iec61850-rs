@@ -1,11 +1,9 @@
 //! Interop against **libiec61850**, in both roles.
 //!
 //! Every other test here proves consistency: the two halves of this crate share one codec, so
-//! they agree by construction, and `tshark` checks the octets but never the *sequence* (D38,
-//! README rule 10). This is the missing third: a client nobody here wrote, driving this
-//! server; and this client driving a server nobody here wrote.
-//!
-//! What each test guards is on the test; why the whole file exists is D52 and D53.
+//! they agree by construction, and `tshark` checks the octets but never the *sequence*. This
+//! is the missing third: a client nobody here wrote, driving this server; and this client
+//! driving a server nobody here wrote. What each test guards is on the test.
 //!
 //! **Running it.** Point `IEC61850_LIBIEC61850` at a built checkout — `git clone
 //! https://github.com/mz-automation/libiec61850 && make examples && make -C
@@ -15,7 +13,7 @@
 //! is what CI sets: an oracle that can quietly stop running is not an oracle.
 //!
 //! Nothing from libiec61850 is copied here. The models the tests serve are **its** files, read
-//! out of its tree: engineering documents this author did not write (README rule 11), and the
+//! out of its tree: engineering documents this author did not write, and the
 //! namespace its examples expect.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
@@ -166,8 +164,8 @@ fn libiec61850_browses_and_reads_this_server() {
         assert!(names.contains(expected), "`{expected}` missing from the browse: {names}");
     }
 
-    // A structured read, through their decoder. `AnIn1` is the case that used to fail: its
-    // `mag$f` is a `floating-point`, and its *type* was encoded with the wrong tags.
+    // A structured read, through their decoder. `AnIn1`'s `mag$f` is a `floating-point`, whose
+    // *type* encoding is easy to get wrong.
     let read = run(&root, "examples/mms_utility/mms_utility", &["-h", host, "-p", port, "-a", "simpleIOGenericIO", "-r", "GGIO1$MX$AnIn1"]);
     assert!(read.contains("Read SUCCESS"), "their client could not read a measurand: {read}");
 }
@@ -326,7 +324,7 @@ fn this_client_drives_a_libiec61850_server() {
     let value = c.read("simpleIOGenericIO/GGIO1$MX$AnIn1", Fc::MX).expect("Read");
     assert!(value.members().is_some_and(|m| m.len() >= 2), "a measurand is a structure: {value:?}");
 
-    // …and its *shape*, which is the service the wrong `floating-point` tags used to hang.
+    // …and its *shape*, which wrong `floating-point` tags would hang.
     let spec = c.variable_type("simpleIOGenericIO/GGIO1$MX$AnIn1", Fc::MX).expect("GetVariableAccessAttributes");
     assert_eq!(spec.component_names(), ["mag", "q", "t"], "{spec:?}");
     assert!(spec.component("mag").and_then(|m| m.component("f")).is_some(), "the float is where the type says it is");

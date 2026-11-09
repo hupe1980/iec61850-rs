@@ -278,10 +278,9 @@ fn the_steady_state_allocates_nothing() {
 
 /// A file service costs the **chunk**, not the record.
 ///
-/// `FileOpen` used to read the whole file into the handle, so a client that opened a 200 MB
-/// COMTRADE record five times on ten associations had made the server allocate ten gigabytes
-/// — remotely, and with no limit anywhere to stop it. The store now reads ranges, so an open
-/// costs a path and a read costs one chunk whatever the file's size.
+/// The store reads ranges, so an open costs a path and a read costs one chunk whatever the
+/// file's size — a client opening a 200 MB COMTRADE record on many associations cannot make
+/// the server allocate the record each time.
 ///
 /// This is a claim about octets rather than calls: a count of allocations cannot tell a
 /// four-megabyte one from a one-kilobyte one, which is exactly the difference at stake.
