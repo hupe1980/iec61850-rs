@@ -85,6 +85,7 @@ impl Outbox {
         Outbox { slots: (0..OUTBOX_FRAMES).map(|_| Vec::new()).collect(), head: 0, len: 0, dropped: 0 }
     }
 
+    #[cfg(any(feature = "goose", feature = "sv"))]
     fn push(&mut self, frame: &[u8]) {
         if self.len == OUTBOX_FRAMES {
             self.dropped += 1;
