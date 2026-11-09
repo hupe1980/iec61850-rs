@@ -12,7 +12,7 @@ matter to a device on the other end of a substation LAN rather than to a compile
 
 ## [Unreleased]
 
-## [0.4.0] — unreleased
+## [0.4.0] — 2026-11-09
 
 GOOSE and SV leave the capture file, the server sends what its control blocks describe and
 receives files, the log survives a restart, and SCL can be edited without being reformatted.
