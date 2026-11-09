@@ -2530,13 +2530,14 @@ fn merging_unit(target: MuTarget<'_>, args: &[&str]) -> Result<(), String> {
             format!("wrote {} frames to {path}", opt.frames)
         }
         MuSink::Live { mut link, launch, .. } => {
-            let late = if launch { link.launch_errors().map_err(|e| e.to_string())? } else { 0 };
-            format!(
-                "sent {} frames on {}{}",
-                opt.frames,
-                link.interface(),
-                if late > 0 { format!(" ({late} missed their launch time)") } else { String::new() }
-            )
+            let late = if launch { link.launch_errors().map_err(|e| e.to_string())? } else { iec61850_rs::net::LaunchErrors::default() };
+            let note = match (late.missed, late.invalid) {
+                (0, 0) => String::new(),
+                (m, 0) => format!(" ({m} missed their launch time)"),
+                (0, i) => format!(" ({i} refused by the qdisc)"),
+                (m, i) => format!(" ({m} missed their launch time, {i} refused by the qdisc)"),
+            };
+            format!("sent {} frames on {}{note}", opt.frames, link.interface())
         }
     };
     println!(

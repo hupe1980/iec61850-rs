@@ -13,9 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # rawether, the raw Ethernet crate behind the `net` feature, is a path dependency at
-      # ../rawether; cargo resolves it even when the feature is off.
-      - run: git clone --depth 1 https://github.com/hupe1980/rawether "$GITHUB_WORKSPACE/../rawether"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -89,9 +86,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # rawether, the raw Ethernet crate behind the `net` feature, is a path dependency at
-      # ../rawether; cargo resolves it even when the feature is off.
-      - run: git clone --depth 1 https://github.com/hupe1980/rawether "$GITHUB_WORKSPACE/../rawether"
       - uses: dtolnay/rust-toolchain@stable
       # Every peer — libiec61850 on both buses, IEC61850bean, csp0924 — is an image built from
       # its Dockerfile under tests/interop/ by the test itself, pinned by release and SHA-256;
@@ -105,9 +99,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # rawether, the raw Ethernet crate behind the `net` feature, is a path dependency at
-      # ../rawether; cargo resolves it even when the feature is off.
-      - run: git clone --depth 1 https://github.com/hupe1980/rawether "$GITHUB_WORKSPACE/../rawether"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: thumbv7em-none-eabihf
@@ -116,18 +107,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # rawether, the raw Ethernet crate behind the `net` feature, is a path dependency at
-      # ../rawether; cargo resolves it even when the feature is off.
-      - run: git clone --depth 1 https://github.com/hupe1980/rawether "$GITHUB_WORKSPACE/../rawether"
       - uses: dtolnay/rust-toolchain@1.90.0
       - run: cargo check --all-features
   fuzz-smoke:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # rawether, the raw Ethernet crate behind the `net` feature, is a path dependency at
-      # ../rawether; cargo resolves it even when the feature is off.
-      - run: git clone --depth 1 https://github.com/hupe1980/rawether "$GITHUB_WORKSPACE/../rawether"
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo install cargo-fuzz --locked
       # Every target in `fuzz/fuzz_targets/`, discovered rather than listed: a target added
@@ -144,8 +129,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # rawether, the raw Ethernet crate behind the `net` feature, is a path dependency at
-      # ../rawether; cargo resolves it even when the feature is off.
-      - run: git clone --depth 1 https://github.com/hupe1980/rawether "$GITHUB_WORKSPACE/../rawether"
       - uses: dtolnay/rust-toolchain@stable
       - run: scripts/linux-test.sh

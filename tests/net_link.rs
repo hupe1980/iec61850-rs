@@ -192,7 +192,11 @@ fn an_open_link_survives_dropping_the_capability() {
     }
     let mut rx = Link::open(&peer, &LinkOptions::goose().join(GOOSE_DST).receive(receive())).unwrap();
     let tx = Link::open(&iface, &LinkOptions::goose()).unwrap();
-    iec61850_rs::net::drop_capabilities().unwrap();
+    // libtest's main thread exists and still holds the capability, so the drop reports it
+    // rather than claiming the process is unprivileged — and has still dropped this thread's.
+    // The whole-process case is `ied sim --iface`, checked thread by thread below.
+    let err = iec61850_rs::net::drop_capabilities().expect_err("another thread is privileged");
+    assert!(err.to_string().contains("still hold capabilities"), "{err}");
     let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
     for cap in ["CapEff:", "CapPrm:"] {
         assert!(status.lines().any(|l| l.starts_with(cap) && l.ends_with("0000000000000000")), "{status}");

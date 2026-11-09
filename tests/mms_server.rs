@@ -571,10 +571,9 @@ fn an_application_hook_refuses_with_the_cause_it_chooses() {
     c.release().unwrap();
 }
 
-/// The `AddCause` a server sends is one its edition defines: an Edition 1 client sent an Edition
-/// 2 code reads it as unknown, so an Edition 1 server sends the Edition 1 value instead.
+/// A refusal's `AddCause` goes out as the hook gave it, whatever edition is served.
 #[test]
-fn a_refusal_carries_an_add_cause_the_served_edition_defines() {
+fn a_refusal_carries_its_add_cause_unmapped_at_every_edition() {
     use iec61850_rs::client::{AddCause, ControlModel};
     use iec61850_rs::common::Edition;
     use iec61850_rs::model::IedModel;
@@ -596,16 +595,13 @@ fn a_refusal_carries_an_add_cause_the_served_edition_defines() {
         }
     }
 
-    // Defined in every edition: unchanged.
-    assert_eq!(refused(Edition::Ed1, AddCause::BlockedByInterlocking), AddCause::BlockedByInterlocking);
-    // Edition 2 only: the Edition 1 server falls back, the Edition 2.1 server does not.
-    assert_eq!(refused(Edition::Ed2_1, AddCause::LockedByOtherClient), AddCause::LockedByOtherClient);
-    assert_eq!(refused(Edition::Ed1, AddCause::LockedByOtherClient), AddCause::Unknown);
-    assert_eq!(refused(Edition::Ed2_1, AddCause::ObjectAlreadySelected), AddCause::ObjectAlreadySelected);
-    assert_eq!(refused(Edition::Ed1, AddCause::ObjectAlreadySelected), AddCause::SelectFailed);
-    // Past the named list: only Edition 2.1 passes it through.
-    assert_eq!(refused(Edition::Ed2_1, AddCause::Other(40)), AddCause::Other(40));
-    assert_eq!(refused(Edition::Ed2, AddCause::Other(40)), AddCause::Unknown);
+    // Every cause goes out as it is, at every edition: which values Edition 1 defines is not
+    // established by any public source, and libiec61850 does not map either.
+    for edition in [Edition::Ed1, Edition::Ed2, Edition::Ed2_1] {
+        for cause in [AddCause::BlockedByInterlocking, AddCause::LockedByOtherClient, AddCause::ObjectAlreadySelected, AddCause::Other(40)] {
+            assert_eq!(refused(edition, cause), cause, "{cause:?} at {edition:?}");
+        }
+    }
 }
 
 /// The `errorClass` tags the server answers with are ISO 9506-2's: `definition [2]`,

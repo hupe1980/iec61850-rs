@@ -246,6 +246,6 @@ fn the_openscd_edition_pair_serves_the_add_causes_of_its_edition() {
         let name = scl.ied_names().into_iter().next().unwrap_or_else(|| panic!("{file} has an IED"));
         let ied = Ied::new(IedModel::from_scl(&xml, Some(&name)).unwrap()).unwrap();
         assert_eq!(ied.edition(), edition, "{file}");
-        assert_eq!(AddCause::ObjectAlreadySelected.for_edition(ied.edition()), already_selected, "{file}");
+        assert_eq!(AddCause::ObjectAlreadySelected.for_edition(ied.edition()), already_selected, "{file}: the mapping a caller may apply");
     }
 }

@@ -219,10 +219,10 @@ Ed 1    RptID RptEna Resv DatSet ConfRev OptFlds BufTm SqNum TrgOps IntgPd GI
 ```
 
 `--edition 1|2|2.1` or `Ied::with_edition` overrides the file. The edition also sets the
-object-reference length limit and the `AddCause` values a refusal may carry: Edition 1 defines
-0–18, so an Edition 1 server sends `ObjectAlreadySelected` as `SelectFailed` and any other newer
-cause — including one the control hook returns — as `Unknown`. `AddCause::for_edition` is the
-mapping; `AddCause::since` names the edition that introduced a value.
+object-reference length limit. A refusal's `AddCause` goes out as it is at every edition, as
+libiec61850 sends it: which values Edition 1 defines is not settled by a public source.
+`AddCause::since` and `AddCause::for_edition` give the commonly assumed boundary (0–18) and a
+fallback, for a caller that has to map for an Edition 1 client.
 
 ## Errors and rejects
 

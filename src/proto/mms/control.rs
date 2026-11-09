@@ -333,7 +333,7 @@ pub enum AddCause {
     InconsistentParameters,
     LockedByOtherClient,
     /// A value above 27, outside the list this crate names. Edition 2.1 lets the list be
-    /// extended; an older server never sends one ([`AddCause::for_edition`]).
+    /// extended.
     Other(i64),
 }
 
@@ -428,7 +428,9 @@ impl AddCause {
     /// The only Edition 2 value with an exact Edition 1 counterpart is
     /// `ObjectAlreadySelected`, which an Edition 1 server reports as `SelectFailed`; every
     /// other newer value becomes `Unknown`, the code each edition defines for "no better
-    /// answer". The fallbacks are ⚠ until IEC 61850-8-1 Ed2.1 Table 110 is read.
+    /// answer". The boundary and the fallbacks are ⚠ until IEC 61850-8-1 Ed2.1 Table 110 is
+    /// read, so the server does **not** apply this: it sends every cause as it is, as
+    /// libiec61850 does. Map with it yourself if an Edition 1 client needs it.
     #[must_use]
     pub const fn for_edition(self, edition: Edition) -> AddCause {
         let defined = matches!((self.since(), edition), (Edition::Ed1, _) | (Edition::Ed2, Edition::Ed2 | Edition::Ed2_1) | (Edition::Ed2_1, Edition::Ed2_1));

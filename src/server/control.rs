@@ -32,7 +32,7 @@ use core::result::Result;
 
 use super::acsi::AssocId;
 use super::ied::{DATA_ACCESS_DENIED, DATA_ACCESS_VALUE_INVALID, Ied};
-use crate::common::{Edition, Fc, Instant, Now, UtcTime};
+use crate::common::{Fc, Instant, Now, UtcTime};
 use crate::proto::data::Value;
 use crate::proto::mms::control::{AddCause, ControlError, ControlModel, ControlRequest, LastApplError};
 use crate::proto::mms::{AccessResult, Mms, ObjectName, Unconfirmed, VariableAccess, VariableSpecification};
@@ -121,8 +121,6 @@ pub struct Controls {
     /// `respAddCause`. It is taken rather than read, because it describes *one* command and a
     /// second reader would be told about a command that had already been reported.
     last_cause: Option<AddCause>,
-    /// The edition served: every `AddCause` that leaves is one this edition defines.
-    edition: Edition,
 }
 
 /// Hand-written because a [`ControlHook`] is a closure and closures have no `Debug`; the
@@ -136,22 +134,13 @@ impl core::fmt::Debug for Controls {
             .field("sbo_timeout_ms", &self.sbo_timeout_ms)
             .field("pending", &self.pending.len())
             .field("last_cause", &self.last_cause)
-            .field("edition", &self.edition)
             .finish()
     }
 }
 
 impl Default for Controls {
     fn default() -> Controls {
-        Controls {
-            selections: BTreeMap::new(),
-            timed: Vec::new(),
-            hook: None,
-            sbo_timeout_ms: DEFAULT_SBO_TIMEOUT_MS,
-            pending: Vec::new(),
-            last_cause: None,
-            edition: Edition::default(),
-        }
+        Controls { selections: BTreeMap::new(), timed: Vec::new(), hook: None, sbo_timeout_ms: DEFAULT_SBO_TIMEOUT_MS, pending: Vec::new(), last_cause: None }
     }
 }
 
@@ -165,12 +154,6 @@ impl Controls {
     /// Ask `hook` before every select, operate and cancel.
     pub fn on_control(&mut self, hook: ControlHook) {
         self.hook = Some(hook);
-    }
-
-    /// The edition the refusals are encoded for ([`AddCause::for_edition`]). The server sets
-    /// it from its [`Ied`]; an `AddCause` the hook returns is mapped too.
-    pub fn set_edition(&mut self, edition: Edition) {
-        self.edition = edition;
     }
 
     /// How long a selection is held.
@@ -217,7 +200,6 @@ impl Controls {
             let refusal =
                 mode_refusal(behaviour_of(ied, &t.object), t.request.test).map_or_else(|| self.ask(&t.object, Stage::Operate, &t.request, t.model), Err);
             if let Err(cause) = refusal {
-                let cause = cause.for_edition(self.edition);
                 let error = LastApplError {
                     control_object: alloc::format!("{}$Oper", t.object),
                     error: ControlError::Unknown,
@@ -399,7 +381,6 @@ impl Controls {
     /// select and reports the refusal afterwards leaves the client believing it holds a
     /// breaker it does not.
     fn refuse(&mut self, assoc: AssocId, object: &str, request: &ControlRequest, model: ControlModel, stage: Stage, cause: AddCause) -> Result<(), i64> {
-        let cause = cause.for_edition(self.edition);
         self.last_cause = Some(cause);
         let error = LastApplError {
             control_object: alloc::format!("{object}$Oper"),

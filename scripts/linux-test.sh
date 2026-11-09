@@ -5,14 +5,12 @@
 #   scripts/linux-test.sh            # Linux: builds as you, runs the binaries with sudo
 #   scripts/linux-test.sh --docker   # anywhere with Docker: the same inside a Linux container
 #
-# rawether is a path dependency at ../rawether; the container mounts it there too.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 if [[ "${1:-}" == "--docker" ]]; then
-    rawether=$(cd ../rawether && pwd -P)
     exec docker run --rm --cap-add NET_ADMIN --cap-add NET_RAW \
-        -v "$PWD":/src/iec61850-rs -v "$rawether":/src/rawether -w /src/iec61850-rs \
+        -v "$PWD":/src/iec61850-rs -w /src/iec61850-rs \
         -v iec61850-cargo:/usr/local/cargo/registry -v iec61850-target:/target -e CARGO_TARGET_DIR=/target \
         rust:latest bash -c 'command -v ip >/dev/null || { apt-get -qq update && apt-get -qq install -y iproute2 >/dev/null; }; scripts/linux-test.sh --inside'
 fi

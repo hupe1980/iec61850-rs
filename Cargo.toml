@@ -54,7 +54,7 @@ cli = ["std", "pcap", "scl", "goose", "sv", "mms", "client", "server", "log-redb
 # 0.21.2 parses nested elements iteratively; 0.21.1 overflows the stack on deep input.
 roxmltree = { version = "0.21.2", optional = true }
 redb = { version = "4.5", optional = true }
-rawether = { version = "0.1", path = "../rawether", optional = true }
+rawether = { version = "0.1", optional = true }
 
 [dev-dependencies]
 proptest = "1.11"

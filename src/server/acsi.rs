@@ -553,8 +553,7 @@ impl Acsi {
         let mut groups = SettingGroups::new(&ied);
         let logs = Logs::new(&ied);
         let tracking = Tracking::new(&ied);
-        let mut controls = Controls::new();
-        controls.set_edition(ied.edition());
+        let controls = Controls::new();
         let obtains = super::obtain::Obtains::new(cfg.max_obtains, cfg.obtain_timeout_ms);
         let publishers = std::sync::Arc::new(std::sync::Mutex::new(super::process_bus::Publishers::new(&ied)));
         let mut acsi = Acsi {

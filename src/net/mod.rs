@@ -48,7 +48,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use std::time::Duration;
 
-pub use rawether::{RingConfig, RxMode as Receive, RxPath};
+pub use rawether::{RingConfig, RxMode as Receive, RxPath, TxErrors as LaunchErrors};
 
 use crate::common::{Error, Instant, MacAddr, Result, monotonic_now};
 
@@ -299,8 +299,9 @@ impl Link {
         Ok(LinkStats { received: s.received, dropped: s.dropped })
     }
 
-    /// Frames the kernel reported it could not send at their launch time.
-    pub fn launch_errors(&mut self) -> Result<u64> {
+    /// Launch-time frames the kernel dropped since the last call, by reason: the launch time
+    /// had passed (`missed`), or the qdisc refused its parameters (`invalid`).
+    pub fn launch_errors(&mut self) -> Result<LaunchErrors> {
         self.sock.tx_errors().map_err(|e| io(&e))
     }
 }

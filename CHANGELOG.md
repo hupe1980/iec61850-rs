@@ -53,7 +53,11 @@ receives files, the log survives a restart, and SCL can be edited without being 
   (`rename_ied`, `remove_ied`, logical nodes, data sets and members, GOOSE/SV/report/log control
   blocks, `ExtRef` bind/unbind, GSE/SMV/access-point addresses, history items); `Document::edit`
   and `Document::read` give raw access.
-- `AddCause::{since, for_edition}`; `Controls::set_edition`.
+- `AddCause::{since, for_edition}`: the edition a cause was introduced in, and a fallback for
+  an older edition. Both are ⚠ (the IEC 61850-8-1 table is not public); the server does not
+  apply them and sends every cause as it is, as libiec61850 does.
+- `net::LaunchErrors`: launch-time drops by reason (`missed`, `invalid`); `ied mu --iface
+  --launch-time` reports both.
 - CLI: `ied goose sniff --iface`, `ied sv monitor --iface`, `ied mu --iface [--launch-time]`,
   `ied goose publish`, `ied sim --iface/--freq/--log-db/--password`, `ied mms put`,
   `ied scl edit` (dry-run diff, atomic write, refuses an edit that adds a validation error unless
@@ -71,9 +75,6 @@ receives files, the log survives a restart, and SCL can be edited without being 
 
 ### Changed
 
-- ⚠ An Edition 1 server sends only Edition 1 `AddCause` values (0–18): `ObjectAlreadySelected`
-  as `SelectFailed`, any other newer cause as `Unknown` — in `LastApplError` and the control
-  tracker alike.
 - ⚠ Enabling a GoCB/MSVCB the server cannot publish (no address, no fixed SV layout, a unicast
   USVCB) is refused with `object-value-invalid`; deleting a data set a publishing block uses is
   refused.
