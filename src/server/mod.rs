@@ -42,7 +42,7 @@ mod supervision;
 mod tracking;
 mod tree;
 
-pub use acsi::{Acsi, AcsiConfig, Answer, AssocId, SetFilePolicy, error_class};
+pub use acsi::{Acsi, AcsiConfig, Answer, AssocId, FileWritePolicy, error_class};
 pub use control::{ControlEvent, ControlHook, Controls, DEFAULT_SBO_TIMEOUT_MS, Stage, Termination};
 #[cfg(feature = "std")]
 pub use files::DirectoryStore;

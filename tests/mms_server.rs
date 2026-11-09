@@ -2291,7 +2291,7 @@ mod set_file {
     use iec61850_rs::proto::mms::association::{Association, AssociationConfig, AssociationEvent};
     use iec61850_rs::proto::mms::file::{FileAttributes, FileNameBuf};
     use iec61850_rs::proto::mms::{ConfirmedRequest, ConfirmedResponse, Mms, file_error};
-    use iec61850_rs::server::{AcsiConfig, DirectoryStore, Ied, Server, ServerConfig, SetFilePolicy};
+    use iec61850_rs::server::{AcsiConfig, DirectoryStore, FileWritePolicy, Ied, Server, ServerConfig};
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("iec61850-setfile-{tag}-{}", std::process::id()));
@@ -2301,8 +2301,8 @@ mod set_file {
     }
 
     /// A server on `store` with `policy`, accepting `clients` associations.
-    fn serve(store: DirectoryStore, policy: SetFilePolicy, password: Option<&str>, tune: impl FnOnce(&mut AcsiConfig), clients: usize) -> String {
-        let mut acsi = AcsiConfig { set_file: policy, ..AcsiConfig::default() };
+    fn serve(store: DirectoryStore, policy: FileWritePolicy, password: Option<&str>, tune: impl FnOnce(&mut AcsiConfig), clients: usize) -> String {
+        let mut acsi = AcsiConfig { file_write: policy, ..AcsiConfig::default() };
         tune(&mut acsi);
         let mut cfg = ServerConfig { acsi, ..ServerConfig::default() };
         cfg.association.password = password.map(String::from);
@@ -2332,10 +2332,55 @@ mod set_file {
         assert!(left.is_empty(), "left behind: {left:?}");
     }
 
+    /// A writable store is not permission: `FileDelete` obeys the same policy as `SetFile`.
+    #[test]
+    fn file_delete_obeys_the_file_write_policy() {
+        let dir = scratch("delete");
+        let victim = dir.join("SETTINGS/victim.xml");
+        for (policy, password, login, allowed) in [
+            (FileWritePolicy::Off, None, None, false),
+            (FileWritePolicy::Authenticated, None, None, false),
+            (FileWritePolicy::Authenticated, Some("s3cret"), Some("s3cret"), true),
+            (FileWritePolicy::Anyone, None, None, true),
+        ] {
+            std::fs::write(&victim, b"keep").unwrap();
+            let addr = serve(DirectoryStore::new(&dir).writable(), policy, password, |_| {}, 1);
+            let mut cfg = ClientConfig::default();
+            cfg.association.password = login.map(String::from);
+            let mut c = Client::connect_with(&addr, &cfg).expect("associate");
+            let deleted = c.delete_file("SETTINGS/victim.xml");
+            assert_eq!(deleted.is_ok(), allowed, "{policy:?}: {deleted:?}");
+            assert_eq!(victim.exists(), !allowed, "{policy:?}");
+            c.release().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The server's own files — its log, its SCL file — are invisible to clients even when they
+    /// lie under the store's root, and cannot be replaced by `SetFile`.
+    #[test]
+    fn a_hidden_file_is_not_listed_read_deleted_or_replaced() {
+        let dir = scratch("hidden");
+        std::fs::write(dir.join("SETTINGS/server.redb"), b"log").unwrap();
+        std::fs::write(dir.join("SETTINGS/public.xml"), b"pub").unwrap();
+        let store = DirectoryStore::new(&dir).writable().allow_overwrite().hiding(dir.join("SETTINGS/server.redb"));
+        let addr = serve(store, FileWritePolicy::Anyone, None, |_| {}, 1);
+        let mut c = Client::connect(&addr).unwrap();
+        let names: Vec<String> = c.file_directory(None).unwrap().into_iter().map(|f| f.name).collect();
+        assert!(names.iter().any(|n| n == "SETTINGS/public.xml"), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("server.redb")), "{names:?}");
+        assert!(c.read_file("SETTINGS/server.redb", 1 << 20).is_err());
+        assert!(c.delete_file("SETTINGS/server.redb").is_err());
+        assert!(c.set_file("SETTINGS/server.redb", b"evil").is_err());
+        assert_eq!(std::fs::read(dir.join("SETTINGS/server.redb")).unwrap(), b"log", "untouched");
+        c.release().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_client_sends_a_file_and_the_server_stores_it_byte_for_byte() {
         let dir = scratch("happy");
-        let addr = serve(DirectoryStore::new(&dir).writable(), SetFilePolicy::Anyone, None, |_| {}, 1);
+        let addr = serve(DirectoryStore::new(&dir).writable(), FileWritePolicy::Anyone, None, |_| {}, 1);
         let body: Vec<u8> = (0..20_000u32).map(|i| (i * 7 % 251) as u8).collect();
         let mut c = Client::connect(&addr).expect("associate");
         c.set_file("SETTINGS/new.xml", &body).expect("SetFile");
@@ -2353,18 +2398,18 @@ mod set_file {
         std::fs::write(dir.join("SETTINGS/existing.xml"), b"keep").unwrap();
 
         // The default: nobody may send a file.
-        let addr = serve(DirectoryStore::new(&dir).writable(), SetFilePolicy::Off, None, |_| {}, 1);
+        let addr = serve(DirectoryStore::new(&dir).writable(), FileWritePolicy::Off, None, |_| {}, 1);
         let mut c = Client::connect(&addr).unwrap();
         assert_eq!(code(&c.set_file("SETTINGS/x", b"x").unwrap_err()), Some((11, file_error::FILE_ACCESS_DENIED)));
         c.release().unwrap();
 
         // A read-only store under an open policy.
-        let addr = serve(DirectoryStore::new(&dir), SetFilePolicy::Anyone, None, |_| {}, 1);
+        let addr = serve(DirectoryStore::new(&dir), FileWritePolicy::Anyone, None, |_| {}, 1);
         let mut c = Client::connect(&addr).unwrap();
         assert_eq!(code(&c.set_file("SETTINGS/x", b"x").unwrap_err()), Some((11, file_error::FILE_ACCESS_DENIED)));
         c.release().unwrap();
 
-        let addr = serve(DirectoryStore::new(&dir).writable().with_limits(100, 1 << 20), SetFilePolicy::Anyone, None, |_| {}, 1);
+        let addr = serve(DirectoryStore::new(&dir).writable().with_limits(100, 1 << 20), FileWritePolicy::Anyone, None, |_| {}, 1);
         let mut c = Client::connect(&addr).unwrap();
         for bad in ["../escape", "/etc/escape", "SETTINGS/.hidden", "SETTINGS/../escape", "C:/escape"] {
             assert_eq!(code(&c.set_file(bad, b"x").unwrap_err()), Some((11, file_error::FILENAME_SYNTAX_ERROR)), "{bad}");
@@ -2379,7 +2424,7 @@ mod set_file {
         no_leftovers(&dir.join("SETTINGS"));
 
         // With overwrite allowed, the existing file is replaced whole.
-        let addr = serve(DirectoryStore::new(&dir).writable().allow_overwrite(), SetFilePolicy::Anyone, None, |_| {}, 1);
+        let addr = serve(DirectoryStore::new(&dir).writable().allow_overwrite(), FileWritePolicy::Anyone, None, |_| {}, 1);
         let mut c = Client::connect(&addr).unwrap();
         c.set_file("SETTINGS/existing.xml", b"replaced").unwrap();
         c.release().unwrap();
@@ -2391,13 +2436,13 @@ mod set_file {
     fn only_an_authenticated_association_may_send_a_file_under_authenticated() {
         let dir = scratch("auth");
         // A server with no password authenticates nobody, so `Authenticated` admits nobody.
-        let addr = serve(DirectoryStore::new(&dir).writable(), SetFilePolicy::Authenticated, None, |_| {}, 1);
+        let addr = serve(DirectoryStore::new(&dir).writable(), FileWritePolicy::Authenticated, None, |_| {}, 1);
         let mut c = Client::connect(&addr).unwrap();
         assert_eq!(code(&c.set_file("SETTINGS/x", b"x").unwrap_err()), Some((11, file_error::FILE_ACCESS_DENIED)));
         c.release().unwrap();
 
         // With a password, a client without it cannot even associate; one with it may send.
-        let addr = serve(DirectoryStore::new(&dir).writable(), SetFilePolicy::Authenticated, Some("s3cret"), |_| {}, 3);
+        let addr = serve(DirectoryStore::new(&dir).writable(), FileWritePolicy::Authenticated, Some("s3cret"), |_| {}, 3);
         assert!(Client::connect(&addr).is_err(), "no password, no association");
         let mut wrong = ClientConfig::default();
         wrong.association.password = Some(String::from("guess"));
@@ -2468,7 +2513,7 @@ mod set_file {
         let dir = scratch("stall");
         let addr = serve(
             DirectoryStore::new(&dir).writable(),
-            SetFilePolicy::Anyone,
+            FileWritePolicy::Anyone,
             None,
             |c| {
                 c.obtain_timeout_ms = 600;
@@ -2508,7 +2553,7 @@ mod set_file {
     fn a_transfer_whose_association_closes_leaves_nothing() {
         use std::io::{Read, Write};
         let dir = scratch("closed");
-        let addr = serve(DirectoryStore::new(&dir).writable(), SetFilePolicy::Anyone, None, |_| {}, 1);
+        let addr = serve(DirectoryStore::new(&dir).writable(), FileWritePolicy::Anyone, None, |_| {}, 1);
         {
             let mut stream = std::net::TcpStream::connect(&addr).unwrap();
             stream.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
@@ -2577,7 +2622,7 @@ mod set_file {
         use iec61850_rs::proto::mms::obtain_file_error;
         use iec61850_rs::server::{Acsi, Answer};
         let dir = scratch("third");
-        let cfg = AcsiConfig { set_file: SetFilePolicy::Anyone, ..AcsiConfig::default() };
+        let cfg = AcsiConfig { file_write: FileWritePolicy::Anyone, ..AcsiConfig::default() };
         let mut acsi = Acsi::with_config(Ied::from_scl(super::RELAY, Some("IED1")).unwrap(), cfg);
         acsi.set_file_store(Box::new(DirectoryStore::new(&dir).writable()));
         let source = FileNameBuf::from_path("payload").unwrap();

@@ -1099,6 +1099,9 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
     if names.is_empty() {
         return Err(format!("{file}: no IED to serve"));
     }
+    if let Some(dir) = &o.files {
+        guard_files_root(dir, file, o.log_db.as_deref())?;
+    }
 
     let mut servers = Vec::new();
     for (n, name) in names.iter().enumerate() {
@@ -1120,37 +1123,7 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
         let trackers = iec61850_rs::server::Tracking::new(&ied).references();
         // Runs out at 65535 rather than wrapping onto a port already in use.
         let port = u16::try_from(n).ok().and_then(|n| o.port.checked_add(n)).ok_or_else(|| format!("{} IEDs do not fit above port {}", names.len(), o.port))?;
-        // `--writable` lets clients send files: anyone, or only who presents `--password`.
-        let mut cfg = iec61850_rs::server::ServerConfig::default();
-        cfg.association.password.clone_from(&o.password);
-        if o.writable && o.files.is_some() {
-            cfg.acsi.set_file =
-                if o.password.is_some() { iec61850_rs::server::SetFilePolicy::Authenticated } else { iec61850_rs::server::SetFilePolicy::Anyone };
-        }
-        let mut server = Server::bind_with(&format!("{}:{port}", o.bind), ied, &cfg).map_err(|e| format!("{name}: {e}"))?;
-        if let Some(dir) = &o.files {
-            let store = DirectoryStore::new(dir);
-            server.set_file_store(Box::new(if o.writable { store.writable() } else { store }));
-        }
-        if let Some(path) = &o.log_db {
-            // One file per server: redb locks a file to one store. With several IEDs the path is
-            // a directory holding `<IED>.redb`.
-            let path = if names.len() == 1 {
-                std::path::PathBuf::from(path)
-            } else {
-                std::fs::create_dir_all(path).map_err(|e| format!("{path}: {e}"))?;
-                std::path::Path::new(path).join(format!("{name}.redb"))
-            };
-            let store = iec61850_rs::server::RedbLog::open(&path, server.log_references(), iec61850_rs::server::DEFAULT_LOG_CAPACITY)
-                .map_err(|e| format!("{name}: {e}"))?;
-            println!("  log in {}", path.display());
-            server.set_log_store(Box::new(store));
-        }
-        server.set_nominal_hz(o.freq);
-        if let Some(iface) = &o.iface {
-            let link = iec61850_rs::net::Link::open(iface, &iec61850_rs::net::LinkOptions::process_bus()).map_err(|e| format!("{iface}: {e}"))?;
-            server.publish_on(link).map_err(|e| format!("{name}: {e}"))?;
-        }
+        let server = sim_server(&o, file, name, names.len(), port, ied)?;
         let addr = server.local_addr().map_err(|e| e.to_string())?;
         println!("{name} on {addr} — {} — logical device(s) {}", edition_name(edition), devices.join(", "));
         if !trackers.is_empty() {
@@ -1167,7 +1140,8 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
         println!("files from {dir}{mode}");
     }
     if let Some(iface) = &o.iface {
-        // Every link is open; the capability is not needed to keep them.
+        // Every link is open and no thread has been spawned yet, so the drop covers the whole
+        // process; the capability is not needed to keep the links.
         iec61850_rs::net::drop_capabilities().map_err(|e| e.to_string())?;
         println!("GOOSE and sampled values a client enables go out on {iface}");
     }
@@ -1176,12 +1150,103 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
     // One accept thread per server, and this thread parks: a simulator that exits when its
     // first client disconnects is not a simulator.
     let mut handles = Vec::new();
+    let mut watched = Vec::new();
     for server in servers {
+        if o.iface.is_some() {
+            watched.push(server.handle());
+        }
         handles.push(std::thread::spawn(move || server.run()));
+    }
+    if !watched.is_empty() {
+        std::thread::spawn(move || report_dropped_frames(&watched));
     }
     for h in handles {
         if let Ok(Err(e)) = h.join() {
             return Err(e.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// A frame the publisher could not hand out is a fact an operator needs, not a counter nobody
+/// reads: say so whenever the count grows.
+fn report_dropped_frames(servers: &[iec61850_rs::server::ServerHandle]) {
+    let mut reported = 0u64;
+    loop {
+        std::thread::sleep(Duration::from_secs(10));
+        let dropped: u64 = servers.iter().map(iec61850_rs::server::ServerHandle::frames_dropped).sum();
+        if dropped > reported {
+            eprintln!("ied: {dropped} GOOSE/SV frame(s) dropped so far: the publisher could not keep up");
+            reported = dropped;
+        }
+    }
+}
+
+/// One simulated IED's server: its file store, its log and its process-bus link, configured
+/// from the options. A link is registered but not started — `Server::run` starts it, after the
+/// caller has dropped the capability.
+fn sim_server(o: &SimOptions, file: &str, name: &str, ieds: usize, port: u16, ied: Ied) -> Result<Server, String> {
+    // `--writable` lets clients send files: anyone, or only who presents `--password`.
+    let mut cfg = iec61850_rs::server::ServerConfig::default();
+    cfg.association.password.clone_from(&o.password);
+    if o.writable && o.files.is_some() {
+        cfg.acsi.file_write =
+            if o.password.is_some() { iec61850_rs::server::FileWritePolicy::Authenticated } else { iec61850_rs::server::FileWritePolicy::Anyone };
+    }
+    let mut server = Server::bind_with(&format!("{}:{port}", o.bind), ied, &cfg).map_err(|e| format!("{name}: {e}"))?;
+    if let Some(dir) = &o.files {
+        // Hidden as well as refused up front: what the server depends on is never a file a
+        // client can name.
+        let mut store = DirectoryStore::new(dir).hiding(file);
+        if let Some(log) = &o.log_db {
+            store = store.hiding(log);
+        }
+        server.set_file_store(Box::new(if o.writable { store.writable() } else { store }));
+    }
+    if let Some(path) = &o.log_db {
+        // One file per server: redb locks a file to one store. With several IEDs the path is
+        // a directory holding `<IED>.redb`.
+        let path = if ieds == 1 {
+            std::path::PathBuf::from(path)
+        } else {
+            std::fs::create_dir_all(path).map_err(|e| format!("{path}: {e}"))?;
+            std::path::Path::new(path).join(format!("{name}.redb"))
+        };
+        let store = iec61850_rs::server::RedbLog::open(&path, server.log_references(), iec61850_rs::server::DEFAULT_LOG_CAPACITY)
+            .map_err(|e| format!("{name}: {e}"))?;
+        println!("  log in {}", path.display());
+        server.set_log_store(Box::new(store));
+    }
+    server.set_nominal_hz(o.freq);
+    if let Some(iface) = &o.iface {
+        // Registered, not started: the process-bus thread starts with `run`, after the
+        // caller has dropped the capability.
+        let link = iec61850_rs::net::Link::open(iface, &iec61850_rs::net::LinkOptions::process_bus()).map_err(|e| format!("{iface}: {e}"))?;
+        server.publish_on(link).map_err(|e| format!("{name}: {e}"))?;
+    }
+    Ok(server)
+}
+
+/// Refuse a `--files` directory that would let a client reach a file the server depends on —
+/// the served SCL file or the log — or that lies inside the log's own directory.
+fn guard_files_root(dir: &str, scl_file: &str, log_db: Option<&str>) -> Result<(), String> {
+    let canonical = |p: &str| {
+        let path = std::path::Path::new(p);
+        path.canonicalize().ok().or_else(|| {
+            // A log file that does not exist yet: its directory does.
+            let parent = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+            parent.canonicalize().ok().map(|d| d.join(path.file_name().unwrap_or_default()))
+        })
+    };
+    let root = canonical(dir).ok_or_else(|| format!("{dir}: no such directory"))?;
+    let mut guarded = vec![("the SCL file", scl_file)];
+    if let Some(log) = log_db {
+        guarded.push(("the log (--log-db)", log));
+    }
+    for (what, path) in guarded {
+        let Some(real) = canonical(path) else { continue };
+        if real.starts_with(&root) || root.starts_with(&real) {
+            return Err(format!("--files {dir} would expose {what} {path}: serve a directory that holds neither"));
         }
     }
     Ok(())

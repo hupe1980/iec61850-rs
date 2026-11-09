@@ -145,6 +145,9 @@ impl FileStore for NoFiles {
 #[derive(Clone, Debug)]
 pub struct DirectoryStore {
     root: std::path::PathBuf,
+    /// Paths the server itself depends on — its log, its SCL file — that no client may list,
+    /// read, replace or delete even if they lie under the root.
+    hidden: Vec<std::path::PathBuf>,
     writable: bool,
     overwrite: bool,
     max_file_size: u64,
@@ -163,7 +166,14 @@ const INCOMING: &str = ".iec61850-incoming-";
 impl DirectoryStore {
     /// Serve `root`, read-only.
     pub fn new(root: impl Into<std::path::PathBuf>) -> DirectoryStore {
-        DirectoryStore { root: root.into(), writable: false, overwrite: false, max_file_size: DEFAULT_MAX_FILE_SIZE, max_total_size: DEFAULT_MAX_TOTAL_SIZE }
+        DirectoryStore {
+            root: root.into(),
+            hidden: Vec::new(),
+            writable: false,
+            overwrite: false,
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
+            max_total_size: DEFAULT_MAX_TOTAL_SIZE,
+        }
     }
 
     /// Allow `FileDelete` and receiving files (`SetFile`) as well as reading.
@@ -171,6 +181,25 @@ impl DirectoryStore {
     pub fn writable(mut self) -> DirectoryStore {
         self.writable = true;
         self
+    }
+
+    /// Never expose `path` — the server's own log or engineering file, say — to a client, even
+    /// if it lies under the root: it is not listed, read, replaced or deleted. A path that does
+    /// not exist yet is hidden by its absolute name once it does.
+    #[must_use]
+    pub fn hiding(mut self, path: impl AsRef<std::path::Path>) -> DirectoryStore {
+        let path = path.as_ref();
+        let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir().map_or_else(|_| path.to_path_buf(), |d| d.join(path)) };
+        self.hidden.push(absolute);
+        self
+    }
+
+    /// Whether `real` (canonical) is, or is inside, a path the server keeps to itself.
+    fn is_hidden(&self, real: &std::path::Path) -> bool {
+        self.hidden.iter().any(|h| {
+            let h = h.canonicalize().unwrap_or_else(|_| h.clone());
+            real == h || real.starts_with(&h)
+        })
     }
 
     /// Let a received file replace an existing one (atomically). Off by default: a `SetFile`
@@ -210,7 +239,7 @@ impl DirectoryStore {
         let joined = self.root.join(path);
         let real = joined.canonicalize().ok()?;
         let root = self.root.canonicalize().ok()?;
-        real.starts_with(&root).then_some(real)
+        (real.starts_with(&root) && !self.is_hidden(&real)).then_some(real)
     }
 
     /// The path a client would name a file under the root by.
@@ -254,7 +283,7 @@ impl DirectoryStore {
     }
 
     fn resolve_ok(&self, real: &std::path::Path) -> bool {
-        self.root.canonicalize().is_ok_and(|root| real.starts_with(&root))
+        self.root.canonicalize().is_ok_and(|root| real.starts_with(&root)) && !self.is_hidden(real)
     }
 }
 
@@ -336,6 +365,9 @@ impl FileStore for DirectoryStore {
             return Err(FileError::Denied);
         }
         let dest = dir.join(name);
+        if self.is_hidden(&dest) {
+            return Err(FileError::Denied);
+        }
         match std::fs::symlink_metadata(&dest) {
             Ok(_) if !self.overwrite => return Err(FileError::Exists),
             Ok(meta) if !meta.file_type().is_file() => return Err(FileError::Denied),

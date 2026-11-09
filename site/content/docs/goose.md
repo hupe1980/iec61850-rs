@@ -292,8 +292,11 @@ A server publishes its own GoCBs: once a client writes `GoEna` — or the applic
 through a transaction — the block's data set goes out from the address the SCL file gives it,
 a member change is a new state, and the retransmission curve runs on its own.
 `Server::publish_on(link)` sends on an interface, `Server::publish_to(sink)` anywhere else
-(a capture, a test). Writing `true` again restarts nothing; a block the file gives no address
-is refused with `object-value-invalid`.
+(a capture, a test); either starts its thread with `Server::run`, so open the link, register
+it, call `net::drop_capabilities()` and then serve. Frames wait in a bounded outbox, so none is
+overwritten before it is sent, and `Server::frames_dropped()` counts any the outbox could not
+take. Writing `true` again restarts nothing; a block the file gives no address is refused with
+`object-value-invalid`.
 
 ## Not included
 

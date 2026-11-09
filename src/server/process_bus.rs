@@ -17,9 +17,13 @@
 //!   nothing.
 //! - A block whose data set cannot be published (an address missing from the file, a member
 //!   that is not a fixed-width leaf for SV) is known at load, and enabling it is refused.
+//! - Every frame a publisher produces is copied into a bounded outbox at once, so a second
+//!   tick or commit before the frames are sent cannot overwrite one; a frame the full outbox
+//!   cannot take is counted ([`Publishers::dropped`]), never silently lost.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::ied::{BlockKind, Ied};
@@ -62,12 +66,66 @@ enum State {
     },
 }
 
+/// Frames the outbox holds before it counts a drop: far more than one tick of every block
+/// produces, so a full outbox means nothing is sending them.
+pub const OUTBOX_FRAMES: usize = 64;
+
+/// Frames produced and not yet handed out, in order. The slots are reused, so after the first
+/// frames nothing is allocated.
+#[derive(Debug)]
+struct Outbox {
+    slots: Vec<Vec<u8>>,
+    head: usize,
+    len: usize,
+    dropped: u64,
+}
+
+impl Outbox {
+    fn new() -> Outbox {
+        Outbox { slots: (0..OUTBOX_FRAMES).map(|_| Vec::new()).collect(), head: 0, len: 0, dropped: 0 }
+    }
+
+    fn push(&mut self, frame: &[u8]) {
+        if self.len == OUTBOX_FRAMES {
+            self.dropped += 1;
+            return;
+        }
+        if let Some(slot) = self.slots.get_mut((self.head + self.len) % OUTBOX_FRAMES) {
+            slot.clear();
+            slot.extend_from_slice(frame);
+            self.len += 1;
+        }
+    }
+
+    fn drain(&mut self, mut send: impl FnMut(&[u8])) {
+        while self.len > 0 {
+            if let Some(slot) = self.slots.get(self.head) {
+                send(slot);
+            }
+            self.head = (self.head + 1) % OUTBOX_FRAMES;
+            self.len -= 1;
+        }
+    }
+}
+
+/// Called when frames are waiting, so whatever sends them need not poll.
+#[derive(Clone)]
+pub struct Notify(pub Arc<dyn Fn() + Send + Sync>);
+
+impl core::fmt::Debug for Notify {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Notify")
+    }
+}
+
 /// The publishers of one served IED.
 #[derive(Debug)]
 pub struct Publishers {
     entries: Vec<Entry>,
     source: MacAddr,
     nominal_hz: u32,
+    outbox: Outbox,
+    notify: Option<Notify>,
 }
 
 impl Publishers {
@@ -84,7 +142,30 @@ impl Publishers {
             entry.refusal = check(ied, block.kind, &entry);
             entries.push(entry);
         }
-        Publishers { entries, source: MacAddr([0; 6]), nominal_hz: DEFAULT_NOMINAL_HZ }
+        Publishers { entries, source: MacAddr([0; 6]), nominal_hz: DEFAULT_NOMINAL_HZ, outbox: Outbox::new(), notify: None }
+    }
+
+    /// Call `notify` whenever frames are waiting in the outbox.
+    pub fn set_notify(&mut self, notify: Notify) {
+        self.notify = Some(notify);
+    }
+
+    /// Frames the outbox could not take because nothing drained it — zero on a healthy server.
+    pub fn dropped(&self) -> u64 {
+        self.outbox.dropped
+    }
+
+    /// Move whatever each publisher has pending into the outbox, and say so if anything moved.
+    fn collect(&mut self) {
+        let before = self.outbox.len;
+        for e in &mut self.entries {
+            collect_entry(&mut e.state, &mut self.outbox);
+        }
+        if self.outbox.len > before
+            && let Some(n) = &self.notify
+        {
+            (n.0)();
+        }
     }
 
     /// The source address frames are published from — the interface's. Takes effect for
@@ -141,6 +222,7 @@ impl Publishers {
                 refresh(ied, e, now, t);
             }
         }
+        self.collect();
     }
 
     /// Time passed: retransmit GOOSE whose curve came due and publish SV samples that are due.
@@ -164,7 +246,9 @@ impl Publishers {
                     }
                 }
             }
+            collect_entry(&mut e.state, &mut self.outbox);
         }
+        self.collect();
     }
 
     /// The earliest moment [`Publishers::on_timeout`] has work.
@@ -181,24 +265,27 @@ impl Publishers {
             .min()
     }
 
-    /// Hand every frame ready to send to `send`, in block order.
-    #[cfg_attr(not(any(feature = "goose", feature = "sv")), allow(unused_variables, unused_mut))]
-    pub fn drain(&mut self, mut send: impl FnMut(&[u8])) {
-        for e in &mut self.entries {
-            match &mut e.state {
-                State::Disabled => {}
-                #[cfg(feature = "goose")]
-                State::Goose(p) => {
-                    if let Some(f) = p.poll_transmit() {
-                        send(f);
-                    }
-                }
-                #[cfg(feature = "sv")]
-                State::Sv { publisher, .. } => {
-                    if let Some(f) = publisher.poll_transmit() {
-                        send(f);
-                    }
-                }
+    /// Hand every frame produced since the last drain to `send`, oldest first.
+    pub fn drain(&mut self, send: impl FnMut(&[u8])) {
+        self.outbox.drain(send);
+    }
+}
+
+/// Move one publisher's pending frame, if any, into the outbox.
+#[cfg_attr(not(any(feature = "goose", feature = "sv")), allow(unused_variables))]
+fn collect_entry(state: &mut State, outbox: &mut Outbox) {
+    match state {
+        State::Disabled => {}
+        #[cfg(feature = "goose")]
+        State::Goose(p) => {
+            if let Some(f) = p.poll_transmit() {
+                outbox.push(f);
+            }
+        }
+        #[cfg(feature = "sv")]
+        State::Sv { publisher, .. } => {
+            if let Some(f) = publisher.poll_transmit() {
+                outbox.push(f);
             }
         }
     }

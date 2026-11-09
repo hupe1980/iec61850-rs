@@ -27,14 +27,21 @@ receives files, the log survives a restart, and SCL can be edited without being 
   (`send_at`), drop counters and `net::drop_capabilities()`.
 - ⚠ **The server publishes its GoCBs and MSVCBs.** Enabling `GoEna`/`SvEna` starts the block's
   publisher from the SCL file: GOOSE on change with the file's retransmission curve, SV every
-  sample period. `Server::{publish_on, publish_to, set_source_mac, set_nominal_hz}`,
-  `Acsi::{drain_frames, set_source_mac, publishing}`.
+  sample period. `Server::{publish_on, publish_to, set_source_mac, set_nominal_hz,
+  frames_dropped}`, `ServerHandle::frames_dropped`, `Acsi::{drain_frames, set_source_mac,
+  publishing, frames_dropped}`. Frames wait in a bounded outbox, so no tick or commit can
+  overwrite one before it is sent, and the process-bus thread takes only the publishers' own
+  lock: a commit spending milliseconds in a durable log does not delay a sampled value. The
+  thread starts with `Server::run`, so a link opened and registered before
+  `net::drop_capabilities()` leaves no thread holding the capability.
 - ⚠ **ACSI `SetFile` (MMS `ObtainFile`)** on both sides, **off by default**:
   `Client::{set_file, set_file_path}`; a sans-IO transfer engine on the server
-  (`server::Obtains`) that never blocks other associations; `SetFilePolicy`
-  (`Off`/`Authenticated`/`Anyone`), `AcsiConfig::{set_file, max_obtains, obtain_timeout_ms}`;
+  (`server::Obtains`) that never blocks other associations; `FileWritePolicy`
+  (`Off`/`Authenticated`/`Anyone`), which governs receiving, replacing **and deleting** files,
+  `AcsiConfig::{file_write, max_obtains, obtain_timeout_ms}`;
   `FileStore::create`, `FileWriter`, `DirectoryStore::{allow_overwrite, with_limits}` with size
-  and quota limits, hidden temporaries published only when complete, unsafe paths refused.
+  and quota limits, hidden temporaries published only when complete, unsafe paths refused, and
+  `DirectoryStore::hiding` for files the server itself depends on.
 - ⚠ **Server-side ACSE password**: a server with `AssociationConfig::password` refuses an
   association without it (constant-time comparison); `Negotiated::authenticated`.
 - **`RedbLog`** (feature `log-redb`, in `cli`): the server's log in a redb file that survives a
@@ -73,6 +80,10 @@ receives files, the log survives a restart, and SCL can be edited without being 
 - ⚠ The client answers every confirmed request a server sends it instead of ignoring it.
 - ⚠ A `FileRead` response is bounded by the negotiated PDU and the TSDU limit, not by
   `Limits::max_primitive_len`.
+- ⚠ `FileDelete` obeys the server's file-write policy; a writable store alone no longer lets a
+  client delete.
+- `ied sim` refuses a `--files` directory that holds the served SCL file or the `--log-db` path,
+  hides both from the store besides, and reports dropped GOOSE/SV frames when there are any.
 - ⚠ A log query the store cannot answer is refused with `resource` / `mass-storage-unavailable`.
 - `DirectoryStore` never lists, reads or deletes a dot-file.
 - `MemoryLog` evicts in O(1).
@@ -81,7 +92,9 @@ receives files, the log survives a restart, and SCL can be edited without being 
   `$IEC61850_REFERENCE`; it also fetches `SCL_BaseSimpleTypes.xsd`.
 - The interop tests no longer read a libiec61850 checkout (`IEC61850_LIBIEC61850` is gone);
   `IEC61850_REQUIRE_INTEROP=1` makes a skip a failure, `IEC61850_SKIP_INTEROP=1` skips the peers.
-- Releases publish through crates.io Trusted Publishing.
+- Releases publish through crates.io Trusted Publishing, and `ied` is released to the
+  `hupe1980/tap` Homebrew tap.
+- The interop harness takes another `rawether` checkout from `IEC61850_RAWETHER`.
 
 ### Fixed
 
@@ -99,6 +112,9 @@ receives files, the log survives a restart, and SCL can be edited without being 
 - Every `LogStore` method is fallible (`Result<_, LogError>`); `by_time`/`after_entry` return
   `LogPage`; `purge` and `bounds` are required; `Logs::set_store` takes the `Ied`.
 - `Negotiated`, `ServiceError` and `AcsiConfig` gain fields; `FileStore` gains `create`.
+- `SetFilePolicy` is `FileWritePolicy`, and `AcsiConfig::set_file` is `AcsiConfig::file_write`.
+- `Server::publish_on`/`publish_to` start no thread; the process-bus thread starts with
+  `Server::run` or the first `Server::accept_one`.
 
 ## [0.3.0] — 2026-09-06
 

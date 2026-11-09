@@ -46,13 +46,15 @@ struct Peer {
     authenticated: bool,
 }
 
-/// Who may send this server a file (ACSI `SetFile`, MMS `ObtainFile`).
+/// Who may change this server's files: receive one (ACSI `SetFile`, MMS `ObtainFile`), replace
+/// one, or delete one (`FileDelete`).
 ///
 /// A client that can write files into an IED can replace its settings, so the default is that
-/// nobody can. The store must be writable as well (`DirectoryStore::writable`).
+/// nobody can. The store must be writable as well (`DirectoryStore::writable`); a writable store
+/// alone authorises nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum SetFilePolicy {
+pub enum FileWritePolicy {
     /// Nobody. The default.
     #[default]
     Off,
@@ -454,8 +456,9 @@ pub struct AcsiConfig {
     /// thing a client asking the question can act on. Anything claimed here is a claim: a
     /// capability listed and not implemented is a request that gets a reject.
     pub capabilities: Vec<String>,
-    /// Who may send this server a file. Off by default.
-    pub set_file: SetFilePolicy,
+    /// Who may change this server's files — receive one with `SetFile`, replace one, delete one
+    /// with `FileDelete`. Off by default.
+    pub file_write: FileWritePolicy,
     /// How many files may be received at once, server-wide (one per association).
     pub max_obtains: usize,
     /// How long one file may take to arrive, in milliseconds, before the transfer is abandoned.
@@ -479,7 +482,7 @@ impl Default for AcsiConfig {
             vmd_logical_status: vmd_logical::STATE_CHANGES_ALLOWED,
             vmd_physical_status: vmd_physical::OPERATIONAL,
             capabilities: alloc::vec![String::from("IEC 61850-8-1:2011+AMD1:2020")],
-            set_file: SetFilePolicy::Off,
+            file_write: FileWritePolicy::Off,
             max_obtains: 2,
             obtain_timeout_ms: 30_000,
         }
@@ -501,8 +504,10 @@ pub struct Acsi {
     tracking: Tracking,
     /// The logs it keeps.
     logs: Logs,
-    /// The GOOSE and sampled-value publishers its `GoCB`s and `MSVCB`s drive.
-    publishers: super::process_bus::Publishers,
+    /// The GOOSE and sampled-value publishers its `GoCB`s and `MSVCB`s drive, behind a lock of
+    /// their own: a process-bus thread ticks and drains them without waiting for this
+    /// struct's owner — in particular not for a durable log append inside [`Acsi::commit`].
+    publishers: std::sync::Arc<std::sync::Mutex<super::process_bus::Publishers>>,
     /// Where its files come from. `NoFiles` by default: an IED that has none should say so
     /// rather than expose a filesystem by accident.
     files: Box<dyn FileStore>,
@@ -551,7 +556,7 @@ impl Acsi {
         let mut controls = Controls::new();
         controls.set_edition(ied.edition());
         let obtains = super::obtain::Obtains::new(cfg.max_obtains, cfg.obtain_timeout_ms);
-        let publishers = super::process_bus::Publishers::new(&ied);
+        let publishers = std::sync::Arc::new(std::sync::Mutex::new(super::process_bus::Publishers::new(&ied)));
         let mut acsi = Acsi {
             ied,
             reports,
@@ -732,7 +737,7 @@ impl Acsi {
             ConfirmedRequest::FileOpen { name, position } => self.file_open(assoc, &name.display(), *position),
             ConfirmedRequest::FileRead(frsm_id) => self.file_read(assoc, *frsm_id),
             ConfirmedRequest::FileClose(frsm_id) => self.file_close(assoc, *frsm_id),
-            ConfirmedRequest::FileDelete(name) => self.file_delete(&name.display()),
+            ConfirmedRequest::FileDelete(name) => self.file_delete(assoc, &name.display()),
             ConfirmedRequest::ObtainFile { source_server, source, destination } => self.obtain_file(assoc, now, source_server.is_some(), source, destination),
             ConfirmedRequest::ReadJournal(request) => {
                 let answer = self.read_journal(request);
@@ -753,7 +758,7 @@ impl Acsi {
         let dirty = self.ied.take_dirty();
         // The process bus first: a state change is a GOOSE before it is a report.
         let utc = self.clock.now();
-        self.publishers.on_commit(&self.ied, &dirty, now, utc);
+        self.pubs().on_commit(&self.ied, &dirty, now, utc);
         let wall = self.now(now).entry();
         // Logging first: a log entry records what the model held at the moment of the change,
         // and the report engine writes counters back into the model as it publishes.
@@ -766,7 +771,7 @@ impl Acsi {
 
     /// Time passed: emit whatever a gathering window or an integrity period has made due.
     pub fn on_timeout(&mut self, now: Instant) -> Vec<(AssocId, Vec<u8>)> {
-        self.publishers.on_timeout(now);
+        self.pubs().on_timeout(now);
         self.controls.on_timeout(&mut self.ied, now);
         // An edit reservation nobody released: `ResvTms` is what ends it.
         self.groups.on_timeout(&mut self.ied, now);
@@ -794,7 +799,7 @@ impl Acsi {
         // Both layers own deadlines: a report's gathering window or integrity period, and a
         // selection expiry or a time-activated command. Reporting only one of them is how an
         // event loop sleeps through the other.
-        [self.reports.next_timeout(), self.controls.next_timeout(), self.groups.next_timeout(), self.obtains.next_timeout(), self.publishers.next_timeout()]
+        [self.reports.next_timeout(), self.controls.next_timeout(), self.groups.next_timeout(), self.obtains.next_timeout(), self.pubs().next_timeout()]
             .into_iter()
             .flatten()
             .min()
@@ -803,25 +808,41 @@ impl Acsi {
     /// The source address GOOSE and sampled values are published from: the hardware address of
     /// the interface they go out on.
     pub fn set_source_mac(&mut self, mac: crate::common::MacAddr) {
-        self.publishers.set_source(mac);
+        self.pubs().set_source(mac);
     }
 
     /// The system frequency for a sampled-value block whose `smpRate` counts samples per
     /// period (default 50 Hz).
     pub fn set_nominal_hz(&mut self, hz: u32) {
-        self.publishers.set_nominal_hz(hz);
+        self.pubs().set_nominal_hz(hz);
     }
 
-    /// Hand every GOOSE and sampled-value frame that is due to `send`. Call after
-    /// [`Acsi::commit`] and [`Acsi::on_timeout`]; the frames borrow the publishers' buffers, so
-    /// nothing is allocated.
+    /// Hand every GOOSE and sampled-value frame produced since the last call to `send`, oldest
+    /// first. Frames wait in a bounded outbox ([`Acsi::frames_dropped`] counts what it could not
+    /// take); the slots are reused, so nothing is allocated.
     pub fn drain_frames(&mut self, send: impl FnMut(&[u8])) {
-        self.publishers.drain(send);
+        self.pubs().drain(send);
     }
 
     /// `GoCB`s and `MSVCB`s currently publishing.
     pub fn publishing(&self) -> usize {
-        self.publishers.enabled()
+        self.pubs().enabled()
+    }
+
+    /// GOOSE and sampled-value frames lost because nothing drained them in time — zero on a
+    /// healthy server.
+    pub fn frames_dropped(&self) -> u64 {
+        self.pubs().dropped()
+    }
+
+    /// The publishers' own handle, for a thread that ticks and drains them without this
+    /// struct's lock.
+    pub(crate) fn process_bus(&self) -> std::sync::Arc<std::sync::Mutex<super::process_bus::Publishers>> {
+        std::sync::Arc::clone(&self.publishers)
+    }
+
+    fn pubs(&self) -> std::sync::MutexGuard<'_, super::process_bus::Publishers> {
+        self.publishers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// An association opened, and this is what it calls itself.
@@ -885,13 +906,7 @@ impl Acsi {
         use super::obtain::Refusal;
         use crate::proto::mms::file_error;
         let refuse = |f: Refusal| Answer::ObtainFileError { class: f.class, code: f.code, side: f.side };
-        let authenticated = self.peers.get(&assoc).is_some_and(|p| p.authenticated);
-        let allowed = match self.cfg.set_file {
-            SetFilePolicy::Off => false,
-            SetFilePolicy::Authenticated => authenticated,
-            SetFilePolicy::Anyone => true,
-        };
-        if !allowed {
+        if !self.may_write_files(assoc) {
             return refuse(Refusal::destination(file_error::FILE_ACCESS_DENIED));
         }
         // Fetching from a third party on a client's word would make this server a relay.
@@ -1311,7 +1326,7 @@ impl Acsi {
         if let Some((block, attribute)) = reference.rsplit_once(tree::SEP)
             && matches!(attribute, "GoEna" | "SvEna")
             && value == Value::Boolean(true)
-            && self.publishers.refusal(block).is_some()
+            && self.pubs().refusal(block).is_some()
         {
             return Err(super::ied::DATA_ACCESS_VALUE_INVALID);
         }
@@ -1483,7 +1498,7 @@ impl Acsi {
             let ObjectName::DomainSpecific { domain, item } = name else { continue };
             let reference = alloc::format!("{domain}/{item}");
             // A data set a publisher is sending must outlive the stream.
-            if self.publishers.publishes_data_set(&self.ied, &reference) {
+            if self.pubs().publishes_data_set(&self.ied, &reference) {
                 matched += 1;
                 continue;
             }
@@ -1562,7 +1577,21 @@ impl Acsi {
         if self.handles.len() == before { Answer::NOT_FOUND } else { Answer::FileClose }
     }
 
-    fn file_delete(&mut self, path: &str) -> Answer {
+    /// Whether `assoc` may change files, under [`AcsiConfig::file_write`].
+    fn may_write_files(&self, assoc: AssocId) -> bool {
+        match self.cfg.file_write {
+            FileWritePolicy::Off => false,
+            FileWritePolicy::Authenticated => self.peers.get(&assoc).is_some_and(|p| p.authenticated),
+            FileWritePolicy::Anyone => true,
+        }
+    }
+
+    fn file_delete(&mut self, assoc: AssocId, path: &str) -> Answer {
+        // A writable store is not permission: deleting changes the server's files, which the
+        // same policy as receiving one governs.
+        if !self.may_write_files(assoc) {
+            return Answer::DENIED;
+        }
         if self.files.delete(path) { Answer::FileDelete } else { Answer::DENIED }
     }
 

@@ -149,6 +149,23 @@ pub struct Server {
     listener: TcpListener,
     shared: Arc<Mutex<Shared>>,
     cfg: ServerConfig,
+    /// A process-bus sink registered with [`Server::publish_to`], waiting for the server to
+    /// start serving: its thread is spawned then, not when it is registered.
+    process_bus: Mutex<Option<ProcessBusStart>>,
+}
+
+/// Where the process-bus thread hands its frames.
+type FrameSink = Box<dyn FnMut(&[u8]) + Send>;
+
+/// What the process-bus thread needs, held until [`Server::run`] or [`Server::accept_one`].
+struct ProcessBusStart {
+    sink: FrameSink,
+}
+
+impl core::fmt::Debug for ProcessBusStart {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ProcessBusStart")
+    }
 }
 
 /// A handle the application updates the model through, and asks what the server is doing.
@@ -182,7 +199,12 @@ impl Server {
         let listener = TcpListener::bind(target).map_err(|e| Error::Io(format!("{addr}: {e}")))?;
         let mut acsi = Acsi::with_config(ied, cfg.acsi.clone());
         acsi.set_max_pdu(cfg.association.max_pdu as usize);
-        Ok(Server { listener, shared: Arc::new(Mutex::new(Shared { acsi, outbound: BTreeMap::new(), next_assoc: 1, wake: None })), cfg: cfg.clone() })
+        Ok(Server {
+            listener,
+            shared: Arc::new(Mutex::new(Shared { acsi, outbound: BTreeMap::new(), next_assoc: 1, wake: None })),
+            cfg: cfg.clone(),
+            process_bus: Mutex::new(None),
+        })
     }
 
     /// The address the server is listening on, which is how a caller learns the port it got
@@ -242,8 +264,13 @@ impl Server {
     ///
     /// The `GoCB`s and `MSVCB`s the file declares publish once a client — or the application, with
     /// [`Txn::set`] — writes `GoEna`/`SvEna`. Frames go out from one thread that wakes on the
-    /// publishers' deadlines and on every commit, so a state change is on the wire without
-    /// waiting for a timer. The source address is the link's.
+    /// publishers' deadlines and whenever a frame is queued, so a state change is on the wire
+    /// without waiting for a timer. The source address is the link's.
+    ///
+    /// No thread is started here: the process-bus thread starts with [`Server::run`] (or the
+    /// first [`Server::accept_one`]). Open every link, register it, call
+    /// [`crate::net::drop_capabilities`], then serve — Linux capabilities are per thread, and a
+    /// thread spawned before the drop would keep them.
     #[cfg(feature = "net")]
     pub fn publish_on(&mut self, link: crate::net::Link) -> Result<()> {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.set_source_mac(link.mac());
@@ -256,15 +283,37 @@ impl Server {
     /// thread — the same seam [`Server::publish_on`] uses for a live interface, for anything
     /// else that takes frames: a capture file, a test, another transport. Frames carry the
     /// source address set with [`Server::set_source_mac`] (all zeros by default).
-    pub fn publish_to(&mut self, mut sink: impl FnMut(&[u8]) + Send + 'static) -> Result<()> {
+    ///
+    /// Like [`Server::publish_on`], the thread starts when the server starts serving.
+    pub fn publish_to(&mut self, sink: impl FnMut(&[u8]) + Send + 'static) -> Result<()> {
+        *self.process_bus.lock().unwrap_or_else(PoisonError::into_inner) = Some(ProcessBusStart { sink: Box::new(sink) });
+        Ok(())
+    }
+
+    /// Start the process-bus thread for a registered sink, once.
+    fn start_process_bus(&self) -> Result<()> {
+        let Some(ProcessBusStart { mut sink }) = self.process_bus.lock().unwrap_or_else(PoisonError::into_inner).take() else { return Ok(()) };
         let wake = Arc::new(Wake::default());
-        self.shared.lock().unwrap_or_else(PoisonError::into_inner).wake = Some(Arc::clone(&wake));
-        let shared = Arc::clone(&self.shared);
+        let bus = {
+            let mut guard = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.wake = Some(Arc::clone(&wake));
+            guard.acsi.process_bus()
+        };
+        {
+            let notify = Arc::clone(&wake);
+            bus.lock().unwrap_or_else(PoisonError::into_inner).set_notify(super::process_bus::Notify(Arc::new(move || notify.notify())));
+        }
         std::thread::Builder::new()
             .name(String::from("process-bus"))
-            .spawn(move || publish_loop(&shared, &wake, &mut sink))
+            .spawn(move || publish_loop(&bus, &wake, &mut *sink))
             .map_err(|e| Error::Io(e.to_string()))?;
         Ok(())
+    }
+
+    /// GOOSE and sampled-value frames lost because the publishing thread could not keep up —
+    /// zero on a healthy server.
+    pub fn frames_dropped(&self) -> u64 {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.frames_dropped()
     }
 
     /// The source address of published GOOSE and sampled-value frames.
@@ -279,6 +328,7 @@ impl Server {
 
     /// Accept associations for ever, one thread each.
     pub fn run(&self) -> Result<()> {
+        self.start_process_bus()?;
         loop {
             self.accept_one()?;
         }
@@ -289,6 +339,7 @@ impl Server {
     /// Returns as soon as the connection is handed over, so a test can accept a known number
     /// of clients without a background accept loop it then has to stop.
     pub fn accept_one(&self) -> Result<()> {
+        self.start_process_bus()?;
         let (stream, _) = self.listener.accept().map_err(|e| Error::Io(e.to_string()))?;
         let shared = Arc::clone(&self.shared);
         let cfg = self.cfg.clone();
@@ -321,6 +372,12 @@ impl Server {
 }
 
 impl ServerHandle {
+    /// GOOSE and sampled-value frames lost because the publishing thread could not keep up —
+    /// zero on a healthy server.
+    pub fn frames_dropped(&self) -> u64 {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner).acsi.frames_dropped()
+    }
+
     /// Begin a transaction. Nothing is visible to a client until [`Txn::commit`].
     pub fn txn(&self) -> Txn<'_> {
         Txn { handle: self, writes: Vec::new() }
@@ -457,18 +514,19 @@ fn publish(shared: &mut Shared, now: Instant) {
 }
 
 /// The process-bus thread: run the publishers' timers, hand what they produced to `sink`
-/// outside the lock, and sleep until the next deadline or the next commit.
-fn publish_loop(shared: &Arc<Mutex<Shared>>, wake: &Wake, sink: &mut dyn FnMut(&[u8])) {
+/// outside the lock, and sleep until the next deadline or until a commit queues a frame.
+///
+/// It takes only the publishers' own lock, never the server's: a commit that is appending to
+/// a durable log (an `fsync`) cannot delay a sampled value that is due.
+fn publish_loop(bus: &Arc<Mutex<super::process_bus::Publishers>>, wake: &Wake, sink: &mut dyn FnMut(&[u8])) {
     // One reusable buffer per frame of a tick: after the first ticks nothing is allocated.
     let mut frames: Vec<Vec<u8>> = Vec::new();
     loop {
         let (count, next) = {
-            let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
-            let now = Instant(now_nanos());
-            let due = guard.acsi.on_timeout(now);
-            dispatch(&guard, due);
+            let mut pubs = bus.lock().unwrap_or_else(PoisonError::into_inner);
+            pubs.on_timeout(Instant(now_nanos()));
             let mut count = 0;
-            guard.acsi.drain_frames(|f| {
+            pubs.drain(|f| {
                 if let Some(buf) = frames.get_mut(count) {
                     buf.clear();
                     buf.extend_from_slice(f);
@@ -477,7 +535,7 @@ fn publish_loop(shared: &Arc<Mutex<Shared>>, wake: &Wake, sink: &mut dyn FnMut(&
                 }
                 count += 1;
             });
-            (count, guard.acsi.next_timeout())
+            (count, pubs.next_timeout())
         };
         for frame in frames.iter().take(count) {
             sink(frame);

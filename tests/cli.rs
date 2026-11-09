@@ -863,3 +863,22 @@ fn put_sends_a_file_to_a_writable_simulator() {
     assert!(sent.ok, "{}{}", sent.stdout, sent.stderr);
     assert_eq!(std::fs::read(store.join("settings.xml")).unwrap(), b"<settings/>");
 }
+
+/// `ied sim` refuses a `--files` directory that would expose the served SCL file or the log.
+#[test]
+fn sim_refuses_a_file_store_that_would_expose_its_own_files() {
+    let dir = tempdir("sim-guard");
+    let scl = dir.join("relay.icd");
+    std::fs::write(&scl, include_str!("fixtures/relay.icd")).unwrap();
+    let store = dir.join("store");
+    std::fs::create_dir_all(&store).unwrap();
+
+    let o = run(&["sim", scl.to_str().unwrap(), "--port", "0", "--files", dir.to_str().unwrap()]);
+    assert!(!o.ok && o.stderr.contains("would expose the SCL file"), "{}", o.stderr);
+
+    let log = store.join("relay.redb");
+    let o = run(&["sim", scl.to_str().unwrap(), "--port", "0", "--files", store.to_str().unwrap(), "--log-db", log.to_str().unwrap()]);
+    assert!(!o.ok && o.stderr.contains("would expose the log"), "{}", o.stderr);
+    assert!(!log.exists(), "refused before anything is opened");
+    std::fs::remove_dir_all(&dir).ok();
+}

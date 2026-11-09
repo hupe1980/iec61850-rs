@@ -370,14 +370,14 @@ fn receiving_a_file_costs_a_chunk_not_the_file() {
     use iec61850_rs::common::Instant;
     use iec61850_rs::proto::mms::file::{FileAttributes, FileNameBuf};
     use iec61850_rs::proto::mms::{ConfirmedRequest, ConfirmedResponse, Mms};
-    use iec61850_rs::server::{Acsi, AcsiConfig, Answer, DirectoryStore, Ied, SetFilePolicy};
+    use iec61850_rs::server::{Acsi, AcsiConfig, Answer, DirectoryStore, FileWritePolicy, Ied};
 
     const CHUNK: usize = 4096;
     const CHUNKS: u32 = 64;
     let dir = std::env::temp_dir().join(format!("iec61850-receive-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let cfg = AcsiConfig { set_file: SetFilePolicy::Anyone, ..AcsiConfig::default() };
+    let cfg = AcsiConfig { file_write: FileWritePolicy::Anyone, ..AcsiConfig::default() };
     let mut acsi = Acsi::with_config(Ied::from_scl(MODEL, Some("IED1")).unwrap(), cfg);
     acsi.set_file_store(Box::new(DirectoryStore::new(&dir).writable()));
     let source = FileNameBuf::from_path("big.bin").unwrap();

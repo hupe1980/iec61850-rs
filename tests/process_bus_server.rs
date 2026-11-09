@@ -201,3 +201,102 @@ fn published_frames_dissect_as_the_file_declares() {
     assert!(text.lines().all(|l| l.split('|').nth(5).is_none_or(str::is_empty)), "no expert info: {text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A store as slow as an `fsync` on every append — what a durable log costs inside a commit.
+#[derive(Debug)]
+struct SlowLog(iec61850_rs::server::MemoryLog);
+
+impl iec61850_rs::server::LogStore for SlowLog {
+    fn append(&mut self, log: &str, entry: iec61850_rs::server::NewEntry) -> Result<iec61850_rs::server::LogBounds, iec61850_rs::server::LogError> {
+        std::thread::sleep(Duration::from_millis(3));
+        self.0.append(log, entry)
+    }
+    fn by_time(
+        &self,
+        log: &str,
+        from: Option<iec61850_rs::common::EntryTime>,
+        to: Option<iec61850_rs::common::EntryTime>,
+        limit: usize,
+    ) -> Result<iec61850_rs::server::LogPage, iec61850_rs::server::LogError> {
+        self.0.by_time(log, from, to, limit)
+    }
+    fn after_entry(
+        &self,
+        log: &str,
+        entry_id: u64,
+        at: iec61850_rs::common::EntryTime,
+        limit: usize,
+    ) -> Result<iec61850_rs::server::LogPage, iec61850_rs::server::LogError> {
+        self.0.after_entry(log, entry_id, at, limit)
+    }
+    fn bounds(&self, log: &str) -> Result<Option<iec61850_rs::server::LogBounds>, iec61850_rs::server::LogError> {
+        self.0.bounds(log)
+    }
+    fn len(&self, log: &str) -> Result<usize, iec61850_rs::server::LogError> {
+        self.0.len(log)
+    }
+    fn purge(&mut self, log: &str) -> Result<(), iec61850_rs::server::LogError> {
+        self.0.purge(log)
+    }
+}
+
+/// Sampled values keep their rate, with no sample skipped and no frame dropped, while another
+/// thread commits as fast as it can and every commit spends milliseconds in a durable log —
+/// the process-bus thread never waits for the server's lock.
+#[test]
+fn sampled_values_keep_their_rate_while_commits_wait_on_a_slow_log() {
+    let mut server = Server::bind("127.0.0.1:0", Ied::from_scl(FIXTURE, Some("IED1")).unwrap()).unwrap();
+    server.set_source_mac(SOURCE);
+    let logs = server.log_references();
+    assert!(!logs.is_empty(), "the fixture declares a log");
+    server.set_log_store(Box::new(SlowLog(iec61850_rs::server::MemoryLog::for_logs(logs, 100_000))));
+    let (tx, rx) = channel();
+    server
+        .publish_to(move |f| {
+            let _ = tx.send(f.to_vec());
+        })
+        .unwrap();
+    let handle = server.handle();
+    let addr = server.local_addr().unwrap().to_string();
+    std::thread::spawn(move || server.run());
+    let mut c = Client::connect(&addr).unwrap();
+    c.write("IED1MU/LLN0$MS$msvcb01$SvEna", Fc::MS, &Value::Boolean(true)).unwrap();
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (handle, stop) = (handle.clone(), std::sync::Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let mut n = 0i32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                n = n.wrapping_add(1);
+                handle.txn().set("IED1MU/TCTR1$MX$AmpSv$instMag$i", Value::Integer(n.into())).commit();
+            }
+            n
+        })
+    };
+    let start = Instant::now();
+    let mut frames = Vec::new();
+    while start.elapsed() < Duration::from_millis(1000) {
+        if let Ok(f) = rx.recv_timeout(Duration::from_millis(50)) {
+            frames.push(f);
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let commits = writer.join().unwrap();
+    assert_eq!(handle.frames_dropped(), 0, "no frame dropped");
+    assert!(commits > 50, "the writer committed {commits} times");
+
+    // 4000 frames a second; a scheduler may be late, never lossy.
+    assert!(frames.len() >= 3000, "{} frames in a second of contended commits", frames.len());
+    let mut last: Option<u16> = None;
+    for f in &frames {
+        let frame = Frame::parse(f).unwrap();
+        let pdu = SavPduView::parse(frame.apdu, &Limits::default()).unwrap();
+        let cnt = pdu.asdus().next().unwrap().unwrap().smp_cnt;
+        if let Some(prev) = last {
+            assert_eq!(cnt, (prev + 1) % 4000, "no sample skipped");
+        }
+        last = Some(cnt);
+    }
+    c.release().unwrap();
+}

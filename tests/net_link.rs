@@ -194,12 +194,61 @@ fn an_open_link_survives_dropping_the_capability() {
     let tx = Link::open(&iface, &LinkOptions::goose()).unwrap();
     iec61850_rs::net::drop_capabilities().unwrap();
     let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
-    assert!(status.lines().any(|l| l.starts_with("CapEff:") && l.ends_with("0000000000000000")), "{status}");
+    for cap in ["CapEff:", "CapPrm:"] {
+        assert!(status.lines().any(|l| l.starts_with(cap) && l.ends_with("0000000000000000")), "{status}");
+    }
     let mut p = goose_publisher(tx.mac(), GOOSE_DST);
     p.on_timeout(Instant::ZERO).unwrap();
     tx.send(p.poll_transmit().unwrap()).unwrap();
     assert!(rx.recv(Some(Duration::from_secs(2))).unwrap().is_some());
     assert!(Link::open(&peer, &LinkOptions::goose()).unwrap_err().to_string().contains("CAP_NET_RAW"));
+}
+
+/// Kills the simulator however the test ends, so a failed assertion leaves no process behind
+/// holding the test's output open.
+struct Sim(std::process::Child);
+
+impl Drop for Sim {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// SR-004, for the whole process: `ied sim --iface` opens its link, drops the capability and
+/// only then starts serving and publishing, so no thread of it — effective or permitted, task by
+/// task — keeps `CAP_NET_RAW`. Linux capabilities are per thread, so this is a property of the
+/// program's order, and the program is what is checked (`IEC61850_IED` names the binary).
+#[test]
+fn no_thread_of_ied_sim_keeps_the_capability() {
+    use std::io::{BufRead, BufReader};
+    let (Some((iface, _)), Ok(ied)) = (pair(), std::env::var("IEC61850_IED")) else { return };
+    let scl = std::env::temp_dir().join(format!("iec61850-caps-{}.icd", std::process::id()));
+    std::fs::write(&scl, include_str!("fixtures/process_bus.icd")).unwrap();
+    let mut child = Sim(std::process::Command::new(ied)
+        .args(["sim", scl.to_str().unwrap(), "--ied", "IED1", "--port", "0", "--iface", &iface])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap());
+    let stdout = child.0.stdout.take().unwrap();
+    let banner: Vec<String> = BufReader::new(stdout).lines().map_while(Result::ok).take_while(|l| !l.starts_with("serving")).collect();
+    // The accept loop and the process-bus thread start with `run`, just after the banner.
+    std::thread::sleep(Duration::from_millis(300));
+    let tasks = std::fs::read_dir(format!("/proc/{}/task", child.0.id())).unwrap();
+    let mut seen = Vec::new();
+    for task in tasks.flatten() {
+        let status = std::fs::read_to_string(task.path().join("status")).unwrap();
+        let name = status.lines().find_map(|l| l.strip_prefix("Name:")).unwrap_or("").trim().to_string();
+        for cap in ["CapEff:", "CapPrm:"] {
+            let line = status.lines().find(|l| l.starts_with(cap)).unwrap();
+            assert!(line.ends_with("0000000000000000"), "thread {name} keeps {line}");
+        }
+        seen.push(name);
+    }
+    drop(child);
+    let _ = std::fs::remove_file(&scl);
+    assert!(seen.iter().any(|n| n == "process-bus"), "the publisher thread is running: {seen:?} ({banner:?})");
 }
 
 /// SC-004: retransmitting and receiving in the steady state allocates nothing.

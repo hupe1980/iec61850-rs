@@ -48,6 +48,8 @@
           <FCDA ldInst="MU" lnClass="TCTR" lnInst="2" doName="AmpSv" daName="q" fc="MX"/>
         </DataSet>
         <SampledValueControl name="msvcb01" smvID="IED1MU01" datSet="PhsMeas" confRev="1" smpRate="80" nofASDU="1" smpMod="SmpPerPeriod" multicast="true"/>
+        <LogControl name="lcb01" datSet="PhsMeas" logName="MuLog" logEna="true"><TrgOps dchg="true"/></LogControl>
+        <Log name="MuLog"/>
       </LN0>
       <LN lnClass="TCTR" inst="1" prefix="" lnType="TCTR_T"/>
       <LN lnClass="TCTR" inst="2" prefix="" lnType="TCTR_T"/>
@@ -68,7 +70,7 @@
       <DA name="t" fc="ST" bType="Timestamp"/>
     </DOType>
     <DOType id="SAV_T" cdc="SAV">
-      <DA name="instMag" fc="MX" bType="Struct" type="AnalogueValueI"/>
+      <DA name="instMag" fc="MX" bType="Struct" type="AnalogueValueI" dchg="true"/>
       <DA name="q" fc="MX" bType="Quality"/>
     </DOType>
     <DAType id="AnalogueValueI"><BDA name="i" bType="INT32"/></DAType>

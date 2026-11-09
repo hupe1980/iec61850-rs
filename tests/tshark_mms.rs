@@ -338,14 +338,14 @@ fn exercise(addr: &str, handle: &ServerHandle) {
 /// requester, so the one this crate's client is otherwise the only reader of.
 #[test]
 fn a_set_file_dissects_in_both_directions() {
-    use iec61850_rs::server::{AcsiConfig, ServerConfig, SetFilePolicy};
+    use iec61850_rs::server::{AcsiConfig, FileWritePolicy, ServerConfig};
     if common::tshark().is_none() {
         return;
     }
     let dir = std::env::temp_dir().join(format!("iec61850-oracle-setfile-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create");
-    let cfg = ServerConfig { acsi: AcsiConfig { set_file: SetFilePolicy::Anyone, ..AcsiConfig::default() }, ..ServerConfig::default() };
+    let cfg = ServerConfig { acsi: AcsiConfig { file_write: FileWritePolicy::Anyone, ..AcsiConfig::default() }, ..ServerConfig::default() };
     let mut server = Server::bind_with("127.0.0.1:0", Ied::from_scl(RELAY, Some("IED1")).expect("load"), &cfg).expect("bind");
     server.set_file_store(Box::new(DirectoryStore::new(&dir).writable()));
     let target = server.local_addr().expect("addr").to_string();

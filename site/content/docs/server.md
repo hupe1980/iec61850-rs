@@ -289,8 +289,10 @@ server.set_file_store(Box::new(DirectoryStore::new("/var/lib/ied/records")));
 `DirectoryStore` refuses absolute paths, drive letters, UNC prefixes, backslashes and `..`
 components, and checks that the canonicalised path is still inside the root. Every refusal is
 `object-non-existent`, indistinguishable from a missing file. Nothing whose path has a
-component starting with `.` is ever listed, read or deleted. It is read-only unless
-`.writable()`, which allows `FileDelete` and receiving files.
+component starting with `.` is ever listed, read or deleted, and `.hiding(path)` keeps a file
+the server itself depends on — its log, its SCL file — out of reach even under the root. It is
+read-only unless `.writable()`; even then only an association the file-write policy allows
+(below) may receive, replace or delete a file.
 
 Files are read in ranges: `FileStore` is `list`, `info` and `read_at(path, offset, len)`, so a
 `FileRead` costs one chunk whatever the file's size. Implement it to serve records from anywhere:
@@ -305,17 +307,18 @@ impl FileStore for MyArchive {
 
 The default is `NoFiles`.
 
-### Receiving files (`SetFile`)
+### Changing files (`SetFile`, `FileDelete`)
 
 A client sends a file with ACSI `SetFile` (MMS `ObtainFile`); the server then reads it from the
-client with `FileOpen`/`FileRead`/`FileClose` on the same association and stores it. Nobody may
-by default: `AcsiConfig::set_file` is `SetFilePolicy::Off`, `Authenticated` (only an association
-that presented the server's ACSE password) or `Anyone`, and the store must be writable.
+client with `FileOpen`/`FileRead`/`FileClose` on the same association and stores it. Who may
+send, replace or delete a file is one policy, `AcsiConfig::file_write`: `FileWritePolicy::Off`
+(the default — nobody), `Authenticated` (only an association that presented the server's ACSE
+password) or `Anyone`; the store must be writable as well.
 
 ```rust
-use iec61850_rs::server::{AcsiConfig, DirectoryStore, ServerConfig, SetFilePolicy};
+use iec61850_rs::server::{AcsiConfig, DirectoryStore, ServerConfig, FileWritePolicy};
 
-let mut cfg = ServerConfig { acsi: AcsiConfig { set_file: SetFilePolicy::Authenticated, ..AcsiConfig::default() }, ..ServerConfig::default() };
+let mut cfg = ServerConfig { acsi: AcsiConfig { file_write: FileWritePolicy::Authenticated, ..AcsiConfig::default() }, ..ServerConfig::default() };
 cfg.association.password = Some("s3cret".into());          // every association must present it
 let mut server = Server::bind_with("0.0.0.0:102", ied, &cfg)?;
 server.set_file_store(Box::new(DirectoryStore::new("/var/lib/ied/settings").writable()));

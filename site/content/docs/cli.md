@@ -185,7 +185,7 @@ serving; ^C to stop
 | `--bind` | `127.0.0.1` | Address to listen on |
 | `--port` | 102 | First port; each further IED takes the next |
 | `--files` | — | Serve this directory through the MMS file services, read-only and sandboxed |
-| `--writable` | off | Also allow `FileDelete` in that directory, and receiving files (`SetFile`) |
+| `--writable` | off | Also allow `FileDelete` and receiving files (`SetFile`) in that directory. Refused if the directory holds the SCL file or the `--log-db` path |
 | `--password` | none | Require this ACSE password of every association; with `--writable`, only those may send files |
 | `--edition` | from the file | `1`, `2` or `2.1` |
 | `--log-db` | in memory | Keep the logs in this file across restarts (a directory of `<IED>.redb` files when serving several IEDs) |

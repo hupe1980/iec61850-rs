@@ -31,10 +31,10 @@ bin=$(sed -n 's/.*"executable":"\([^"]*net_link[^"]*\)".*/\1/p' <<<"$json" | tai
 cargo build --features cli --bin ied
 ied="${CARGO_TARGET_DIR:-target}/debug/ied"
 
-export IEC61850_IFACE=iec0 IEC61850_PEER_IFACE=iec1
+export IEC61850_IFACE=iec0 IEC61850_PEER_IFACE=iec1 IEC61850_IED="$ied"
 for rx in ring plain; do
     echo "==> net_link, receive path: $rx"
-    run env IEC61850_IFACE=iec0 IEC61850_PEER_IFACE=iec1 RAWETHER_RX="$rx" "$bin" --test-threads=1
+    run env IEC61850_IFACE=iec0 IEC61850_PEER_IFACE=iec1 IEC61850_IED="$ied" RAWETHER_RX="$rx" "$bin" --test-threads=1
     run env IEC61850_IFACE=iec0 IEC61850_PEER_IFACE=iec1 RAWETHER_RX="$rx" IEC61850_ALLOC_ALONE=1 \
         "$bin" --exact the_live_steady_state_does_not_allocate
 done
