@@ -479,10 +479,12 @@ impl Acsi {
         let mut groups = SettingGroups::new(&ied);
         let logs = Logs::new(&ied);
         let tracking = Tracking::new(&ied);
+        let mut controls = Controls::new();
+        controls.set_edition(ied.edition());
         let mut acsi = Acsi {
             ied,
             reports,
-            controls: Controls::new(),
+            controls,
             groups: SettingGroups::default(),
             tracking,
             logs,

@@ -227,3 +227,25 @@ fn subscriptions_resolve_signal_bound_ext_refs_in_the_corpus() {
     assert!(g.ext_refs.iter().all(|x| x.src_cb_name.is_none()), "these are the signal-bound ones");
     assert!(subs.unresolved.is_empty(), "{:#?}", subs.unresolved);
 }
+
+/// The edition a server built from a file serves is the file's, and it decides which control
+/// refusal codes go out: `valid2003.scd` gives an Edition 1 server, `valid2007B4.scd` an
+/// Edition 2.1 one.
+#[cfg(feature = "server")]
+#[test]
+fn the_openscd_edition_pair_serves_the_add_causes_of_its_edition() {
+    use iec61850_rs::proto::mms::control::AddCause;
+    use iec61850_rs::server::Ied;
+
+    for (file, edition, already_selected) in
+        [("valid2003.scd", Edition::Ed1, AddCause::SelectFailed), ("valid2007B4.scd", Edition::Ed2_1, AddCause::ObjectAlreadySelected)]
+    {
+        let Some(path) = common::reference(&format!("fixtures/openscd/{file}")) else { return };
+        let xml = std::fs::read_to_string(&path).unwrap();
+        let scl = scl::Scl::parse(&xml).unwrap();
+        let name = scl.ied_names().into_iter().next().unwrap_or_else(|| panic!("{file} has an IED"));
+        let ied = Ied::new(IedModel::from_scl(&xml, Some(&name)).unwrap()).unwrap();
+        assert_eq!(ied.edition(), edition, "{file}");
+        assert_eq!(AddCause::ObjectAlreadySelected.for_edition(ied.edition()), already_selected, "{file}");
+    }
+}

@@ -571,6 +571,43 @@ fn an_application_hook_refuses_with_the_cause_it_chooses() {
     c.release().unwrap();
 }
 
+/// The `AddCause` a server sends is one its edition defines: an Edition 1 client sent an Edition
+/// 2 code reads it as unknown, so an Edition 1 server sends the Edition 1 value instead.
+#[test]
+fn a_refusal_carries_an_add_cause_the_served_edition_defines() {
+    use iec61850_rs::client::{AddCause, ControlModel};
+    use iec61850_rs::common::Edition;
+    use iec61850_rs::model::IedModel;
+    use iec61850_rs::proto::data::Dbpos;
+    use iec61850_rs::server::Stage;
+
+    fn refused(edition: Edition, hook_cause: AddCause) -> AddCause {
+        let ied = Ied::with_edition(IedModel::from_scl(RELAY, Some("IED1")).expect("model"), edition).expect("ied");
+        let mut server = Server::bind("127.0.0.1:0", ied).expect("bind");
+        server.on_control(Box::new(move |event| if event.stage == Stage::Operate { Err(hook_cause) } else { Ok(()) }));
+        let addr = server.local_addr().unwrap().to_string();
+        std::thread::spawn(move || server.accept_one());
+        let mut c = Client::connect(&addr).expect("associate");
+        let e = c.control("IED1LD0/CSWI1.Pos").model(ControlModel::DirectNormal).execute(&Value::dbpos(Dbpos::On)).unwrap_err();
+        c.release().unwrap();
+        match e {
+            iec61850_rs::Error::ControlRejected { add_cause } => AddCause::from_code(add_cause),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    // Defined in every edition: unchanged.
+    assert_eq!(refused(Edition::Ed1, AddCause::BlockedByInterlocking), AddCause::BlockedByInterlocking);
+    // Edition 2 only: the Edition 1 server falls back, the Edition 2.1 server does not.
+    assert_eq!(refused(Edition::Ed2_1, AddCause::LockedByOtherClient), AddCause::LockedByOtherClient);
+    assert_eq!(refused(Edition::Ed1, AddCause::LockedByOtherClient), AddCause::Unknown);
+    assert_eq!(refused(Edition::Ed2_1, AddCause::ObjectAlreadySelected), AddCause::ObjectAlreadySelected);
+    assert_eq!(refused(Edition::Ed1, AddCause::ObjectAlreadySelected), AddCause::SelectFailed);
+    // Past the named list: only Edition 2.1 passes it through.
+    assert_eq!(refused(Edition::Ed2_1, AddCause::Other(40)), AddCause::Other(40));
+    assert_eq!(refused(Edition::Ed2, AddCause::Other(40)), AddCause::Unknown);
+}
+
 /// A relay whose overcurrent pickup is a setting with four groups.
 const SETTINGS: &str = r#"<?xml version="1.0"?>
 <SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">

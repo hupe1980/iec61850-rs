@@ -219,7 +219,10 @@ Ed 1    RptID RptEna Resv DatSet ConfRev OptFlds BufTm SqNum TrgOps IntgPd GI
 ```
 
 `--edition 1|2|2.1` or `Ied::with_edition` overrides the file. The edition also sets the
-object-reference length limit.
+object-reference length limit and the `AddCause` values a refusal may carry: Edition 1 defines
+0–18, so an Edition 1 server sends `ObjectAlreadySelected` as `SelectFailed` and any other newer
+cause — including one the control hook returns — as `Unknown`. `AddCause::for_edition` is the
+mapping; `AddCause::since` names the edition that introduced a value.
 
 ## Errors and rejects
 
@@ -363,8 +366,7 @@ select expiry or time-activated command.
 
 ## Limits
 
-Not implemented: `ObtainFile` (ACSI `SetFile`), TLS (IEC 62351-3), and edition-specific
-enumeration values (`AddCause`). `GoEna`/`SvEna` drive no publisher. The default `LogStore` is
+Not implemented: `ObtainFile` (ACSI `SetFile`) and TLS (IEC 62351-3). `GoEna`/`SvEna` drive no publisher. The default `LogStore` is
 in memory.
 
 The server is tested against this crate's client, Wireshark and libiec61850's client — see
