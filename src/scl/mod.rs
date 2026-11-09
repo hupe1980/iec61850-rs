@@ -1,6 +1,6 @@
-//! Reading IEC 61850-6 SCL: loading a model, resolving subscriptions, checking engineering.
+//! IEC 61850-6 SCL: loading a model, resolving subscriptions, checking engineering, editing.
 //!
-//! Three things, in the order a project needs them:
+//! Four things, in the order a project needs them:
 //!
 //! - [`IedModel::from_scl`] loads one IED of an ICD, CID, IID or SCD into the descriptor a
 //!   publisher and a server work from.
@@ -10,8 +10,12 @@
 //! - [`validate`] reports the engineering errors the XML schema is happy to accept: two
 //!   streams on one address, a data set nobody defined, a binding that resolves to nothing.
 //!
-//! Read-only, on `roxmltree`; element names are matched by local name so that files with
-//! unusual namespace prefixes still load. Editing and writing SCL is a later layer.
+//! - [`Document`] edits a file without reformatting it: an untouched document is its input
+//!   byte for byte, an edit changes only the bytes it is about, and the typed operations
+//!   (rename an IED, set a GOOSE address, bind an `ExtRef`, …) keep references consistent.
+//!
+//! All of it is on `roxmltree`; element names are matched by local name so that files with
+//! unusual namespace prefixes still load.
 //!
 //! The loader is **lenient by default**: real SCL files — `OpenSCD`'s own test corpus among
 //! them — carry dangling type references and half-finished control blocks, and a tool that
@@ -23,10 +27,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use std::collections::HashMap;
 
-use roxmltree::{Document, Node};
+use roxmltree::{Document as XmlDocument, Node};
 
+mod edit;
 mod validate;
 
+pub use edit::{CbRef, ControlKind, Document, Element, ExtRefSource, Hitem, LnRef, NewElement, Patch, Transaction, Tx};
 pub use validate::{Finding, FindingCode, Report, Severity, validate};
 
 use crate::common::MacAddr;
@@ -57,13 +63,13 @@ fn scl_err(msg: impl Into<String>) -> Error {
 /// The one-shot free functions ([`subscriptions`], [`validate`], [`IedModel::from_scl`]) are
 /// this type with the parse inlined, and are the right thing for a single question.
 pub struct Scl<'x> {
-    doc: Document<'x>,
+    doc: XmlDocument<'x>,
 }
 
 impl<'x> Scl<'x> {
     /// Parse SCL text.
     pub fn parse(xml: &'x str) -> Result<Scl<'x>> {
-        Ok(Scl { doc: Document::parse(xml).map_err(|e| scl_err(alloc::format!("XML: {e}")))? })
+        Ok(Scl { doc: XmlDocument::parse(xml).map_err(|e| scl_err(alloc::format!("XML: {e}")))? })
     }
 
     fn root(&self) -> Node<'_, 'x> {
@@ -1517,7 +1523,7 @@ mod tests {
         // `<MinTime unit="s" multiplier="m">4</MinTime>` is 4 ms; the same element without
         // the multiplier is 4 whole seconds, and reading it as 4 ms would turn a heartbeat
         // into a flood.
-        let doc = Document::parse(r#"<r><a multiplier="m">4</a><b>2</b><c multiplier="u">500</c><d multiplier="m">x</d></r>"#).unwrap();
+        let doc = XmlDocument::parse(r#"<r><a multiplier="m">4</a><b>2</b><c multiplier="u">500</c><d multiplier="m">x</d></r>"#).unwrap();
         let r = doc.root_element();
         assert_eq!(child(r, "a").and_then(duration_ms), Some(4));
         assert_eq!(child(r, "b").and_then(duration_ms), Some(2000));

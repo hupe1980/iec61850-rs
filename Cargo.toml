@@ -46,7 +46,8 @@ server = ["std", "mms", "scl"]
 cli = ["std", "pcap", "scl", "goose", "sv", "mms", "client", "server"]
 
 [dependencies]
-roxmltree = { version = "0.21", optional = true }
+# 0.21.2 parses nested elements iteratively; 0.21.1 overflows the stack on deep input.
+roxmltree = { version = "0.21.2", optional = true }
 
 [dev-dependencies]
 proptest = "1.11"
@@ -119,6 +120,11 @@ required-features = ["client"]
 [[test]]
 name = "scl_fixtures"
 path = "tests/scl_fixtures.rs"
+required-features = ["scl", "goose", "sv"]
+
+[[test]]
+name = "scl_edit"
+path = "tests/scl_edit.rs"
 required-features = ["scl", "goose", "sv"]
 
 [[test]]
