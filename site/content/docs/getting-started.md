@@ -32,11 +32,13 @@ feature builds on its own, and so does none of them; CI checks both on every pus
 
 ```bash
 cargo add iec61850-rs --no-default-features --features goose   # GOOSE on an MCU
-cargo install iec61850-rs --features cli                       # the command line
+brew install hupe1980/tap/ied                                  # the command line
+cargo install iec61850-rs --features cli                       # …or from source
 ```
 
-The crate has **no mandatory dependencies** and one optional: `roxmltree`, which arrives with
-`scl`. The MMS client is blocking, so there is no async runtime in the tree.
+The crate has **no mandatory dependencies**. The optional ones come with a feature each:
+`roxmltree` (`scl`), `redb` (`log-redb`) and `rawether` (`net`). The MMS client and server are
+blocking, so there is no async runtime in the tree.
 
 ## Decode a frame
 

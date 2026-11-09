@@ -172,9 +172,6 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      # rawether, the raw Ethernet crate behind the `net` feature, is a path dependency at
-      # ../rawether; cargo resolves it even when the feature is off.
-      - run: git clone --depth 1 https://github.com/hupe1980/rawether "$GITHUB_WORKSPACE/../rawether"
         with:
           fetch-depth: 0
       - uses: actions/download-artifact@v4
@@ -186,7 +183,12 @@ jobs:
       # trusting the page it came from.
       - name: Checksums
         working-directory: artifacts
-        run: sha256sum *.tar.gz *.zip > SHA256SUMS
+        run: sha256sum -- *.tar.gz *.zip > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sha256sums
+          path: artifacts/SHA256SUMS
+          if-no-files-found: error
 
       - name: Publish the release
         env:
@@ -206,3 +208,73 @@ jobs:
             --generate-notes \
             --verify-tag \
             artifacts/*
+
+  # The Homebrew formula follows the GitHub release it points at, for a release only (a `-` in
+  # the version is a pre-release). Owner setup, once: a GitHub App installed on
+  # hupe1980/homebrew-tap only, with contents read and write, and a GitHub environment
+  # `release` (deployment rule: tags `v*`) holding its HOMEBREW_APP_ID and
+  # HOMEBREW_APP_PRIVATE_KEY. Third-party actions here are pinned by commit: the job holds a
+  # write token.
+  tap:
+    name: homebrew tap
+    needs: [guard, github-release]
+    if: github.event_name == 'push' && !contains(needs.guard.outputs.version, '-')
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      VERSION: ${{ needs.guard.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: sha256sums
+          path: dist
+      # A short-lived installation token that can write to the tap only.
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.HOMEBREW_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: hupe1980
+          repositories: homebrew-tap
+          permission-contents: write
+      - uses: actions/checkout@v4
+        with:
+          repository: hupe1980/homebrew-tap
+          token: ${{ steps.app-token.outputs.token }}
+          path: tap
+          persist-credentials: true
+      - name: Update the formula
+        run: |
+          mkdir -p tap/Formula
+          scripts/release/formula.sh "$VERSION" dist/SHA256SUMS > tap/Formula/ied.rb
+          cd tap
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "iec61850-rs release"
+            git config user.email "iec61850-rs-release@users.noreply.github.com"
+            git add Formula/ied.rb
+            git commit -m "ied $VERSION"
+            git push
+          fi
+
+  # What a user gets from the tap installs and answers, on clean machines.
+  smoke:
+    name: brew install ${{ matrix.os }}
+    needs: [guard, tap]
+    if: github.event_name == 'push' && needs.tap.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - if: runner.os == 'Linux'
+        run: |
+          if [ ! -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+            NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          fi
+          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+      - run: |
+          brew install hupe1980/tap/ied
+          brew test ied
+          [ "$(ied --version)" = "ied ${{ needs.guard.outputs.version }}" ]

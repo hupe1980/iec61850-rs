@@ -41,7 +41,8 @@ GOOSE/SV (IEC TR 61850-90-5), unicast SV, and encoding fixed-length GOOSE (decod
 
 ```bash
 cargo add iec61850-rs
-cargo install iec61850-rs --features cli    # the `ied` command line
+brew install hupe1980/tap/ied                # the `ied` command line (macOS arm64, Linux)
+cargo install iec61850-rs --features cli    # …or from source; binaries are on each release
 ```
 
 Dependencies are optional and per feature: `roxmltree` (`scl`), `redb` (`log-redb`) and
