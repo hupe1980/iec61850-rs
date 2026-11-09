@@ -42,6 +42,25 @@ struct Peer {
     identity: Vec<u8>,
     /// The largest MMS PDU it agreed to accept.
     max_pdu: usize,
+    /// Whether it presented the server's ACSE password.
+    authenticated: bool,
+}
+
+/// Who may send this server a file (ACSI `SetFile`, MMS `ObtainFile`).
+///
+/// A client that can write files into an IED can replace its settings, so the default is that
+/// nobody can. The store must be writable as well (`DirectoryStore::writable`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SetFilePolicy {
+    /// Nobody. The default.
+    #[default]
+    Off,
+    /// Only an association that presented the server's ACSE password
+    /// (`AssociationConfig::password`).
+    Authenticated,
+    /// Any association.
+    Anyone,
 }
 
 /// The octets a `GetNameList` page may fill inside a PDU of `max_pdu`.
@@ -55,6 +74,7 @@ fn page_budget(max_pdu: usize) -> usize {
 /// while the association is open, which is all any ownership rule needs.
 pub type AssocId = u64;
 use crate::proto::data::Value;
+use crate::proto::mms::file::FileName;
 use crate::proto::mms::reject::{self, Reject, RejectReason};
 use crate::proto::mms::typespec::TypeSpec;
 use crate::proto::mms::{
@@ -165,6 +185,20 @@ pub enum Answer {
         /// The integer that choice carries.
         code: i64,
     },
+    /// No answer yet: the request is answered later (an `ObtainFile` is answered when the file
+    /// has been fetched). Encodes to nothing.
+    Deferred,
+    /// `ObtainFile`: the file is stored.
+    ObtainFile,
+    /// `ObtainFile` refused or failed: the `ServiceError`, and which side failed.
+    ObtainFileError {
+        /// The `errorClass` choice tag.
+        class: u32,
+        /// The code inside it.
+        code: i64,
+        /// `obtain_file_error::SOURCE_FILE` or `DESTINATION_FILE`.
+        side: i64,
+    },
     /// The PDU could not be acted on at all, which ISO 9506 answers with a **reject** rather
     /// than a service error: an unrecognised service, an argument that did not decode, or
     /// octets that are not a PDU.
@@ -236,6 +270,19 @@ impl Answer {
             // which is strictly worse than a reject it cannot attribute.
             let original_invoke_id = u32::try_from(invoke_id).ok().map(i64::from);
             return Reject { original_invoke_id, reason: *reason }.to_vec();
+        }
+        if let Answer::Deferred = self {
+            return Ok(Vec::new());
+        }
+        if let Answer::ObtainFileError { class, code, side } = self {
+            let body = crate::proto::mms::ServiceError::encode_obtain_file(crate::ber::Tag::context_constructed(2), *class, *code, *side)?;
+            let mut e = Encoder::new();
+            e.constructed(crate::ber::Tag::context_constructed(2), |e| {
+                e.integer(crate::ber::Tag::context(0), invoke_id)?;
+                e.raw(&body);
+                Ok(())
+            })?;
+            return Ok(e.into_vec());
         }
         // A service error is a `confirmed-ErrorPDU`, not a response with an error in it.
         if let Answer::Error { class, code } = self {
@@ -342,6 +389,7 @@ impl Answer {
             },
             Answer::FileRead { data, more } => ConfirmedResponse::FileRead { data, more_follows: *more },
             Answer::FileClose => ConfirmedResponse::FileClose,
+            Answer::ObtainFile => ConfirmedResponse::ObtainFile,
             Answer::FileDelete => ConfirmedResponse::FileDelete,
             Answer::Journal { entries, more } => {
                 let mut out = Vec::with_capacity(entries.len());
@@ -363,7 +411,9 @@ impl Answer {
             // Both are whole PDUs of their own and were returned above. An `Err` rather
             // than an `unreachable!` keeps the crate's "no panics" rule literal even on a
             // branch nothing can reach.
-            Answer::Error { .. } | Answer::Reject(_) => return Err(Error::InvalidValue("an error or reject answer is encoded before the service match")),
+            Answer::Error { .. } | Answer::Reject(_) | Answer::Deferred | Answer::ObtainFileError { .. } => {
+                return Err(Error::InvalidValue("an error or reject answer is encoded before the service match"));
+            }
         };
         Mms::ConfirmedResponse { invoke_id, service }.to_vec()
     }
@@ -404,6 +454,12 @@ pub struct AcsiConfig {
     /// thing a client asking the question can act on. Anything claimed here is a claim: a
     /// capability listed and not implemented is a request that gets a reject.
     pub capabilities: Vec<String>,
+    /// Who may send this server a file. Off by default.
+    pub set_file: SetFilePolicy,
+    /// How many files may be received at once, server-wide (one per association).
+    pub max_obtains: usize,
+    /// How long one file may take to arrive, in milliseconds, before the transfer is abandoned.
+    pub obtain_timeout_ms: u64,
 }
 
 impl Default for AcsiConfig {
@@ -423,6 +479,9 @@ impl Default for AcsiConfig {
             vmd_logical_status: vmd_logical::STATE_CHANGES_ALLOWED,
             vmd_physical_status: vmd_physical::OPERATIONAL,
             capabilities: alloc::vec![String::from("IEC 61850-8-1:2011+AMD1:2020")],
+            set_file: SetFilePolicy::Off,
+            max_obtains: 2,
+            obtain_timeout_ms: 30_000,
         }
     }
 }
@@ -471,6 +530,8 @@ pub struct Acsi {
     /// floor of the `BinaryTime` epoch, and makes `QueryLogByTime` match nothing. The clock is
     /// a trait so a test can pin it and a PTP- or SNTP-disciplined source can replace it.
     clock: Box<dyn Clock + Send + Sync>,
+    /// The files being received (`ObtainFile`).
+    obtains: super::obtain::Obtains,
 }
 
 impl Acsi {
@@ -487,6 +548,7 @@ impl Acsi {
         let tracking = Tracking::new(&ied);
         let mut controls = Controls::new();
         controls.set_edition(ied.edition());
+        let obtains = super::obtain::Obtains::new(cfg.max_obtains, cfg.obtain_timeout_ms);
         let mut acsi = Acsi {
             ied,
             reports,
@@ -502,6 +564,7 @@ impl Acsi {
             deferred: Vec::new(),
             peers: BTreeMap::new(),
             clock: Box::new(SystemClock),
+            obtains,
         };
         // The engineered active group is in force from the moment the server starts, not from
         // the first time a client writes `ActSG`.
@@ -666,6 +729,7 @@ impl Acsi {
             ConfirmedRequest::FileRead(frsm_id) => self.file_read(assoc, *frsm_id),
             ConfirmedRequest::FileClose(frsm_id) => self.file_close(assoc, *frsm_id),
             ConfirmedRequest::FileDelete(name) => self.file_delete(&name.display()),
+            ConfirmedRequest::ObtainFile { source_server, source, destination } => self.obtain_file(assoc, now, source_server.is_some(), source, destination),
             ConfirmedRequest::ReadJournal(request) => {
                 let answer = self.read_journal(request);
                 self.track_log_query(assoc, now, request, &answer);
@@ -706,7 +770,15 @@ impl Acsi {
         // nothing else will collect it: `commit` only runs when the model changes, and an
         // abandoned select changes nothing.
         out.extend(self.controls.take_pending().into_iter().map(|Termination { assoc, pdu }| Outgoing { assoc, pdu }));
-        out.into_iter().map(|Outgoing { assoc, pdu }| (assoc, pdu)).collect()
+        let mut out: Vec<(AssocId, Vec<u8>)> = out.into_iter().map(|Outgoing { assoc, pdu }| (assoc, pdu)).collect();
+        // A client that stalls a transfer fails its own `ObtainFile`, and nothing else.
+        for finished in self.obtains.on_timeout(now) {
+            let assoc = finished.0;
+            if let Some(pdu) = Self::obtain_answer(finished) {
+                out.push((assoc, pdu));
+            }
+        }
+        out
     }
 
     /// When the server next needs [`Acsi::on_timeout`].
@@ -714,7 +786,7 @@ impl Acsi {
         // Both layers own deadlines: a report's gathering window or integrity period, and a
         // selection expiry or a time-activated command. Reporting only one of them is how an
         // event loop sleeps through the other.
-        [self.reports.next_timeout(), self.controls.next_timeout(), self.groups.next_timeout()].into_iter().flatten().min()
+        [self.reports.next_timeout(), self.controls.next_timeout(), self.groups.next_timeout(), self.obtains.next_timeout()].into_iter().flatten().min()
     }
 
     /// An association opened, and this is what it calls itself.
@@ -723,7 +795,87 @@ impl Acsi {
     /// has one enabled — the peer's network address, in the octets the transport reports.
     pub fn on_association_opened(&mut self, assoc: AssocId, identity: Vec<u8>) {
         let max_pdu = self.cfg.name_list_budget.saturating_add(100);
-        self.peers.insert(assoc, Peer { identity, max_pdu });
+        self.peers.insert(assoc, Peer { identity, max_pdu, authenticated: false });
+    }
+
+    /// Whether `assoc` presented the server's ACSE password, which the association decided.
+    pub fn set_authenticated(&mut self, assoc: AssocId, authenticated: bool) {
+        if let Some(peer) = self.peers.get_mut(&assoc) {
+            peer.authenticated = authenticated;
+        }
+    }
+
+    // ---- ObtainFile: the requests this server issues toward a client ------------------
+
+    /// The `ObtainFile` `assoc` just sent, whose answer was [`Answer::Deferred`], was `invoke`.
+    pub fn obtain_bind(&mut self, assoc: AssocId, invoke: i64) {
+        self.obtains.bind(assoc, invoke);
+    }
+
+    /// The request to issue toward the client on `assoc` now, if a transfer needs one.
+    pub fn obtain_call(&self, assoc: AssocId) -> Option<ConfirmedRequest<'_>> {
+        self.obtains.next_call(assoc)
+    }
+
+    /// The request [`Acsi::obtain_call`] named went out as `invoke`.
+    pub fn obtain_issued(&mut self, assoc: AssocId, invoke: i64) {
+        self.obtains.issued(assoc, invoke);
+    }
+
+    /// The client answered `invoke`; the encoded answer to its `ObtainFile` when that ends the
+    /// transfer.
+    pub fn obtain_response(&mut self, assoc: AssocId, invoke: i64, pdu: &Mms<'_>) -> Option<Vec<u8>> {
+        let finished = self.obtains.on_response(assoc, invoke, pdu)?;
+        Self::obtain_answer(finished)
+    }
+
+    /// A request toward the client could not be issued, timed out or was answered with octets
+    /// that do not decode; the encoded answer to its `ObtainFile`.
+    pub fn obtain_failed(&mut self, assoc: AssocId, invoke: Option<i64>) -> Option<Vec<u8>> {
+        let finished = self.obtains.failed(assoc, invoke)?;
+        Self::obtain_answer(finished)
+    }
+
+    fn obtain_answer((_, invoke, outcome): super::obtain::Finished) -> Option<Vec<u8>> {
+        let answer = match outcome {
+            super::obtain::Outcome::Stored => Answer::ObtainFile,
+            super::obtain::Outcome::Failed(f) => Answer::ObtainFileError { class: f.class, code: f.code, side: f.side },
+        };
+        answer.encode(invoke).ok()
+    }
+
+    /// `ObtainFile`: check who asks, what for and where to, then start fetching. Everything
+    /// that can be refused is refused here, before a single request goes toward the client.
+    fn obtain_file(&mut self, assoc: AssocId, now: Instant, third_party: bool, source: &FileName<'_>, destination: &FileName<'_>) -> Answer {
+        use super::obtain::Refusal;
+        use crate::proto::mms::file_error;
+        let refuse = |f: Refusal| Answer::ObtainFileError { class: f.class, code: f.code, side: f.side };
+        let authenticated = self.peers.get(&assoc).is_some_and(|p| p.authenticated);
+        let allowed = match self.cfg.set_file {
+            SetFilePolicy::Off => false,
+            SetFilePolicy::Authenticated => authenticated,
+            SetFilePolicy::Anyone => true,
+        };
+        if !allowed {
+            return refuse(Refusal::destination(file_error::FILE_ACCESS_DENIED));
+        }
+        // Fetching from a third party on a client's word would make this server a relay.
+        if third_party {
+            return refuse(Refusal::source(file_error::FILE_ACCESS_DENIED));
+        }
+        if let Err(f) = self.obtains.admit(assoc) {
+            return refuse(f);
+        }
+        let Ok(source) = crate::proto::mms::file::FileNameBuf::from_path(&source.display()) else {
+            return refuse(Refusal::source(file_error::FILENAME_SYNTAX_ERROR));
+        };
+        match self.files.create(&destination.display()) {
+            Ok(writer) => {
+                self.obtains.start(assoc, source, writer, now);
+                Answer::Deferred
+            }
+            Err(e) => refuse(Refusal::from_store(e)),
+        }
     }
 
     /// An association ended: release everything it owned.
@@ -756,6 +908,8 @@ impl Acsi {
         self.peers.remove(&assoc);
         self.controls.on_association_closed(assoc);
         self.groups.on_association_closed(assoc);
+        // A file half received from a client that has gone is discarded, never stored.
+        self.obtains.on_closed(assoc);
         // A file handle is a server-side resource; an association that goes away without
         // closing its handles must not leak them.
         self.handles.retain(|h| h.assoc != assoc);

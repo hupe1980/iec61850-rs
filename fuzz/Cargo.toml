@@ -76,3 +76,9 @@ name = "log_record"
 path = "fuzz_targets/log_record.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "obtain_engine"
+path = "fuzz_targets/obtain_engine.rs"
+test = false
+doc = false

@@ -665,3 +665,34 @@ const SIM_RELAY: &str = r#"<?xml version="1.0"?>
     <DAType id="AV_T"><BDA name="f" bType="FLOAT32"/></DAType>
   </DataTypeTemplates>
 </SCL>"#;
+
+/// `ied mms put` sends a file to `ied sim --writable`, which stores it.
+#[test]
+fn put_sends_a_file_to_a_writable_simulator() {
+    use std::io::{BufRead, BufReader};
+
+    let dir = tempdir("put");
+    let scl = dir.join("relay.icd");
+    std::fs::write(&scl, include_str!("fixtures/relay.icd")).expect("write the file");
+    let store = dir.join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    let local = dir.join("settings.xml");
+    std::fs::write(&local, b"<settings/>").unwrap();
+
+    let mut child = Command::new(ied())
+        .args(["sim", scl.to_str().unwrap(), "--port", "0", "--files", store.to_str().unwrap(), "--writable", "--password", "s3cret"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sim");
+    let stdout = child.stdout.take().expect("stdout");
+    let lines: Vec<String> = BufReader::new(stdout).lines().map_while(Result::ok).take_while(|l| !l.starts_with("serving")).collect();
+    let addr = lines.iter().find(|l| l.contains(" on ")).and_then(|l| l.split_whitespace().nth(2)).expect("the address").to_string();
+    let refused = run(&["mms", "put", &addr, local.to_str().unwrap(), "settings.xml"]);
+    let sent = run(&["mms", "put", &addr, local.to_str().unwrap(), "settings.xml", "--password", "s3cret"]);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(!refused.ok, "no password, no association: {}", refused.stdout);
+    assert!(sent.ok, "{}{}", sent.stdout, sent.stderr);
+    assert_eq!(std::fs::read(store.join("settings.xml")).unwrap(), b"<settings/>");
+}

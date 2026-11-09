@@ -288,8 +288,9 @@ server.set_file_store(Box::new(DirectoryStore::new("/var/lib/ied/records")));
 
 `DirectoryStore` refuses absolute paths, drive letters, UNC prefixes, backslashes and `..`
 components, and checks that the canonicalised path is still inside the root. Every refusal is
-`object-non-existent`, indistinguishable from a missing file. It is read-only unless
-`.writable()`, which allows `FileDelete`.
+`object-non-existent`, indistinguishable from a missing file. Nothing whose path has a
+component starting with `.` is ever listed, read or deleted. It is read-only unless
+`.writable()`, which allows `FileDelete` and receiving files.
 
 Files are read in ranges: `FileStore` is `list`, `info` and `read_at(path, offset, len)`, so a
 `FileRead` costs one chunk whatever the file's size. Implement it to serve records from anywhere:
@@ -303,6 +304,39 @@ impl FileStore for MyArchive {
 ```
 
 The default is `NoFiles`.
+
+### Receiving files (`SetFile`)
+
+A client sends a file with ACSI `SetFile` (MMS `ObtainFile`); the server then reads it from the
+client with `FileOpen`/`FileRead`/`FileClose` on the same association and stores it. Nobody may
+by default: `AcsiConfig::set_file` is `SetFilePolicy::Off`, `Authenticated` (only an association
+that presented the server's ACSE password) or `Anyone`, and the store must be writable.
+
+```rust
+use iec61850_rs::server::{AcsiConfig, DirectoryStore, ServerConfig, SetFilePolicy};
+
+let mut cfg = ServerConfig { acsi: AcsiConfig { set_file: SetFilePolicy::Authenticated, ..AcsiConfig::default() }, ..ServerConfig::default() };
+cfg.association.password = Some("s3cret".into());          // every association must present it
+let mut server = Server::bind_with("0.0.0.0:102", ied, &cfg)?;
+server.set_file_store(Box::new(DirectoryStore::new("/var/lib/ied/settings").writable()));
+```
+
+`DirectoryStore` applies the read rules to the destination and more: no component may start
+with `.`, the directory must already exist inside the root after symlinks are resolved, and an
+existing file is not replaced (`duplicate-filename`) unless `.allow_overwrite()`. The file is
+written to a hidden temporary beside its destination and appears under its name only complete;
+a refused, failed, timed-out or abandoned transfer leaves nothing. `.with_limits(file, total)`
+bounds one file (default 16 MiB) and the whole store (256 MiB); the declared size is checked
+before the first read and every chunk after it.
+
+Transfers never hold up the server: the connection loop issues each request and goes on, one
+transfer per association and `AcsiConfig::max_obtains` (2) in all, each finished within
+`obtain_timeout_ms` (30 s) or answered with an error. A refusal carries the ISO 9506 `file`
+error and says which side failed (`ObtainFile-Error`: source or destination). A request naming a
+third-party `sourceFileServer` is refused.
+
+A server with `AssociationConfig::password` refuses any association that does not present it,
+at ACSE with `authentication-failure`; the comparison is constant-time.
 
 ## Logs
 
@@ -378,7 +412,7 @@ select expiry or time-activated command.
 
 ## Limits
 
-Not implemented: `ObtainFile` (ACSI `SetFile`) and TLS (IEC 62351-3). `GoEna`/`SvEna` drive no publisher.
+Not implemented: TLS (IEC 62351-3). `GoEna`/`SvEna` drive no publisher.
 
 The server is tested against this crate's client, Wireshark and libiec61850's client — see
 [Verification](@/docs/verification.md).

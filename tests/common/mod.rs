@@ -610,6 +610,8 @@ mod mms_server {
                 assert_eq!(name.display(), FILE);
                 s.assoc.respond(invoke_id, &ConfirmedResponse::FileDelete).unwrap();
             }
+            // This stub stores nothing it is sent; it acknowledges the request as received.
+            ConfirmedRequest::ObtainFile { .. } => s.assoc.respond(invoke_id, &ConfirmedResponse::ObtainFile).unwrap(),
             ConfirmedRequest::ReadJournal(request) => {
                 let name = match request.name {
                     Some(ObjectName::DomainSpecific { domain, item }) => format!("{domain}/{item}"),

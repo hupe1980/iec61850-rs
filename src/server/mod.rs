@@ -34,17 +34,18 @@ mod log;
 #[cfg(feature = "log-redb")]
 mod log_redb;
 mod net;
+mod obtain;
 mod rcb;
 mod sg;
 mod supervision;
 mod tracking;
 mod tree;
 
-pub use acsi::{Acsi, AcsiConfig, Answer, AssocId, error_class};
+pub use acsi::{Acsi, AcsiConfig, Answer, AssocId, SetFilePolicy, error_class};
 pub use control::{ControlEvent, ControlHook, Controls, DEFAULT_SBO_TIMEOUT_MS, Stage, Termination};
 #[cfg(feature = "std")]
 pub use files::DirectoryStore;
-pub use files::{FileInfo, FileStore, NoFiles, is_safe_relative};
+pub use files::{DEFAULT_MAX_FILE_SIZE, DEFAULT_MAX_TOTAL_SIZE, FileError, FileInfo, FileStore, FileWriter, NoFiles, is_safe_relative};
 pub use ied::{
     Block, BlockKind, DATA_ACCESS_DENIED, DATA_ACCESS_NON_EXISTENT, DATA_ACCESS_TYPE_INCONSISTENT, DATA_ACCESS_VALUE_INVALID, DataSetMember, Ied,
     ServedDataSet, accepts, default_value,
@@ -53,6 +54,7 @@ pub use log::{DEFAULT_LOG_CAPACITY, Entry, LogBounds, LogError, LogPage, LogStor
 #[cfg(feature = "log-redb")]
 pub use log_redb::{RedbLog, SyncPolicy, decode_record};
 pub use net::{Server, ServerConfig, ServerHandle, Txn};
+pub use obtain::{Obtains, Outcome as ObtainOutcome, Refusal as ObtainRefusal};
 pub use rcb::{DEFAULT_BUFFER, Engine, Outgoing};
 pub use sg::SettingGroups;
 pub use supervision::SubscriptionStatus;

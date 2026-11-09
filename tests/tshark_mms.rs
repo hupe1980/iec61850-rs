@@ -332,3 +332,47 @@ fn exercise(addr: &str, handle: &ServerHandle) {
 
     c.release().expect("release");
 }
+
+/// ACSI `SetFile`: the client's `ObtainFile`, the server's own `FileOpen`/`FileRead`/`FileClose`
+/// toward the client, and the `NULL` response — the one sequence where this server is the
+/// requester, so the one this crate's client is otherwise the only reader of.
+#[test]
+fn a_set_file_dissects_in_both_directions() {
+    use iec61850_rs::server::{AcsiConfig, ServerConfig, SetFilePolicy};
+    if common::tshark().is_none() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("iec61850-oracle-setfile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create");
+    let cfg = ServerConfig { acsi: AcsiConfig { set_file: SetFilePolicy::Anyone, ..AcsiConfig::default() }, ..ServerConfig::default() };
+    let mut server = Server::bind_with("127.0.0.1:0", Ied::from_scl(RELAY, Some("IED1")).expect("load"), &cfg).expect("bind");
+    server.set_file_store(Box::new(DirectoryStore::new(&dir).writable()));
+    let target = server.local_addr().expect("addr").to_string();
+    std::thread::spawn(move || {
+        let _ = server.accept_one();
+    });
+    let (addr, log) = recording_proxy(target);
+
+    let body: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+    let mut c = Client::connect(&addr).expect("associate");
+    c.set_file("received.bin", &body).expect("SetFile");
+    c.release().expect("release");
+    assert_eq!(std::fs::read(dir.join("received.bin")).unwrap(), body);
+
+    std::thread::sleep(Duration::from_millis(200));
+    let packets = log.lock().expect("lock").clone();
+    let text = dissect("set-file", &packets);
+    assert!(!text.contains("_ws.malformed"), "malformed PDU in the capture:\n{text}");
+    assert!(!text.contains("\"_ws.expert.severity\": \"Error\""), "expert error in the capture:\n{text}");
+    assert!(text.contains("\"mms.obtainFile_element\""), "Wireshark names the ObtainFile:\n{text}");
+    for field in ["\"mms.sourceFile\"", "\"mms.destinationFile\"", "\"mms.sizeOfFile\": \"3000\""] {
+        assert!(text.contains(field), "{field} missing:\n{text}");
+    }
+    // Source and destination in the request, and the name the server's own FileOpen carries.
+    assert_eq!(text.matches("\"mms.FileName_item\": \"received.bin\"").count(), 3, "three file names, each read back:\n{text}");
+    for service in ["fileOpen", "fileRead", "fileClose"] {
+        assert!(text.contains(service), "{service} toward the client is missing:\n{text}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -59,6 +59,8 @@ COMMANDS:
     mms files <HOST[:PORT]> [DIR]  List the server's files
     mms get <HOST[:PORT]> <PATH> [OUT]
                                    Read a file off the server (COMTRADE records live here)
+    mms put <HOST[:PORT]> <LOCAL> <REMOTE>
+                                   Send a file to the server (SetFile)
     mms log <HOST[:PORT]> <LOG>    Read a log's entries; --lcb prints its control block
     mms sg <HOST[:PORT]> [REF]     Setting groups: print, --activate N, --edit N
     sv monitor <FILE.pcap>         Track sampled-value streams: gaps, sync, staleness
@@ -105,7 +107,9 @@ COMMANDS:
     --bind <ADDR>       address to listen on (default 127.0.0.1)
     --port <N>          first port; each further IED takes the next one (default 102)
     --files <DIR>       serve this directory through the MMS file services, read-only
-    --writable          also allow `FileDelete` on that directory
+    --writable          also let clients delete files there and send files to it (SetFile);
+                        with --password, only a client that presents the password may send
+    --password <TEXT>   require this ACSE password of every association
     --edition <1|2|2.1> serve as this edition, overriding the file's own schema version
     --log-db <PATH>     keep the logs in a file that survives a restart (a directory of
                         <IED>.redb files when the SCD has several IEDs)
@@ -163,6 +167,7 @@ fn main() -> ExitCode {
         ["mms", "type", host, reference, rest @ ..] => mms_type(host, reference, rest),
         ["mms", "files", host, rest @ ..] => mms_files(host, rest),
         ["mms", "get", host, path, rest @ ..] => mms_get(host, path, rest),
+        ["mms", "put", host, local, remote, rest @ ..] => mms_put(host, local, remote, rest),
         ["mms", "log", host, log, rest @ ..] => mms_log(host, log, rest),
         ["mms", "sg", host, rest @ ..] => mms_setting_groups(host, rest),
         ["sv", "monitor", file, rest @ ..] => sv_monitor(file, rest),
@@ -508,6 +513,7 @@ fn describe_request(service: &iec61850_rs::proto::mms::ConfirmedRequest<'_>) -> 
         ConfirmedRequest::FileRead(id) => format!("fileRead frsm {id}"),
         ConfirmedRequest::FileClose(id) => format!("fileClose frsm {id}"),
         ConfirmedRequest::FileDelete(name) => format!("fileDelete {}", name.display()),
+        ConfirmedRequest::ObtainFile { source, destination, .. } => format!("obtainFile {} -> {}", source.display(), destination.display()),
         ConfirmedRequest::FileDirectory { specification, .. } => {
             format!("fileDirectory {}", specification.as_ref().map_or_else(|| String::from("*"), file::FileName::display))
         }
@@ -540,6 +546,7 @@ fn describe_response(service: &iec61850_rs::proto::mms::ConfirmedResponse<'_>) -
         ConfirmedResponse::FileRead { data, more_follows } => format!("{} octets{}", data.len(), if *more_follows { ", more follow" } else { "" }),
         ConfirmedResponse::FileClose => String::from("fileClose"),
         ConfirmedResponse::FileDelete => String::from("fileDelete"),
+        ConfirmedResponse::ObtainFile => String::from("obtainFile"),
         ConfirmedResponse::FileDirectory { entries, more_follows } => {
             format!("{} file(s){}", entries.len(), if *more_follows { ", more follow" } else { "" })
         }
@@ -678,6 +685,17 @@ fn mms_get(host: &str, path: &str, args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+/// `mms put` — send a local file to the server (ACSI `SetFile`, MMS `ObtainFile`).
+fn mms_put(host: &str, local: &str, remote: &str, args: &[&str]) -> Result<(), String> {
+    let o = mms_options(args)?;
+    let mut c = mms_connect(host, &o)?;
+    c.set_file_path(std::path::Path::new(local), remote).map_err(|e| format!("{remote}: {e}"))?;
+    let size = std::fs::metadata(local).map_or(0, |m| m.len());
+    println!("{local} -> {remote} ({size} octets)");
+    let _ = c.release();
+    Ok(())
+}
+
 /// `mms log` — a log's entries, oldest first, and optionally its control block.
 fn mms_log(host: &str, log: &str, args: &[&str]) -> Result<(), String> {
     let o = mms_options(args)?;
@@ -773,6 +791,7 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
             "--writable" => o.writable = true,
             "--edition" => o.edition = Some(parse_edition(value()?)?),
             "--log-db" => o.log_db = Some(value()?.to_string()),
+            "--password" => o.password = Some(value()?.to_string()),
             other => return Err(format!("unknown option `{other}`")),
         }
     }
@@ -807,7 +826,14 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
         let trackers = iec61850_rs::server::Tracking::new(&ied).references();
         // Runs out at 65535 rather than wrapping onto a port already in use.
         let port = u16::try_from(n).ok().and_then(|n| o.port.checked_add(n)).ok_or_else(|| format!("{} IEDs do not fit above port {}", names.len(), o.port))?;
-        let mut server = Server::bind(&format!("{}:{port}", o.bind), ied).map_err(|e| format!("{name}: {e}"))?;
+        // `--writable` lets clients send files: anyone, or only who presents `--password`.
+        let mut cfg = iec61850_rs::server::ServerConfig::default();
+        cfg.association.password.clone_from(&o.password);
+        if o.writable && o.files.is_some() {
+            cfg.acsi.set_file =
+                if o.password.is_some() { iec61850_rs::server::SetFilePolicy::Authenticated } else { iec61850_rs::server::SetFilePolicy::Anyone };
+        }
+        let mut server = Server::bind_with(&format!("{}:{port}", o.bind), ied, &cfg).map_err(|e| format!("{name}: {e}"))?;
         if let Some(dir) = &o.files {
             let store = DirectoryStore::new(dir);
             server.set_file_store(Box::new(if o.writable { store.writable() } else { store }));
@@ -834,7 +860,12 @@ fn simulate(file: &str, args: &[&str]) -> Result<(), String> {
         servers.push(server);
     }
     if let Some(dir) = &o.files {
-        println!("files from {dir}{}", if o.writable { " (deletable)" } else { " (read-only)" });
+        let mode = match (o.writable, o.password.is_some()) {
+            (false, _) => " (read-only)",
+            (true, false) => " (writable: delete and SetFile by any client)",
+            (true, true) => " (writable: delete and SetFile by password-authenticated clients)",
+        };
+        println!("files from {dir}{mode}");
     }
     println!("serving; ^C to stop");
 
@@ -863,13 +894,15 @@ struct SimOptions {
     edition: Option<Edition>,
     /// Keep the logs in this redb file (one IED) or directory (several).
     log_db: Option<String>,
+    /// The ACSE password every association must present.
+    password: Option<String>,
 }
 
 impl Default for SimOptions {
     fn default() -> SimOptions {
         // Loopback and port 102: the standard port needs privileges, and a simulator that
         // binds every interface by default is a simulator someone finds on a substation LAN.
-        SimOptions { ied: None, bind: String::from("127.0.0.1"), port: 102, files: None, writable: false, edition: None, log_db: None }
+        SimOptions { ied: None, bind: String::from("127.0.0.1"), port: 102, files: None, writable: false, edition: None, log_db: None, password: None }
     }
 }
 

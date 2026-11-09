@@ -83,11 +83,11 @@ re-encodes to the octets it arrived as.
 
 | Modelled | Kept as tag + octets |
 |---|---|
-| `Initiate`, `Conclude`, `Cancel`, `reject-PDU` | `ObtainFile` |
+| `Initiate`, `Conclude`, `Cancel`, `reject-PDU` | |
 | `Status`, `GetCapabilityList`, `Identify`, `GetNameList` | the semaphore and program services |
 | `Read`, `Write`, `InformationReport` | everything else |
 | `GetVariableAccessAttributes`; `Get…Attributes`, `Define…` and `DeleteNamedVariableList` | |
-| `ReadJournal`; `FileOpen`, `FileRead`, `FileClose`, `FileDelete`, `FileDirectory` | |
+| `ReadJournal`; `ObtainFile`, `FileOpen`, `FileRead`, `FileClose`, `FileDelete`, `FileDirectory` | |
 
 Unmodelled services still round-trip and print.
 
@@ -360,6 +360,19 @@ c.delete_file("COMTRADE/rec0001.cfg")?;
 `read_file` closes the handle even when a read fails or the file exceeds the size limit, which
 is required.
 
+Sending a file is ACSI `SetFile`, MMS `ObtainFile`: the server reads it back from the client on
+the same association, and `set_file` serves those reads while it waits — only for the one file
+it offered, one handle at a time — and refuses anything else the server asks for.
+
+```rust
+c.set_file("SETTINGS/settings.xml", &bytes)?;                   // or set_file_path(local, remote)
+```
+
+The call fails with the server's reason (`file-access-denied` when it takes no files, the
+default; `duplicate-filename`; `insufficient-space-in-filestore`). It times out only when the
+server stops making progress, not because a transfer is long. Outside `set_file` a request from
+the server is refused, never left unanswered.
+
 ## Logs
 
 Log services map to two different MMS mechanisms:
@@ -441,5 +454,4 @@ The server side is on [its own page](@/docs/server.md); testing is described in
 
 ## Limits
 
-Not implemented: `ObtainFile` (ACSI `SetFile`), unsolicited `Status`, TLS (IEC 62351-3), and an
-async client.
+Not implemented: unsolicited `Status`, TLS (IEC 62351-3), and an async client.
